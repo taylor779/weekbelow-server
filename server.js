@@ -1,14 +1,19 @@
 /**
- * Week Below — Live Timer WebSocket Server
- * ─────────────────────────────────────────
+ * Week Below — Live Sync WebSocket Server
+ * ────────────────────────────────────────
+ * Handles real-time sync for:
+ *   • Active timers    (timer_start / timer_stop)
+ *   • Whiteboard state (wb_sync)
+ *   • Tasks            (tasks_sync)
+ *
  * Requirements:  Node.js 16+
  * Install:       npm install ws
- * Run:           node weekbelow-server.js
- * Default port:  8765  (set WB_PORT env var to override)
+ * Run:           node server.js
+ * Port:          8765  (override with WB_PORT env var)
  *
- * The server is a pure relay + state store.
- * It holds the current running-timer state for each user in memory
- * and broadcasts any change to every connected client.
+ * Every connected client gets a full snapshot on connect.
+ * All mutations are last-write-wins — server stores latest state
+ * and broadcasts to every other client immediately.
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
@@ -16,40 +21,51 @@ const { WebSocketServer, WebSocket } = require('ws');
 const PORT = parseInt(process.env.WB_PORT || '8765', 10);
 const wss  = new WebSocketServer({ port: PORT });
 
-/**
- * Active timers keyed by userId (string).
- * Shape: { userId, userName, userColor, userInitials,
- *          projectId, projectName, phase,
- *          startedAt (ISO string) }
- * A userId key being absent means that user has no active timer.
- */
+// ── Server state ─────────────────────────────────────────────────────────────
+
+/** Active timers: { [userId]: { userId, userName, userColor, userInitials, projectId, projectName, phase, startedAt } } */
 const activeTimers = {};
 
-/** All currently connected sockets */
+/** Whiteboard assignment state: { [projOrTaskId]: { userId, stage, split[] } } */
+let wbState = {};
+
+/** Tasks array — full task objects synced from clients */
+let tasks = [];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 const clients = new Set();
 
-function broadcast(payload) {
+function broadcast(payload, excludeSocket = null) {
   const msg = JSON.stringify(payload);
   for (const client of clients) {
-    if (client.readyState === WebSocket.OPEN) {
+    if (client !== excludeSocket && client.readyState === WebSocket.OPEN) {
       client.send(msg);
     }
   }
 }
 
-/** Send the full current timer state to a single socket (on connect) */
 function sendSnapshot(socket) {
   socket.send(JSON.stringify({
-    type: 'snapshot',
-    timers: Object.values(activeTimers),
+    type:    'snapshot',
+    timers:  Object.values(activeTimers),
+    wbState,
+    tasks,
   }));
 }
 
-wss.on('connection', (socket, req) => {
-  clients.add(socket);
-  console.log(`[+] Client connected  (total: ${clients.size})`);
+function log(icon, msg) {
+  const time = new Date().toTimeString().slice(0, 8);
+  console.log(`[${time}] ${icon}  ${msg}`);
+}
 
-  // Immediately give the new client the current state
+// ── Connection handler ────────────────────────────────────────────────────────
+
+wss.on('connection', (socket) => {
+  clients.add(socket);
+  log('+', `Client connected  (total: ${clients.size})`);
+
+  // Give new client the full current state immediately
   sendSnapshot(socket);
 
   socket.on('message', (raw) => {
@@ -58,38 +74,52 @@ wss.on('connection', (socket, req) => {
 
     switch (msg.type) {
 
-      // ── User started a timer ──────────────────────────────────────────
+      // ── TIMERS ────────────────────────────────────────────────────────────
+
       case 'timer_start': {
         const { userId, userName, userColor, userInitials,
                 projectId, projectName, phase } = msg;
         if (!userId) return;
-
         activeTimers[String(userId)] = {
           userId, userName, userColor, userInitials,
           projectId, projectName, phase,
           startedAt: new Date().toISOString(),
         };
-
-        broadcast({ type: 'timer_start', timer: activeTimers[String(userId)] });
-        console.log(`  ▶ ${userName} started timer on "${projectName}"`);
+        broadcast({ type: 'timer_start', timer: activeTimers[String(userId)] }, socket);
+        log('▶', `${userName} started timer on "${projectName}"`);
         break;
       }
 
-      // ── User stopped a timer ─────────────────────────────────────────
       case 'timer_stop': {
         const { userId } = msg;
         if (!userId) return;
-
-        const key = String(userId);
-        const timer = activeTimers[key];
-        delete activeTimers[key];
-
-        broadcast({ type: 'timer_stop', userId, timer });
-        if (timer) console.log(`  ■ ${timer.userName} stopped timer`);
+        const timer = activeTimers[String(userId)];
+        delete activeTimers[String(userId)];
+        broadcast({ type: 'timer_stop', userId, timer }, socket);
+        if (timer) log('■', `${timer.userName} stopped timer`);
         break;
       }
 
-      // ── Client asks for current state (e.g. after reconnect) ─────────
+      // ── WHITEBOARD ───────────────────────────────────────────────────────
+
+      case 'wb_sync': {
+        wbState = msg.wbState || wbState;
+        broadcast({ type: 'wb_sync', wbState, triggeredBy: msg.userName || '?' }, socket);
+        log('🗂', `Whiteboard updated by ${msg.userName || 'unknown'}`);
+        break;
+      }
+
+      // ── TASKS ────────────────────────────────────────────────────────────
+
+      case 'tasks_sync': {
+        tasks = msg.tasks || tasks;
+        broadcast({ type: 'tasks_sync', tasks, triggeredBy: msg.userName || '?' }, socket);
+        log('✅', `Tasks updated by ${msg.userName || 'unknown'} (${tasks.length} total)`);
+        break;
+      }
+
+      // ── UTILITY ──────────────────────────────────────────────────────────
+
       case 'ping': {
         sendSnapshot(socket);
         break;
@@ -102,7 +132,7 @@ wss.on('connection', (socket, req) => {
 
   socket.on('close', () => {
     clients.delete(socket);
-    console.log(`[-] Client disconnected (total: ${clients.size})`);
+    log('-', `Client disconnected (total: ${clients.size})`);
   });
 
   socket.on('error', (err) => {
@@ -111,5 +141,5 @@ wss.on('connection', (socket, req) => {
   });
 });
 
-console.log(`Week Below WS server listening on ws://localhost:${PORT}`);
-console.log('Press Ctrl+C to stop.\n');
+console.log(`\nWeek Below sync server running on ws://localhost:${PORT}`);
+console.log('Handles: timers · whiteboard · tasks\n');
