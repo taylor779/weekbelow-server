@@ -1,40 +1,81 @@
 /**
  * Week Below — Live Sync WebSocket Server
  * ────────────────────────────────────────
- * Handles real-time sync for:
- *   • Active timers    (timer_start / timer_stop)
- *   • Whiteboard state (wb_sync)
- *   • Tasks            (tasks_sync)
+ * Server is the single source of truth for all app data.
+ * Data is persisted to /data/data.json on Railway volume
+ * (or ./data.json locally) so restarts never lose state.
  *
  * Requirements:  Node.js 16+
  * Install:       npm install ws
  * Run:           node server.js
  * Port:          8765  (override with WB_PORT env var)
  *
- * Every connected client gets a full snapshot on connect.
- * All mutations are last-write-wins — server stores latest state
- * and broadcasts to every other client immediately.
+ * Railway setup:
+ *   1. Upgrade to Hobby ($5/mo)
+ *   2. Service → Volumes → New Volume → mount at /data
+ *   That's it — data.json persists across all restarts.
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
+const fs   = require('fs');
+const path = require('path');
 
-const PORT = parseInt(process.env.WB_PORT || '8765', 10);
-const wss  = new WebSocketServer({ port: PORT });
+const PORT      = parseInt(process.env.WB_PORT || '8765', 10);
+const DATA_DIR  = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname);
+const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
-// ── Server state ─────────────────────────────────────────────────────────────
+// ── Persistence ───────────────────────────────────────────────────────────────
 
-/** Active timers: { [userId]: { userId, userName, userColor, userInitials, projectId, projectName, phase, startedAt } } */
+let saveTimer = null;
+
+function loadState() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      log('💾', `Loaded state from ${DATA_FILE}`);
+      return { ...defaultAppState(), ...parsed, seeded: true };
+    }
+  } catch (e) {
+    console.error('Failed to load state:', e.message);
+  }
+  return defaultAppState();
+}
+
+function scheduleSave() {
+  // Debounce — write at most once per 2s to avoid hammering disk
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(DATA_FILE, JSON.stringify(appState, null, 2));
+    } catch (e) {
+      console.error('Failed to save state:', e.message);
+    }
+  }, 2000);
+}
+
+function defaultAppState() {
+  return {
+    projects: [],
+    clients:  [],
+    users:    [],
+    archived: [],
+    tasks:    [],
+    wbState:  {},
+    seeded:   false,
+  };
+}
+
+// ── Server state ──────────────────────────────────────────────────────────────
+
 const activeTimers = {};
-
-/** Whiteboard assignment state: { [projOrTaskId]: { userId, stage, split[] } } */
-let wbState = {};
-
-/** Tasks array — full task objects synced from clients */
-let tasks = [];
+let appState = loadState();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const clients = new Set();
+const wss = new WebSocketServer({ port: PORT });
 
 function broadcast(payload, excludeSocket = null) {
   const msg = JSON.stringify(payload);
@@ -47,10 +88,9 @@ function broadcast(payload, excludeSocket = null) {
 
 function sendSnapshot(socket) {
   socket.send(JSON.stringify({
-    type:    'snapshot',
-    timers:  Object.values(activeTimers),
-    wbState,
-    tasks,
+    type:     'snapshot',
+    timers:   Object.values(activeTimers),
+    appState,
   }));
 }
 
@@ -64,8 +104,6 @@ function log(icon, msg) {
 wss.on('connection', (socket) => {
   clients.add(socket);
   log('+', `Client connected  (total: ${clients.size})`);
-
-  // Give new client the full current state immediately
   sendSnapshot(socket);
 
   socket.on('message', (raw) => {
@@ -73,8 +111,6 @@ wss.on('connection', (socket) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     switch (msg.type) {
-
-      // ── TIMERS ────────────────────────────────────────────────────────────
 
       case 'timer_start': {
         const { userId, userName, userColor, userInitials,
@@ -100,33 +136,42 @@ wss.on('connection', (socket) => {
         break;
       }
 
-      // ── WHITEBOARD ───────────────────────────────────────────────────────
-
-      case 'wb_sync': {
-        wbState = msg.wbState || wbState;
-        broadcast({ type: 'wb_sync', wbState, triggeredBy: msg.userName || '?' }, socket);
-        log('🗂', `Whiteboard updated by ${msg.userName || 'unknown'}`);
+      case 'app_sync': {
+        const { projects, clients: cls, users, archived, tasks, wbState, userName } = msg;
+        if (projects !== undefined) appState.projects = projects;
+        if (cls      !== undefined) appState.clients  = cls;
+        if (users    !== undefined) appState.users    = users;
+        if (archived !== undefined) appState.archived = archived;
+        if (tasks    !== undefined) appState.tasks    = tasks;
+        if (wbState  !== undefined) appState.wbState  = wbState;
+        appState.seeded = true;
+        scheduleSave();
+        broadcast({ type: 'app_sync', appState, triggeredBy: userName || '?' }, socket);
+        log('🔄', `State updated by ${userName || 'unknown'}`);
         break;
       }
 
-      // ── TASKS ────────────────────────────────────────────────────────────
+      // Legacy compat
+      case 'wb_sync': {
+        appState.wbState = msg.wbState || appState.wbState;
+        appState.seeded = true;
+        scheduleSave();
+        broadcast({ type: 'wb_sync', wbState: appState.wbState, triggeredBy: msg.userName || '?' }, socket);
+        break;
+      }
 
       case 'tasks_sync': {
-        tasks = msg.tasks || tasks;
-        broadcast({ type: 'tasks_sync', tasks, triggeredBy: msg.userName || '?' }, socket);
-        log('✅', `Tasks updated by ${msg.userName || 'unknown'} (${tasks.length} total)`);
+        appState.tasks = msg.tasks || appState.tasks;
+        appState.seeded = true;
+        scheduleSave();
+        broadcast({ type: 'tasks_sync', tasks: appState.tasks, triggeredBy: msg.userName || '?' }, socket);
         break;
       }
-
-      // ── UTILITY ──────────────────────────────────────────────────────────
 
       case 'ping': {
         sendSnapshot(socket);
         break;
       }
-
-      default:
-        break;
     }
   });
 
@@ -141,5 +186,6 @@ wss.on('connection', (socket) => {
   });
 });
 
-console.log(`\nWeek Below sync server running on ws://localhost:${PORT}`);
-console.log('Handles: timers · whiteboard · tasks\n');
+console.log(`\nWeek Below sync server · ws://localhost:${PORT}`);
+console.log(`Persistence: ${DATA_FILE}`);
+console.log(`State seeded: ${appState.seeded}\n`);
