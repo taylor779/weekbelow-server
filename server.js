@@ -57,13 +57,15 @@ function scheduleSave() {
 
 function defaultAppState() {
   return {
-    projects: [],
-    clients:  [],
-    users:    [],
-    archived: [],
-    tasks:    [],
-    wbState:  {},
-    seeded:   false,
+    projects:  [],
+    clients:   [],
+    users:     [],
+    archived:  [],
+    tasks:     [],
+    wbState:   {},
+    templates: [],
+    brand:     {},
+    seeded:    false,
   };
 }
 
@@ -137,13 +139,15 @@ wss.on('connection', (socket) => {
       }
 
       case 'app_sync': {
-        const { projects, clients: cls, users, archived, tasks, wbState, userName } = msg;
-        if (projects !== undefined) appState.projects = projects;
-        if (cls      !== undefined) appState.clients  = cls;
-        if (users    !== undefined) appState.users    = users;
-        if (archived !== undefined) appState.archived = archived;
-        if (tasks    !== undefined) appState.tasks    = tasks;
-        if (wbState  !== undefined) appState.wbState  = wbState;
+        const { projects, clients: cls, users, archived, tasks, wbState, templates, brand, userName } = msg;
+        if (projects  !== undefined) appState.projects  = projects;
+        if (cls       !== undefined) appState.clients   = cls;
+        if (users     !== undefined) appState.users     = users;
+        if (archived  !== undefined) appState.archived  = archived;
+        if (tasks     !== undefined) appState.tasks     = tasks;
+        if (wbState   !== undefined) appState.wbState   = wbState;
+        if (templates !== undefined) appState.templates = templates;
+        if (brand     !== undefined) appState.brand     = brand;
         appState.seeded = true;
         scheduleSave();
         broadcast({ type: 'app_sync', appState, triggeredBy: userName || '?' }, socket);
