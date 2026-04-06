@@ -370,6 +370,7 @@ function notifyAssignments(newProjects, prevProjects, triggerName) {
 wss.on('connection', socket => {
   clients.add(socket);
   log('+', `Client connected (total: ${clients.size})`);
+  log('🔑', `RESEND_API_KEY: ${RESEND_KEY ? 'SET (' + RESEND_KEY.slice(0,8) + '...)' : 'NOT SET — emails will not send'}`);
   sendSnapshot(socket);
 
   socket.on('message', raw => {
@@ -438,6 +439,7 @@ wss.on('connection', socket => {
 
       case 'test_email': {
         const to = msg.to;
+        console.log('[TEST EMAIL] Received request to:', to, '| RESEND_KEY set:', !!RESEND_KEY, '| Key prefix:', RESEND_KEY ? RESEND_KEY.slice(0,8) : 'NONE');
         if (!to || !to.includes('@')) {
           socket.send(JSON.stringify({ type:'email_result', ok:false, error:'No valid email address provided.' }));
           break;
