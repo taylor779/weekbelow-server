@@ -21,6 +21,7 @@
 
 const { WebSocketServer, WebSocket } = require('ws');
 const https = require('https');
+const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
@@ -65,8 +66,12 @@ const activeTimers = {};
 let appState = loadState();
 const clients = new Set();
 
-// Pure WebSocket server — test email and recap triggered via WS messages from app
-const wss = new WebSocketServer({ port: PORT });
+// HTTP server handles Railway health checks + WebSocket upgrades on same port
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Week Below OK');
+});
+const wss = new WebSocketServer({ server: httpServer });
 
 function broadcast(payload, excludeSocket = null) {
   const msg = JSON.stringify(payload);
@@ -447,9 +452,11 @@ wss.on('connection', socket => {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
-console.log(`\nWeek Below sync server · ws://localhost:${PORT}`);
-console.log(`Persistence: ${DATA_FILE}`);
-console.log(`State seeded: ${appState.seeded}`);
-console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}\n`);
+httpServer.listen(PORT, () => {
+  console.log(`\nWeek Below sync server · port ${PORT}`);
+  console.log(`Persistence: ${DATA_FILE}`);
+  console.log(`State seeded: ${appState.seeded}`);
+  console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}\n`);
+});
 
 scheduleWeeklyRecap();
