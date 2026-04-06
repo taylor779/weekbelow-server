@@ -2,9 +2,9 @@
   "name": "weekbelow-server",
   "version": "1.0.0",
   "description": "Week Below live sync WebSocket server",
-  "main": "weekbelow-server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node weekbelow-server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "ws": "^8.17.0"
