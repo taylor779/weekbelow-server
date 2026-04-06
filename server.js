@@ -21,10 +21,11 @@
 
 const { WebSocketServer, WebSocket } = require('ws');
 const https = require('https');
+const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
-const PORT       = parseInt(process.env.WB_PORT || '8765', 10);
+const PORT = parseInt(process.env.PORT || process.env.WB_PORT || '8765', 10);
 const DATA_DIR   = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname);
 const DATA_FILE  = path.join(DATA_DIR, 'data.json');
 const RESEND_KEY = process.env.RESEND_API_KEY || '';
@@ -64,7 +65,58 @@ function defaultAppState() {
 const activeTimers = {};
 let appState = loadState();
 const clients = new Set();
-const wss = new WebSocketServer({ port: PORT });
+
+// Shared HTTP server — handles both WebSocket upgrades and HTTP requests
+const httpServer = http.createServer((req, res) => {
+  const u = new URL(req.url, `http://localhost:${PORT}`);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json');
+
+  if (u.pathname === '/status') {
+    const users = (appState.users || []).filter(u => u.active !== false);
+    const withEmail = users.filter(u => u.email && u.email.includes('@') && !u.email.includes('@weekbelow.com'));
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      ok: true,
+      seeded: appState.seeded,
+      users: users.length,
+      usersWithRealEmail: withEmail.map(u => ({ name: u.name, email: u.email })),
+      resendConfigured: !!RESEND_KEY,
+      resendKeyPrefix: RESEND_KEY ? RESEND_KEY.slice(0, 12) + '...' : null,
+      port: PORT,
+    }, null, 2));
+    return;
+  }
+
+  if (u.pathname === '/test-email') {
+    const to = u.searchParams.get('to');
+    if (!to || !to.includes('@')) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Add ?to=your@email.com to the URL' }));
+      return;
+    }
+    const html = wrap(`
+      <h2>Test email ✓</h2>
+      <p class="sub">If you're reading this, Week Below emails are working.</p>
+      <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
+        <div style="font-size:14px;font-weight:500;margin-bottom:8px;">Details</div>
+        <div style="font-size:13px;color:#555;">Resend key: ${RESEND_KEY ? RESEND_KEY.slice(0,12)+'...' : 'NOT SET'}</div>
+        <div style="font-size:13px;color:#555;">From: ${FROM_EMAIL}</div>
+        <div style="font-size:13px;color:#555;">Sent: ${new Date().toISOString()}</div>
+      </div>
+    `);
+    sendEmail({ to, subject: '✅ Week Below test email', html }).then(() => {
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, to, sent: new Date().toISOString() }));
+    });
+    return;
+  }
+
+  res.writeHead(200);
+  res.end(JSON.stringify({ ok: true, service: 'Week Below', endpoints: ['/status', '/test-email?to=email'] }));
+});
+
+const wss = new WebSocketServer({ server: httpServer });
 
 function broadcast(payload, excludeSocket = null) {
   const msg = JSON.stringify(payload);
@@ -94,12 +146,16 @@ function sendEmail({ to, subject, html }) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) log('✉', `Sent to ${to} — ${subject}`);
-        else log('✉', `Failed (${res.statusCode}) to ${to}: ${data}`);
-        resolve();
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          log('✉', `Sent to ${to} — ${subject}`);
+          resolve({ ok:true });
+        } else {
+          log('✉', `Failed (${res.statusCode}) to ${to}: ${data}`);
+          resolve({ ok:false, error:`HTTP ${res.statusCode}`, detail:data });
+        }
       });
     });
-    req.on('error', e => { log('✉', `Error: ${e.message}`); resolve(); });
+    req.on('error', e => { log('✉', `Error: ${e.message}`); resolve({ ok:false, error:e.message }); });
     req.write(body); req.end();
   });
 }
@@ -379,6 +435,53 @@ wss.on('connection', socket => {
       }
 
       case 'ping': { sendSnapshot(socket); break; }
+
+      case 'test_email': {
+        const to = msg.to;
+        if (!to || !to.includes('@')) {
+          socket.send(JSON.stringify({ type:'email_result', ok:false, error:'No valid email address provided.' }));
+          break;
+        }
+        if (!RESEND_KEY) {
+          socket.send(JSON.stringify({ type:'email_result', ok:false, to, error:'RESEND_API_KEY is not set on the server. Add it in Railway → Variables.' }));
+          break;
+        }
+        const html = wrap(`
+          <h2>Test email ✓</h2>
+          <p class="sub">If you're reading this, Week Below emails are working correctly.</p>
+          <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
+            <div style="font-size:13px;color:#555;">From: ${FROM_EMAIL}</div>
+            <div style="font-size:13px;color:#555;">Sent: ${new Date().toISOString()}</div>
+            <div style="font-size:13px;color:#555;">Key: ${RESEND_KEY.slice(0,12)}...</div>
+          </div>
+        `);
+        sendEmail({ to, subject: '✅ Week Below — email test', html })
+          .then(result => {
+            socket.send(JSON.stringify({
+              type: 'email_result',
+              ok: result.ok,
+              to,
+              error: result.error || null,
+              detail: result.detail || null,
+            }));
+          });
+        log('✉', `Test email requested by ${msg.userName || '?'} → ${to}`);
+        break;
+      }
+
+      case 'send_recap_now': {
+        log('✉', `Manual weekly recap triggered by ${msg.userName || '?'}`);
+        const users = (appState.users || []).filter(u => u.active !== false);
+        const withEmail = users.filter(u => u.email && u.email.includes('@') && !u.email.includes('@weekbelow.com'));
+        const skipped = users.length - withEmail.length;
+        try {
+          sendWeeklyRecaps();
+          socket.send(JSON.stringify({ type:'recap_result', ok:true, count:withEmail.length, skipped }));
+        } catch(e) {
+          socket.send(JSON.stringify({ type:'recap_result', ok:false, error:e.message }));
+        }
+        break;
+      }
     }
   });
 
@@ -388,9 +491,18 @@ wss.on('connection', socket => {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
-console.log(`\nWeek Below sync server · ws://localhost:${PORT}`);
-console.log(`Persistence: ${DATA_FILE}`);
-console.log(`State seeded: ${appState.seeded}`);
-console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}\n`);
+// ── HTTP server (test endpoints) ─────────────────────────────────────────────
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+
+httpServer.listen(PORT, () => {
+  console.log(`\nWeek Below sync server running on port ${PORT}`);
+  console.log(`WebSocket: ws://localhost:${PORT}`);
+  console.log(`HTTP:      http://localhost:${PORT}/status`);
+  console.log(`Test:      http://localhost:${PORT}/test-email?to=you@email.com`);
+  console.log(`Persistence: ${DATA_FILE}`);
+  console.log(`State seeded: ${appState.seeded}`);
+  console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}\n`);
+});
 
 scheduleWeeklyRecap();
