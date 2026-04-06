@@ -95,7 +95,7 @@ function sendEmail({ to, subject, html }) {
       res.on('data', d => data += d);
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) log('✉', `Sent to ${to} — ${subject}`);
-        else log('✉', `Failed (${res.statusCode}) to ${to}: ${data.slice(0,100)}`);
+        else log('✉', `Failed (${res.statusCode}) to ${to}: ${data}`);
         resolve();
       });
     });
@@ -292,6 +292,7 @@ function notifyAssignments(newProjects, prevProjects, triggerName) {
     const oldIds = (oldP ? oldP.assigned || [] : []).map(String);
     const newIds = (newP.assigned || []).map(String);
     const added = newIds.filter(id => !oldIds.includes(id));
+    log('🔍', `Assignment check "${newP.name}": old=[${oldIds}] new=[${newIds}] added=[${added}]`);
     if (!added.length) return;
 
     const cl = (appState.clients || []).find(c => c.id === newP.clientId);
@@ -300,8 +301,7 @@ function notifyAssignments(newProjects, prevProjects, triggerName) {
     added.forEach(uid => {
       const user = (appState.users || []).find(u => String(u.id) === uid);
       if (!user || !user.email || !user.email.includes('@')) return;
-      // Don't email the person who made the change
-      if (user.name === triggerName) return;
+      // Note: we DO email self-assignments — if you assign yourself, you should still get the confirmation
       const { subject, html } = assignmentEmail(user, proj, triggerName || 'Someone');
       log('✉', `Assignment email → ${user.email} for "${newP.name}"`);
       sendEmail({ to: user.email, subject, html });
@@ -342,7 +342,8 @@ wss.on('connection', socket => {
 
       case 'app_sync': {
         const { projects, clients: cls, users, archived, tasks, wbState, templates, brand, userName } = msg;
-        const prevProjects = appState.projects;
+        // Snapshot BEFORE updating so we can diff for assignment changes
+        const prevProjects = JSON.parse(JSON.stringify(appState.projects || []));
 
         if (projects  !== undefined) appState.projects  = projects;
         if (cls       !== undefined) appState.clients   = cls;
