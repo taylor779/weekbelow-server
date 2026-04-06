@@ -1,11 +1,15 @@
 {
   "name": "weekbelow-server",
   "version": "1.0.0",
-  "main": "server.js",
+  "description": "Week Below live sync WebSocket server",
+  "main": "weekbelow-server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node weekbelow-server.js"
   },
   "dependencies": {
-    "ws": "^8.0.0"
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=16"
   }
 }
