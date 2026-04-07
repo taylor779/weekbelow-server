@@ -395,6 +395,7 @@ wss.on('connection', socket => {
         if (wbState   !== undefined) appState.wbState   = wbState;
         if (templates !== undefined) appState.templates = templates;
         if (msg.taskTemplates !== undefined) appState.taskTemplates = msg.taskTemplates;
+        if (msg.businessCosts !== undefined) appState.businessCosts = msg.businessCosts;
         if (brand     !== undefined) appState.brand     = brand;
         appState.seeded = true;
         scheduleSave();
