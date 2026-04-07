@@ -80,10 +80,10 @@ function broadcast(payload, excludeSocket = null) {
   }
 }
 function sendSnapshot(socket) {
-  // Strip PINs before sending — clients only need to know IF a user has a PIN, not the value
+  // Strip legacy plaintext pin field — pinHash (SHA-256) is safe to send
   const safeUsers = (appState.users || []).map(u => {
-    const { pin, ...rest } = u;
-    return { ...rest, hasPin: !!(pin && pin.length) };
+    const { pin, ...rest } = u; // remove any legacy plaintext pin
+    return rest; // pinHash stays — it's a one-way hash, safe across devices
   });
   const safeState = { ...appState, users: safeUsers };
   socket.send(JSON.stringify({ type:'snapshot', timers:Object.values(activeTimers), appState: safeState }));
@@ -382,11 +382,11 @@ wss.on('connection', socket => {
         if (projects  !== undefined) appState.projects  = projects;
         if (cls       !== undefined) appState.clients   = cls;
         if (users     !== undefined) {
-          // Merge incoming users with existing PINs — clients receive hasPin (not the real PIN)
-          // so we must preserve the real PIN from our authoritative server copy
+          // Merge users — client sends pinHash (SHA-256), preserve it
+          // Strip any legacy plaintext pin field for security
           const merged = users.map(incoming => {
-            const existing = (appState.users || []).find(u => String(u.id) === String(incoming.id));
-            return { ...incoming, pin: incoming.pin || (existing ? existing.pin : '') };
+            const { pin, ...rest } = incoming; // strip legacy plaintext
+            return rest; // pinHash is included and safe
           });
           appState.users = merged;
         }
