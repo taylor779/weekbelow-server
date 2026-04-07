@@ -1,5 +1,5 @@
 /**
- * Week Below — Live Sync WebSocket Server
+ * BSMNT — Live Sync WebSocket Server
  * ────────────────────────────────────────
  * Server is the single source of truth for all app data.
  * Data is persisted to /data/data.json on Railway volume
@@ -29,7 +29,7 @@ const PORT = parseInt(process.env.PORT || process.env.WB_PORT || '8765', 10);
 const DATA_DIR   = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname);
 const DATA_FILE  = path.join(DATA_DIR, 'data.json');
 const RESEND_KEY = process.env.RESEND_API_KEY || '';
-const FROM_EMAIL = 'Week Below <onboarding@resend.dev>';
+const FROM_EMAIL = 'BSMNT <onboarding@resend.dev>';
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ function scheduleSave() {
 
 function defaultAppState() {
   return { projects:[], clients:[], users:[], archived:[], tasks:[],
-           wbState:{}, templates:[], brand:{}, seeded:false };
+           wbState:{}, templates:[], taskTemplates:{'Pre-Production':[],'Production':[],'Post Production':[]}, brand:{}, seeded:false };
 }
 
 const activeTimers = {};
@@ -69,7 +69,7 @@ const clients = new Set();
 // HTTP server handles Railway health checks + WebSocket upgrades on same port
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Week Below OK');
+  res.end('BSMNT OK');
 });
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -144,7 +144,7 @@ function wrap(body) {
 <div class="card">
   <div class="hdr"><div class="logo">Week <span>Below</span></div></div>
   <div class="body">${body}</div>
-  <div class="ftr">Week Below · Video Production Management<br>You're receiving this as part of the team.</div>
+  <div class="ftr">BSMNT · Built from Below<br>You're receiving this as part of the team.</div>
 </div></body></html>`;
 }
 
@@ -170,10 +170,10 @@ function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueIt
   }).join('') || '<p style="color:#aaa;font-size:13px;">Nothing due this week 🎉</p>';
 
   return {
-    subject: `📋 Your Week Below recap — ${dateLabel}`,
+    subject: `📋 Your BSMNT recap — ${dateLabel}`,
     html: wrap(`
       <h2>Good morning, ${firstName} 👋</h2>
-      <p class="sub">Your Week Below recap for the week of ${dateLabel}</p>
+      <p class="sub">Your BSMNT recap for the week of ${dateLabel}</p>
       <div class="stats">
         <div class="stat"><div class="sn">${hoursLastWeek.toFixed(1)}h</div><div class="sl">Hours last week</div></div>
         <div class="stat"><div class="sn">${myProjects.length}</div><div class="sl">Active projects</div></div>
@@ -190,7 +190,7 @@ function assignmentEmail(user, project, byName) {
     subject: `🎬 You've been added to "${project.name}"`,
     html: wrap(`
       <h2>You've been added to a project</h2>
-      <p class="sub">${byName} has assigned you to a project in Week Below.</p>
+      <p class="sub">${byName} has assigned you to a project in BSMNT.</p>
       <div class="proj-card">
         <div style="font-size:18px;font-weight:600;margin-bottom:6px">${project.name}</div>
         ${project.client ? `<div style="font-size:13px;color:#777">${project.client}</div>` : ''}
@@ -198,7 +198,7 @@ function assignmentEmail(user, project, byName) {
         ${project.description ? `<div style="font-size:13px;color:#555;margin-top:12px;line-height:1.65">${project.description}</div>` : ''}
       </div>
       <p style="font-size:13px;color:#555;line-height:1.7">
-        Log in to Week Below to view the project, track your time, and check the run sheet.
+        Log in to BSMNT to view the project, track your time, and check the run sheet.
       </p>
     `),
   };
@@ -266,8 +266,8 @@ function sendWeeklyRecaps() {
     }
   });
 
-  const recipients = (appState.users || []).filter(u => u.active !== false && u.email && u.email.includes('@'));
-  log('✉', `Sending weekly recaps to ${recipients.length} users`);
+  const recipients = (appState.users || []).filter(u => u.active !== false && u.email && u.email.includes('@') && !u.email.includes('@weekbelow.com'));
+  log('✉', `Sending weekly recaps to ${recipients.length} users: ${recipients.map(u => u.email).join(', ')}`);
 
   recipients.forEach((user, idx) => {
     const hoursLastWeek = activeProjects.reduce((s, p) =>
@@ -364,6 +364,7 @@ wss.on('connection', socket => {
         if (tasks     !== undefined) appState.tasks     = tasks;
         if (wbState   !== undefined) appState.wbState   = wbState;
         if (templates !== undefined) appState.templates = templates;
+        if (msg.taskTemplates !== undefined) appState.taskTemplates = msg.taskTemplates;
         if (brand     !== undefined) appState.brand     = brand;
         appState.seeded = true;
         scheduleSave();
@@ -405,14 +406,14 @@ wss.on('connection', socket => {
         }
         const html = wrap(`
           <h2>Test email ✓</h2>
-          <p class="sub">If you're reading this, Week Below emails are working correctly.</p>
+          <p class="sub">If you're reading this, BSMNT emails are working correctly.</p>
           <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
             <div style="font-size:13px;color:#555;">From: ${FROM_EMAIL}</div>
             <div style="font-size:13px;color:#555;">Sent: ${new Date().toISOString()}</div>
             <div style="font-size:13px;color:#555;">Key: ${RESEND_KEY.slice(0,12)}...</div>
           </div>
         `);
-        sendEmail({ to, subject: '✅ Week Below — email test', html })
+        sendEmail({ to, subject: '✅ BSMNT — email test', html })
           .then(result => {
             socket.send(JSON.stringify({
               type: 'email_result',
@@ -453,7 +454,7 @@ wss.on('connection', socket => {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 httpServer.listen(PORT, () => {
-  console.log(`\nWeek Below sync server · port ${PORT}`);
+  console.log(`\nBSMNT sync server · port ${PORT}`);
   console.log(`Persistence: ${DATA_FILE}`);
   console.log(`State seeded: ${appState.seeded}`);
   console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}\n`);
