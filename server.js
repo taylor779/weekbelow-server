@@ -71,7 +71,7 @@ const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('BSMNT OK');
 });
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 }); // 5MB max message
 
 function broadcast(payload, excludeSocket = null) {
   const msg = JSON.stringify(payload);
@@ -80,7 +80,13 @@ function broadcast(payload, excludeSocket = null) {
   }
 }
 function sendSnapshot(socket) {
-  socket.send(JSON.stringify({ type:'snapshot', timers:Object.values(activeTimers), appState }));
+  // Strip PINs before sending — clients only need to know IF a user has a PIN, not the value
+  const safeUsers = (appState.users || []).map(u => {
+    const { pin, ...rest } = u;
+    return { ...rest, hasPin: !!(pin && pin.length) };
+  });
+  const safeState = { ...appState, users: safeUsers };
+  socket.send(JSON.stringify({ type:'snapshot', timers:Object.values(activeTimers), appState: safeState }));
 }
 function log(icon, msg) {
   console.log(`[${new Date().toTimeString().slice(0,8)}] ${icon}  ${msg}`);
@@ -326,6 +332,9 @@ wss.on('connection', socket => {
   clients.add(socket);
   log('+', `Client connected (total: ${clients.size})`);
   log('🔑', `RESEND_API_KEY: ${RESEND_KEY ? 'SET (' + RESEND_KEY.slice(0,8) + '...)' : 'NOT SET — emails will not send'}`);
+  // Rate limit app_sync to prevent disk hammering
+  socket._lastSync = 0;
+  socket._syncCount = 0;
   sendSnapshot(socket);
 
   socket.on('message', raw => {
@@ -353,13 +362,34 @@ wss.on('connection', socket => {
       }
 
       case 'app_sync': {
+        // Rate limit: max 2 syncs per second per socket to prevent disk hammering
+        const now = Date.now();
+        if (now - (socket._lastSync || 0) < 500) {
+          socket._syncCount = (socket._syncCount || 0) + 1;
+          if (socket._syncCount > 5) {
+            log('⚠', `Rate limit: app_sync throttled`);
+            break;
+          }
+        } else {
+          socket._syncCount = 0;
+        }
+        socket._lastSync = now;
+
         const { projects, clients: cls, users, archived, tasks, wbState, templates, brand, userName } = msg;
         // Snapshot BEFORE updating so we can diff for assignment changes
         const prevProjects = JSON.parse(JSON.stringify(appState.projects || []));
 
         if (projects  !== undefined) appState.projects  = projects;
         if (cls       !== undefined) appState.clients   = cls;
-        if (users     !== undefined) appState.users     = users;
+        if (users     !== undefined) {
+          // Merge incoming users with existing PINs — clients receive hasPin (not the real PIN)
+          // so we must preserve the real PIN from our authoritative server copy
+          const merged = users.map(incoming => {
+            const existing = (appState.users || []).find(u => String(u.id) === String(incoming.id));
+            return { ...incoming, pin: incoming.pin || (existing ? existing.pin : '') };
+          });
+          appState.users = merged;
+        }
         if (archived  !== undefined) appState.archived  = archived;
         if (tasks     !== undefined) appState.tasks     = tasks;
         if (wbState   !== undefined) appState.wbState   = wbState;
