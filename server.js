@@ -29,7 +29,7 @@ const PORT = parseInt(process.env.PORT || process.env.WB_PORT || '8765', 10);
 const DATA_DIR   = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname);
 const DATA_FILE  = path.join(DATA_DIR, 'data.json');
 const RESEND_KEY = process.env.RESEND_API_KEY || '';
-const FROM_EMAIL = 'BSMNT <onboarding@resend.dev>';
+const FROM_EMAIL = 'BSMNT <noreply@bsmnt.co.nz>';
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
@@ -272,7 +272,7 @@ function sendWeeklyRecaps() {
     }
   });
 
-  const recipients = (appState.users || []).filter(u => u.active !== false && u.email && u.email.includes('@') && !u.email.includes('@weekbelow.com'));
+  const recipients = (appState.users || []).filter(u => u.active !== false && u.emailWeekly !== false && u.email && u.email.includes('@'));
   log('✉', `Sending weekly recaps to ${recipients.length} users: ${recipients.map(u => u.email).join(', ')}`);
 
   recipients.forEach((user, idx) => {
@@ -318,6 +318,7 @@ function notifyAssignments(newProjects, prevProjects, triggerName) {
     added.forEach(uid => {
       const user = (appState.users || []).find(u => String(u.id) === uid);
       if (!user || !user.email || !user.email.includes('@')) return;
+      if (user.emailAssign === false) return; // user opted out
       // Note: we DO email self-assignments — if you assign yourself, you should still get the confirmation
       const { subject, html } = assignmentEmail(user, proj, triggerName || 'Someone');
       log('✉', `Assignment email → ${user.email} for "${newP.name}"`);
