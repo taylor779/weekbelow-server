@@ -1,685 +1,149 @@
-/**
- * BSMNT — Live Sync WebSocket Server
- * ────────────────────────────────────────
- * Server is the single source of truth for all app data.
- * Data is persisted to /data/data.json on Railway volume
- * (or ./data.json locally) so restarts never lose state.
- *
- * Requirements:  Node.js 16+
- * Install:       npm install ws
- * Run:           node server.js
- * Port:          8765  (override with WB_PORT env var)
- *
- * Railway env vars:
- *   RESEND_API_KEY  — your Resend API key
- *   WB_PORT         — optional port override
- *
- * Email features:
- *   - Weekly recap every Monday 8am NZT
- *   - Assignment notification when added to a project
- */
+// ══════════════════════════════════════════════════════════════════════════════
+// WEEK BELOW — RAILWAY SERVER HANDLER ADDITIONS
+// Add these cases to your existing ws.on('message') switch/if-else block
+// Assumes you already have: const resend = new Resend(process.env.RESEND_API_KEY);
+// and FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@weekbelow.com'
+// ══════════════════════════════════════════════════════════════════════════════
 
-const { WebSocketServer, WebSocket } = require('ws');
-const https = require('https');
-const http  = require('http');
-const fs    = require('fs');
-const path  = require('path');
+// ── feedback_reply ────────────────────────────────────────────────────────────
+// Triggered when Taylor hits "Send Reply" on a bug/feature/feedback item
+if (msg.type === 'feedback_reply') {
+  const { feedbackId, userEmail, subject, replyText, senderName } = msg;
 
-const PORT = parseInt(process.env.PORT || process.env.WB_PORT || '8765', 10);
-const DATA_DIR   = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname);
-const DATA_FILE  = path.join(DATA_DIR, 'data.json');
-const RESEND_KEY = process.env.RESEND_API_KEY || '';
-const FROM_EMAIL = 'BSMNT <noreply@bsmnt.co.nz>';
+  if (!userEmail || !replyText) {
+    console.warn('[feedback_reply] Missing userEmail or replyText');
+    return;
+  }
 
-// ── Persistence ───────────────────────────────────────────────────────────────
-
-let saveTimer = null;
-
-function loadState() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = fs.readFileSync(DATA_FILE, 'utf8');
-      const parsed = JSON.parse(raw);
-      log('💾', `Loaded state from ${DATA_FILE}`);
-      return { ...defaultAppState(), ...parsed, seeded: true };
-    }
-  } catch (e) { console.error('Failed to load state:', e.message); }
-  return defaultAppState();
-}
-
-function scheduleSave() {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(DATA_FILE, JSON.stringify(appState, null, 2));
-    } catch (e) { console.error('Failed to save state:', e.message); }
-  }, 2000);
-}
-
-function defaultAppState() {
-  return { projects:[], clients:[], users:[], archived:[], tasks:[],
-           wbState:{}, templates:[], taskTemplates:{'Pre-Production':[],'Production':[],'Post Production':[]}, brand:{}, retainers:[], seeded:false };
-}
-
-const activeTimers = {};
-let appState = loadState();
-const clients = new Set();
-
-// HTTP server handles Railway health checks + WebSocket upgrades on same port
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('BSMNT OK');
-});
-const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 }); // 5MB max message
-
-function broadcast(payload, excludeSocket = null) {
-  const msg = JSON.stringify(payload);
-  for (const c of clients) {
-    if (c !== excludeSocket && c.readyState === WebSocket.OPEN) c.send(msg);
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      userEmail,
+      subject: subject || 'Re: your feedback',
+      html: `
+        <div style="font-family:'DM Sans',sans-serif;max-width:560px;margin:0 auto;color:#111;font-size:14px;line-height:1.6;">
+          <div style="background:#7c6fff;padding:16px 24px;border-radius:8px 8px 0 0;">
+            <div style="color:#fff;font-size:16px;font-weight:600;">Week Below</div>
+          </div>
+          <div style="background:#fff;padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;">
+            <p style="margin:0 0 16px;">Hi there,</p>
+            <p style="margin:0 0 16px;">${escapeHtml(replyText)}</p>
+            <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;"/>
+            <p style="margin:0;font-size:12px;color:#6b7280;">
+              Replied by ${escapeHtml(senderName || 'The Week Below team')}<br/>
+              <a href="https://app.weekbelow.com" style="color:#7c6fff;">app.weekbelow.com</a>
+            </p>
+          </div>
+        </div>
+      `,
+    });
+    console.log(`[feedback_reply] Reply sent to ${userEmail} re: feedback ${feedbackId}`);
+  } catch (e) {
+    console.error('[feedback_reply] Email error:', e.message);
   }
 }
-function sendSnapshot(socket) {
-  // Strip legacy plaintext pin field — pinHash (SHA-256) is safe to send
-  const safeUsers = (appState.users || []).map(u => {
-    const { pin, ...rest } = u; // remove any legacy plaintext pin
-    return rest; // pinHash stays — it's a one-way hash, safe across devices
-  });
-  const safeState = { ...appState, users: safeUsers };
-  socket.send(JSON.stringify({ type:'snapshot', timers:Object.values(activeTimers), appState: safeState }));
-}
-function log(icon, msg) {
-  console.log(`[${new Date().toTimeString().slice(0,8)}] ${icon}  ${msg}`);
-}
 
-// ── Email via Resend ──────────────────────────────────────────────────────────
+// ── project_assigned ──────────────────────────────────────────────────────────
+// Triggered when a team member is assigned to a project
+if (msg.type === 'project_assigned') {
+  const { to, userName, projectName, assignedBy } = msg;
 
-function sendEmail({ to, subject, html }) {
-  if (!RESEND_KEY) { log('✉', `[no key] Would send to ${to}: ${subject}`); return Promise.resolve(); }
-  if (!to || !to.includes('@')) { log('✉', `Skipping — invalid address: ${to}`); return Promise.resolve(); }
-  const body = JSON.stringify({ from: FROM_EMAIL, to, subject, html });
-  return new Promise(resolve => {
-    const req = https.request({
-      hostname: 'api.resend.com', path: '/emails', method: 'POST',
-      headers: { 'Authorization': `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json',
-                 'Content-Length': Buffer.byteLength(body) },
-    }, res => {
-      let data = '';
-      res.on('data', d => data += d);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          log('✉', `Sent to ${to} — ${subject}`);
-          resolve({ ok:true });
-        } else {
-          log('✉', `Failed (${res.statusCode}) to ${to}: ${data}`);
-          resolve({ ok:false, error:`HTTP ${res.statusCode}`, detail:data });
-        }
-      });
-    });
-    req.on('error', e => { log('✉', `Error: ${e.message}`); resolve({ ok:false, error:e.message }); });
-    req.write(body); req.end();
-  });
-}
-
-// ── Email templates ───────────────────────────────────────────────────────────
-
-const BASE_STYLE = `
-  body{font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background:#0c0c0e;margin:0;padding:40px 16px;color:#e0e0ec;}
-  .wrap{max-width:560px;margin:0 auto;}
-  /* Logo header */
-  .hdr{text-align:center;padding-bottom:28px;}
-  .logo-mark{display:inline-block;background:#7c6fff;border-radius:10px;width:40px;height:40px;line-height:40px;text-align:center;font-size:18px;font-weight:700;color:#fff;vertical-align:middle;margin-right:10px;}
-  .logo-name{font-size:18px;font-weight:700;color:#fff;letter-spacing:-0.3px;vertical-align:middle;}
-  .logo-sub{font-size:10px;color:#55556a;letter-spacing:1px;text-transform:uppercase;display:block;margin-top:2px;text-align:center;}
-  /* Card */
-  .card{background:#131316;border:1px solid #25252f;border-radius:16px;overflow:hidden;}
-  .body{padding:36px 36px 32px;}
-  h2{font-size:22px;font-weight:700;margin:0 0 6px;color:#fff;letter-spacing:-0.4px;}
-  .sub{font-size:14px;color:#8080a0;margin:0 0 28px;line-height:1.6;}
-  /* CTA button */
-  .btn-wrap{text-align:center;margin:0 0 28px;}
-  .btn{display:inline-block;background:#7c6fff;color:#fff;font-size:14px;font-weight:600;padding:13px 32px;border-radius:8px;text-decoration:none;letter-spacing:-0.1px;}
-  /* Divider */
-  .div{border:none;border-top:1px solid #25252f;margin:24px 0;}
-  /* Section labels */
-  .slabel{font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#55556a;margin:24px 0 10px;border-bottom:1px solid #25252f;padding-bottom:8px;}
-  /* Project rows */
-  .prow{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid #1e1e28;}
-  .pname{font-size:13px;font-weight:600;color:#e0e0ec;} .pmeta{font-size:11px;color:#55556a;margin-top:2px;}
-  /* Badges */
-  .badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;white-space:nowrap;}
-  .ok{background:rgba(52,211,153,0.12);color:#34d399;}
-  .warn{background:rgba(251,191,36,0.12);color:#fbbf24;}
-  .over{background:rgba(248,113,113,0.12);color:#f87171;}
-  /* Stats row */
-  .stats{display:flex;gap:10px;margin:0 0 24px;}
-  .stat{background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:14px 16px;flex:1;text-align:center;}
-  .sn{font-size:24px;font-weight:700;color:#7c6fff;letter-spacing:-0.5px;}
-  .sl{font-size:10px;color:#55556a;margin-top:3px;text-transform:uppercase;letter-spacing:0.5px;}
-  /* Due rows */
-  .drow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1e1e28;}
-  .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
-  /* Project card (assignment email) */
-  .proj-card{background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 22px;margin:20px 0;border-left:3px solid #7c6fff;}
-  .proj-card-name{font-size:17px;font-weight:700;color:#fff;margin-bottom:5px;}
-  .proj-card-client{font-size:12px;color:#55556a;}
-  .proj-card-due{font-size:12px;color:#8080a0;margin-top:8px;}
-  .proj-card-desc{font-size:13px;color:#8080a0;margin-top:12px;line-height:1.65;}
-  /* Link fallback */
-  .link-box{background:#0c0c0e;border:1px solid #25252f;border-radius:6px;padding:10px 12px;margin-top:12px;}
-  .link-text{font-size:11px;color:#3a3a50;word-break:break-all;font-family:monospace;}
-  .link-label{font-size:11px;color:#55556a;margin-bottom:6px;}
-  /* Footer */
-  .ftr{padding:20px 36px;text-align:center;font-size:11px;color:#3a3a50;line-height:1.8;border-top:1px solid #25252f;}
-`;
-
-function wrap(body) {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <style>${BASE_STYLE}</style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="hdr">
-      <img src="data:image/png;base64,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" width="48" height="48" alt="BSMNT" style="display:block;margin:0 auto 10px;width:48px;height:48px;border-radius:10px;"/>
-      <div style="font-size:18px;font-weight:700;color:#fff;letter-spacing:-0.3px;text-align:center;">BSMNT</div>
-      <div style="font-size:10px;color:#55556a;letter-spacing:1px;text-transform:uppercase;text-align:center;margin-top:2px;">Studio Management</div>
-    </div>
-    <div class="card">
-      <div class="body">${body}</div>
-      <div class="ftr">
-        BSMNT Studio Management &middot; bsmnt.co.nz<br>
-        You're receiving this as a member of your studio.
-      </div>
-    </div>
-  </div>
-</body>
-</html>`;
-}
-
-function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems }) {
-  const dateLabel = new Date().toLocaleDateString('en-NZ', { day:'numeric', month:'long', year:'numeric' });
-  const firstName = user.name.split(' ')[0];
-
-  const projRows = myProjects.map(p => {
-    const cls = p.budgetPct < 70 ? 'ok' : p.budgetPct < 100 ? 'warn' : 'over';
-    const label = p.budgetPct < 70 ? 'On track' : p.budgetPct < 100 ? 'Watch budget' : 'Over budget';
-    const dueFmt = p.endDate ? new Date(p.endDate + 'T12:00:00').toLocaleDateString('en-NZ', { day:'numeric', month:'short' }) : null;
-    return `<div class="prow"><div><div class="pname">${p.name}</div>
-      <div class="pmeta">${p.client}${dueFmt ? ' · Due ' + dueFmt : ''}</div></div>
-      <span class="badge ${cls}">${label}</span></div>`;
-  }).join('') || '<p style="font-size:13px;color:#55556a;padding:8px 0;">No active projects assigned to you.</p>';
-
-  const allDue = [...overdueItems, ...dueItems];
-  const dueRows = allDue.map(d => {
-    const col = d.overdue ? '#f87171' : '#fbbf24';
-    return `<div class="drow"><div class="dot" style="background:${col}"></div>
-      <div style="flex:1"><div style="font-size:13px;font-weight:500;color:#e0e0ec">${d.name}</div>
-      <div style="font-size:11px;color:#55556a">${d.type === 'project' ? 'Project' : 'Task'}</div></div>
-      <span style="font-size:12px;font-weight:600;color:${col}">${d.overdue ? 'Overdue' : 'Due ' + d.dueLabel}</span></div>`;
-  }).join('') || '<p style="font-size:13px;color:#55556a;padding:8px 0;">Nothing due this week 🎉</p>';
-
-  return {
-    subject: `Your BSMNT recap — ${dateLabel}`,
-    html: wrap(`
-      <h2>Morning, ${firstName} 👋</h2>
-      <p class="sub">Your studio recap for the week of ${dateLabel}</p>
-      <div class="stats">
-        <div class="stat"><div class="sn">${hoursLastWeek.toFixed(1)}h</div><div class="sl">Hours logged</div></div>
-        <div class="stat"><div class="sn">${myProjects.length}</div><div class="sl">Active projects</div></div>
-        <div class="stat"><div class="sn" style="color:#34d399">${completedThisWeek}</div><div class="sl">Tasks done</div></div>
-      </div>
-      <div class="slabel">Your Active Projects</div>${projRows}
-      <div class="slabel">Due This Week / Overdue</div>${dueRows}
-    `),
-  };
-}
-
-function assignmentEmail(user, project, byName) {
-  const firstName = (user.name || 'there').split(' ')[0];
-  const dueFmt = project.endDate ? new Date(project.endDate + 'T12:00:00').toLocaleDateString('en-NZ', { day:'numeric', month:'long', year:'numeric' }) : null;
-  return {
-    subject: `You've been added to "${project.name}"`,
-    html: wrap(`
-      <h2>You're on a new project</h2>
-      <p class="sub">${byName} has assigned you to a project. Here's what you need to know.</p>
-      <div class="proj-card">
-        <div class="proj-card-name">${project.name}</div>
-        ${project.client ? `<div class="proj-card-client">${project.client}</div>` : ''}
-        ${dueFmt ? `<div class="proj-card-due">📅 Due ${dueFmt}</div>` : ''}
-        ${project.description ? `<div class="proj-card-desc">${project.description}</div>` : ''}
-      </div>
-      <p style="font-size:13px;color:#8080a0;line-height:1.7;margin:0;">
-        Log in to BSMNT to view the full brief, track your time, and check the run sheet.
-      </p>
-    `),
-  };
-}
-
-// ── Weekly recap scheduler ────────────────────────────────────────────────────
-
-function msUntilNextMondayNZT() {
-  // NZT is UTC+12 (close enough for weekly scheduling)
-  const NZT = 12 * 3600000;
-  const nowNzt = new Date(Date.now() + NZT);
-  const day  = nowNzt.getUTCDay(); // 0=Sun 1=Mon
-  const hour = nowNzt.getUTCHours();
-  let daysToMonday = (1 - day + 7) % 7;
-  if (daysToMonday === 0 && hour >= 8) daysToMonday = 7;
-  const nowSecs = nowNzt.getUTCHours() * 3600 + nowNzt.getUTCMinutes() * 60 + nowNzt.getUTCSeconds();
-  const target8am = 8 * 3600;
-  const secsToday = daysToMonday === 0 ? (target8am - nowSecs) : (86400 - nowSecs + target8am + (daysToMonday - 1) * 86400);
-  return secsToday * 1000;
-}
-
-function calcBudgetPct(p) {
-  const budgetEntries = (p.budgetEntries || []).reduce((s, e) => s + (e.amount || 0), 0);
-  const billed = (p.timeLog || []).reduce((s, l) => {
-    const u = (appState.users || []).find(u => String(u.id) === String(l.user));
-    return s + (l.hours * (u ? u.chargeRate || 0 : 0));
-  }, 0);
-  const total = billed + (p.hardCosts || 0) + budgetEntries;
-  return p.budget > 0 ? Math.round(total / p.budget * 100) : 0;
-}
-
-function sendWeeklyRecaps() {
-  if (!appState.seeded || !appState.users.length) {
-    log('✉', 'Recap skipped — no data'); return;
+  if (!to || !userName || !projectName) {
+    console.warn('[project_assigned] Missing fields:', msg);
+    return;
   }
 
-  const now = new Date();
-  const lastMonday = new Date(now); lastMonday.setDate(now.getDate() - 7); lastMonday.setHours(0,0,0,0);
-  const lastSunday = new Date(now); lastSunday.setDate(now.getDate() - 1); lastSunday.setHours(23,59,59,999);
-  const nextWeekEnd = new Date(now); nextWeekEnd.setDate(now.getDate() + 7); nextWeekEnd.setHours(23,59,59,999);
-
-  const inLastWeek = d => { if (!d) return false; const x = new Date(d+'T00:00:00'); return x >= lastMonday && x <= lastSunday; };
-
-  const activeProjects = (appState.projects || []).filter(p => p.status !== 'upcoming');
-
-  // Build due/overdue lists
-  const overdueItems = [], dueItems = [];
-  activeProjects.forEach(p => {
-    if (!p.endDate) return;
-    const d = new Date(p.endDate + 'T23:59:59');
-    if (d < now) { overdueItems.push({ name: p.name, type: 'project', overdue: true, dueLabel: p.endDate }); }
-    else if (d <= nextWeekEnd) {
-      const diff = Math.ceil((d - now) / 86400000);
-      dueItems.push({ name: p.name, type: 'project', overdue: false,
-        dueLabel: diff === 0 ? 'today' : diff === 1 ? 'tomorrow' : `in ${diff} days` });
-    }
-  });
-  (appState.tasks || []).filter(t => !t.done && t.dueDate).forEach(t => {
-    const d = new Date(t.dueDate + 'T23:59:59');
-    if (d < now) { overdueItems.push({ name: t.name, type: 'task', overdue: true, dueLabel: t.dueDate }); }
-    else if (d <= nextWeekEnd) {
-      const diff = Math.ceil((d - now) / 86400000);
-      dueItems.push({ name: t.name, type: 'task', overdue: false,
-        dueLabel: diff === 0 ? 'today' : diff === 1 ? 'tomorrow' : `in ${diff} days` });
-    }
-  });
-
-  const recipients = (appState.users || []).filter(u => u.active !== false && u.emailWeekly !== false && u.email && u.email.includes('@'));
-  log('✉', `Sending weekly recaps to ${recipients.length} users: ${recipients.map(u => u.email).join(', ')}`);
-
-  recipients.forEach((user, idx) => {
-    const hoursLastWeek = activeProjects.reduce((s, p) =>
-      s + (p.timeLog || []).filter(l => String(l.user) === String(user.id) && inLastWeek(l.date))
-        .reduce((t, l) => t + l.hours, 0), 0);
-
-    const completedThisWeek = (appState.tasks || []).filter(t => t.done && inLastWeek(t.completedAt)).length;
-
-    const myProjects = activeProjects
-      .filter(p => (p.assigned || []).map(String).includes(String(user.id)))
-      .map(p => {
-        const cl = (appState.clients || []).find(c => c.id === p.clientId);
-        return { name: p.name, client: cl ? cl.name : '', endDate: p.endDate, budgetPct: calcBudgetPct(p) };
-      });
-
-    const { subject, html } = weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems });
-    setTimeout(() => sendEmail({ to: user.email, subject, html }), idx * 600);
-  });
-}
-
-function scheduleWeeklyRecap() {
-  const ms = msUntilNextMondayNZT();
-  log('✉', `Weekly recap in ~${Math.round(ms/3600000)}h`);
-  setTimeout(() => { sendWeeklyRecaps(); scheduleWeeklyRecap();
-scheduleRetainerCheck(); }, ms);
-}
-
-// ── Assignment notifications ──────────────────────────────────────────────────
-
-function notifyAssignments(newProjects, prevProjects, triggerName) {
-  if (!Array.isArray(newProjects)) return;
-  newProjects.forEach(newP => {
-    const oldP = (prevProjects || []).find(p => String(p.id) === String(newP.id));
-    const oldIds = (oldP ? oldP.assigned || [] : []).map(String);
-    const newIds = (newP.assigned || []).map(String);
-    const added = newIds.filter(id => !oldIds.includes(id));
-    log('🔍', `Assignment check "${newP.name}": old=[${oldIds}] new=[${newIds}] added=[${added}]`);
-    if (!added.length) return;
-
-    const cl = (appState.clients || []).find(c => c.id === newP.clientId);
-    const proj = { name: newP.name, client: cl ? cl.name : '', endDate: newP.endDate, description: newP.description };
-
-    added.forEach(uid => {
-      const user = (appState.users || []).find(u => String(u.id) === uid);
-      if (!user) { log('⚠', `Assignment: no user found for uid=${uid} (users: ${(appState.users||[]).map(u=>String(u.id)).join(',')})`); return; }
-      if (!user.email || !user.email.includes('@')) { log('⚠', `Assignment: user ${user.name} has no valid email (${user.email})`); return; }
-      if (user.emailAssign === false) { log('✉', `Assignment: ${user.name} has opted out of assignment emails`); return; }
-      // Note: we DO email self-assignments — if you assign yourself, you should still get the confirmation
-      const { subject, html } = assignmentEmail(user, proj, triggerName || 'Someone');
-      log('✉', `Assignment email → ${user.email} for "${newP.name}"`);
-      sendEmail({ to: user.email, subject, html });
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      to,
+      subject: `You've been assigned to ${projectName}`,
+      html: `
+        <div style="font-family:'DM Sans',sans-serif;max-width:560px;margin:0 auto;color:#111;font-size:14px;line-height:1.6;">
+          <div style="background:#7c6fff;padding:16px 24px;border-radius:8px 8px 0 0;">
+            <div style="color:#fff;font-size:16px;font-weight:600;">Week Below</div>
+          </div>
+          <div style="background:#fff;padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;">
+            <p style="margin:0 0 16px;">Hi ${escapeHtml(userName)},</p>
+            <p style="margin:0 0 16px;">
+              You've been added to <strong>${escapeHtml(projectName)}</strong>
+              ${assignedBy ? ` by ${escapeHtml(assignedBy)}` : ''}.
+            </p>
+            <a href="https://app.weekbelow.com"
+               style="display:inline-block;background:#7c6fff;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;font-size:13px;">
+              Open Project →
+            </a>
+            <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0;"/>
+            <p style="margin:0;font-size:12px;color:#6b7280;">
+              <a href="https://app.weekbelow.com" style="color:#7c6fff;">app.weekbelow.com</a>
+            </p>
+          </div>
+        </div>
+      `,
     });
-  });
+    console.log(`[project_assigned] Notification sent to ${to} for project "${projectName}"`);
+  } catch (e) {
+    console.error('[project_assigned] Email error:', e.message);
+  }
 }
 
-// ── Connection handler ────────────────────────────────────────────────────────
+// ── feedback_submitted ────────────────────────────────────────────────────────
+// Triggered when a user submits a bug/feature report — notifies Taylor
+if (msg.type === 'feedback_submitted') {
+  const { agencyId, userName, userEmail, feedbackType, subject, message: fbMessage } = msg;
 
-wss.on('connection', socket => {
-  clients.add(socket);
-  log('+', `Client connected (total: ${clients.size})`);
-  log('🔑', `RESEND_API_KEY: ${RESEND_KEY ? 'SET (' + RESEND_KEY.slice(0,8) + '...)' : 'NOT SET — emails will not send'}`);
-  // Rate limit app_sync to prevent disk hammering
-  socket._lastSync = 0;
-  socket._syncCount = 0;
-  sendSnapshot(socket);
+  const TAYLOR_EMAIL = process.env.TAYLOR_EMAIL || 'taylor@below.co.nz';
 
-  socket.on('message', raw => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-
-    switch (msg.type) {
-
-      case 'timer_start': {
-        const { userId, userName, userColor, userInitials, projectId, projectName, taskId, phase } = msg;
-        if (!userId) return;
-        activeTimers[String(userId)] = { userId, userName, userColor, userInitials, projectId, projectName, taskId, phase, startedAt: new Date().toISOString() };
-        broadcast({ type: 'timer_start', timer: activeTimers[String(userId)] }, socket);
-        log('▶', `${userName} started timer on "${projectName}"`);
-        break;
-      }
-
-      case 'timer_stop': {
-        const { userId } = msg;
-        if (!userId) return;
-        const timer = activeTimers[String(userId)];
-        delete activeTimers[String(userId)];
-        broadcast({ type: 'timer_stop', userId, timer }, socket);
-        if (timer) log('■', `${timer.userName} stopped timer`);
-        break;
-      }
-
-      case 'app_sync': {
-        // Rate limit: max 2 syncs per second per socket to prevent disk hammering
-        const now = Date.now();
-        if (now - (socket._lastSync || 0) < 500) {
-          socket._syncCount = (socket._syncCount || 0) + 1;
-          if (socket._syncCount > 5) {
-            log('⚠', `Rate limit: app_sync throttled`);
-            break;
-          }
-        } else {
-          socket._syncCount = 0;
-        }
-        socket._lastSync = now;
-
-        const { projects, clients: cls, users, archived, tasks, wbState, templates, brand, userName } = msg;
-        // Snapshot BEFORE updating so we can diff for assignment changes
-        const prevProjects = JSON.parse(JSON.stringify(appState.projects || []));
-
-        if (projects  !== undefined) appState.projects  = projects;
-        if (cls       !== undefined) appState.clients   = cls;
-        if (users     !== undefined) {
-          // Merge users — client sends pinHash (SHA-256), preserve it
-          // Strip any legacy plaintext pin field for security
-          const merged = users.map(incoming => {
-            const { pin, ...rest } = incoming; // strip legacy plaintext
-            return rest; // pinHash is included and safe
-          });
-          appState.users = merged;
-        }
-        if (archived  !== undefined) appState.archived  = archived;
-        if (tasks     !== undefined) appState.tasks     = tasks;
-        if (wbState   !== undefined) appState.wbState   = wbState;
-        if (templates !== undefined) appState.templates = templates;
-        if (msg.taskTemplates !== undefined) appState.taskTemplates = msg.taskTemplates;
-        if (msg.businessCosts !== undefined) appState.businessCosts = msg.businessCosts;
-        if (msg.retainers !== undefined) appState.retainers = msg.retainers;
-        if (brand     !== undefined) appState.brand     = brand;
-        appState.seeded = true;
-        scheduleSave();
-
-        broadcast({ type: 'app_sync', appState, triggeredBy: userName || '?' }, socket);
-        log('🔄', `State updated by ${userName || 'unknown'}`);
-
-        // Fire assignment emails
-        if (projects !== undefined) notifyAssignments(projects, prevProjects, userName);
-        break;
-      }
-
-      case 'wb_sync': {
-        appState.wbState = msg.wbState || appState.wbState;
-        appState.seeded = true; scheduleSave();
-        broadcast({ type: 'wb_sync', wbState: appState.wbState, triggeredBy: msg.userName || '?' }, socket);
-        break;
-      }
-
-      case 'tasks_sync': {
-        appState.tasks = msg.tasks || appState.tasks;
-        appState.seeded = true; scheduleSave();
-        broadcast({ type: 'tasks_sync', tasks: appState.tasks, triggeredBy: msg.userName || '?' }, socket);
-        break;
-      }
-
-      case 'ping': { sendSnapshot(socket); break; }
-
-      case 'test_email': {
-        const to = msg.to;
-        console.log('[TEST EMAIL] Received request to:', to, '| RESEND_KEY set:', !!RESEND_KEY, '| Key prefix:', RESEND_KEY ? RESEND_KEY.slice(0,8) : 'NONE');
-        if (!to || !to.includes('@')) {
-          socket.send(JSON.stringify({ type:'email_result', ok:false, error:'No valid email address provided.' }));
-          break;
-        }
-        if (!RESEND_KEY) {
-          socket.send(JSON.stringify({ type:'email_result', ok:false, to, error:'RESEND_API_KEY is not set on the server. Add it in Railway → Variables.' }));
-          break;
-        }
-        const html = wrap(`
-          <h2>Test email ✓</h2>
-          <p class="sub">If you're reading this, BSMNT emails are working correctly.</p>
-          <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
-            <div style="font-size:13px;color:#555;">From: ${FROM_EMAIL}</div>
-            <div style="font-size:13px;color:#555;">Sent: ${new Date().toISOString()}</div>
-            <div style="font-size:13px;color:#555;">Key: ${RESEND_KEY.slice(0,12)}...</div>
+  try {
+    await resend.emails.send({
+      from:    FROM_EMAIL,
+      to:      TAYLOR_EMAIL,
+      subject: `[${feedbackType || 'Feedback'}] ${subject || 'New submission'} — ${agencyId || 'unknown studio'}`,
+      html: `
+        <div style="font-family:'DM Sans',sans-serif;max-width:560px;margin:0 auto;color:#111;font-size:14px;line-height:1.6;">
+          <div style="background:#1a1a2e;padding:16px 24px;border-radius:8px 8px 0 0;">
+            <div style="color:#7c6fff;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">Week Below Platform</div>
+            <div style="color:#fff;font-size:16px;font-weight:600;margin-top:4px;">New ${escapeHtml(feedbackType || 'feedback')}</div>
           </div>
-        `);
-        sendEmail({ to, subject: '✅ BSMNT — email test', html })
-          .then(result => {
-            socket.send(JSON.stringify({
-              type: 'email_result',
-              ok: result.ok,
-              to,
-              error: result.error || null,
-              detail: result.detail || null,
-            }));
-          });
-        log('✉', `Test email requested by ${msg.userName || '?'} → ${to}`);
-        break;
-      }
-
-      case 'send_recap_now': {
-        log('✉', `Manual weekly recap triggered by ${msg.userName || '?'}`);
-        const users = (appState.users || []).filter(u => u.active !== false);
-        const withEmail = users.filter(u => u.email && u.email.includes('@'));
-        const skipped = users.length - withEmail.length;
-        try {
-          sendWeeklyRecaps();
-          socket.send(JSON.stringify({ type:'recap_result', ok:true, count:withEmail.length, skipped }));
-        } catch(e) {
-          socket.send(JSON.stringify({ type:'recap_result', ok:false, error:e.message }));
-        }
-        break;
-      }
-
-      case 'feedback_submitted': {
-        const fb = msg.entry || {};
-        log('💬', `Feedback from ${fb.user_name || '?'}: [${fb.type}] ${fb.subject}`);
-        const adminEmail = process.env.ADMIN_EMAIL || '';
-        if(adminEmail && adminEmail.includes('@') && RESEND_KEY) {
-          const typeEmoji = {bug:'🐛',feature:'💡',general:'💬'}[fb.type]||'💬';
-          const html = wrap(`
-            <h2>${typeEmoji} New ${fb.type} feedback</h2>
-            <p class="sub">From <strong>${fb.user_name||'Unknown'}</strong> (${fb.user_email||'no email'}) on ${fb.page||'unknown page'}</p>
-            <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
-              <div style="font-size:15px;font-weight:600;color:#111;margin-bottom:8px;">${fb.subject||'(no subject)'}</div>
-              <div style="font-size:14px;color:#444;line-height:1.7;white-space:pre-wrap;">${fb.message||''}</div>
-            </div>
-            <p style="font-size:12px;color:#999;">Submitted ${new Date(fb.created_at||Date.now()).toLocaleString()} · Status: new</p>
-          `);
-          sendEmail({ to: adminEmail, subject: `${typeEmoji} [${fb.type}] ${fb.subject||'Feedback'}`, html });
-        }
-        break;
-      }
-
-      case 'feedback_status_update': {
-        const { to, subject, status, userName, customMessage } = msg;
-        if(!to || !to.includes('@') || !RESEND_KEY) break;
-        const statusMsg = customMessage || {
-          reviewing: "We're looking into this and will keep you posted.",
-          shipped: "Great news — this has been shipped! Update your app to see it.",
-          closed: "We've reviewed this and closed it out. Thanks for taking the time.",
-        }[status] || `Status updated to: ${status}`;
-        const accentColor = status==='shipped'?'#34d399':status==='reviewing'?'#fbbf24':'#7c6fff';
-        const html = wrap(`
-          <h2>${customMessage ? 'Reply to your feedback' : 'Update on your feedback'}</h2>
-          <p class="sub">Re: <strong>${subject||'your feedback'}</strong></p>
-          <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid ${accentColor};">
-            <div style="font-size:14px;color:#333;line-height:1.75;white-space:pre-wrap;">${statusMsg}</div>
+          <div style="background:#fff;padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;">
+            <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+              <tr><td style="padding:6px 0;color:#6b7280;font-size:12px;width:90px;">Studio</td><td style="padding:6px 0;font-weight:500;">${escapeHtml(agencyId || '—')}</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280;font-size:12px;">From</td><td style="padding:6px 0;font-weight:500;">${escapeHtml(userName || '—')} ${userEmail ? `&lt;${escapeHtml(userEmail)}&gt;` : ''}</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280;font-size:12px;">Type</td><td style="padding:6px 0;font-weight:500;">${escapeHtml(feedbackType || '—')}</td></tr>
+              <tr><td style="padding:6px 0;color:#6b7280;font-size:12px;">Subject</td><td style="padding:6px 0;font-weight:500;">${escapeHtml(subject || '—')}</td></tr>
+            </table>
+            <div style="background:#f9fafb;border-radius:6px;padding:14px;font-size:13px;line-height:1.6;white-space:pre-wrap;">${escapeHtml(fbMessage || '')}</div>
           </div>
-          <p style="font-size:13px;color:#666;">— ${userName||'The team'}</p>
-        `);
-        sendEmail({ to, subject: `Re: ${subject||'your feedback'}`, html });
-        log('✉', `Feedback reply → ${to}: ${status}`);
-        break;
-      }
-    }
-  });
-
-  socket.on('close', () => { clients.delete(socket); log('-', `Client disconnected (total: ${clients.size})`); });
-  socket.on('error', err => { console.error('Socket error:', err.message); clients.delete(socket); });
-});
-
-// ── Boot ──────────────────────────────────────────────────────────────────────
-
-// ── HTTP server (test endpoints) ─────────────────────────────────────────────
-
-
-// ── Retainer auto-spawn ───────────────────────────────────────────────────────
-
-function spawnRetainerProjects() {
-  if (!appState.seeded) return;
-  const retainers = appState.retainers || [];
-  if (!retainers.length) return;
-
-  const now = new Date();
-  const todayStr = now.toISOString().split('T')[0];
-  const dayOfMonth = now.getUTCDate();
-  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-  const monthLabel = monthNames[now.getUTCMonth()];
-  const year = now.getUTCFullYear();
-
-  let spawned = 0;
-  retainers.forEach(r => {
-    if (r.active === false) return;
-
-    // Determine if we should spawn today
-    let shouldSpawn = false;
-    const targetDay = r.dayOfMonth || 1;
-
-    if (r.frequency === 'monthly' && dayOfMonth === targetDay) shouldSpawn = true;
-    if (r.frequency === 'fortnightly') {
-      // Spawn on targetDay and targetDay+14 (wrapping within month)
-      if (dayOfMonth === targetDay || dayOfMonth === ((targetDay + 13) % 28) + 1) shouldSpawn = true;
-    }
-    if (r.frequency === 'weekly') {
-      // Spawn every 7 days from targetDay
-      const diff = (dayOfMonth - targetDay + 28) % 7;
-      if (diff === 0) shouldSpawn = true;
-    }
-
-    if (!shouldSpawn) return;
-
-    // Don't double-spawn: check lastSpawned is not today
-    if (r.lastSpawned && r.lastSpawned.startsWith(todayStr.slice(0, 7))) {
-      // Already spawned this month
-      log('📅', `Retainer "${r.name}" already spawned this month (${r.lastSpawned})`);
-      return;
-    }
-
-    // Build the project
-    const lastDay = new Date(year, now.getUTCMonth() + 1, 0);
-    const endDate = lastDay.toISOString().split('T')[0];
-    const phaseMap = {preproduction:'Pre-Production', production:'Production', postproduction:'Post Production'};
-    const project = {
-      id: Date.now() + Math.floor(Math.random() * 10000),
-      name: `${r.name} — ${monthLabel} ${year}`,
-      clientId: r.clientId,
-      status: r.status || 'preproduction',
-      phase: phaseMap[r.status] || 'Pre-Production',
-      budget: r.budget || 0,
-      shootBudget: 0, editBudget: 0,
-      budgetSpent: {shoot:0, edit:0},
-      hardCosts: 0,
-      startDate: todayStr,
-      endDate,
-      description: r.description || '',
-      assigned: r.assigned || [],
-      stages: [
-        {id:'s1', name:'Pre-Production', tasks:[]},
-        {id:'s2', name:'Production', tasks:[]},
-        {id:'s3', name:'Post Production', tasks:[]},
-      ],
-      shotList:[], timeLog:[], budgetEntries:[], deliverables:[],
-      retainerId: r.id,
-    };
-
-    appState.projects.push(project);
-    r.lastSpawned = todayStr;
-    spawned++;
-
-    log('📅', `Spawned retainer project: "${project.name}"`);
-    broadcast({ type: 'recurring_spawn', project, retainerId: r.id });
-  });
-
-  if (spawned > 0) scheduleSave();
+        </div>
+      `,
+    });
+    console.log(`[feedback_submitted] Notification sent to ${TAYLOR_EMAIL} from ${agencyId}`);
+  } catch (e) {
+    console.error('[feedback_submitted] Email error:', e.message);
+  }
 }
 
-function scheduleRetainerCheck() {
-  // Run once per day at 7am NZT (UTC+12)
-  const NZT = 12 * 3600000;
-  const nowNzt = new Date(Date.now() + NZT);
-  const secsNow = nowNzt.getUTCHours() * 3600 + nowNzt.getUTCMinutes() * 60 + nowNzt.getUTCSeconds();
-  const target7am = 7 * 3600;
-  let secsUntil = target7am - secsNow;
-  if (secsUntil < 0) secsUntil += 86400;
-  log('📅', `Retainer check in ~${Math.round(secsUntil/3600)}h`);
-  setTimeout(() => {
-    spawnRetainerProjects();
-    scheduleRetainerCheck();
-  }, secsUntil * 1000);
+// ── feedback_status_update ────────────────────────────────────────────────────
+// Just log it — no email needed, status is already saved in Supabase
+if (msg.type === 'feedback_status_update') {
+  console.log(`[feedback_status_update] feedback ${msg.feedbackId} → ${msg.status}`);
 }
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER — add this near the top of your server file if not already present
+// ══════════════════════════════════════════════════════════════════════════════
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
-httpServer.listen(PORT, () => {
-  console.log(`\nBSMNT sync server · port ${PORT}`);
-  console.log(`Persistence: ${DATA_FILE}`);
-  console.log(`State seeded: ${appState.seeded}`);
-  console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}\n`);
-});
-
-scheduleWeeklyRecap();
+// ══════════════════════════════════════════════════════════════════════════════
+// ENV VARS TO ADD IN RAILWAY DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════
+// RESEND_API_KEY   — your Resend API key (probably already set)
+// FROM_EMAIL       — e.g. "Week Below <noreply@weekbelow.com>"
+// TAYLOR_EMAIL     — taylor@below.co.nz  (for feedback notifications)
