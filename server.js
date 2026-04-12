@@ -59,7 +59,7 @@ function scheduleSave() {
 
 function defaultAppState() {
   return { projects:[], clients:[], users:[], archived:[], tasks:[],
-           wbState:{}, templates:[], taskTemplates:{'Pre-Production':[],'Production':[],'Post Production':[]}, brand:{}, seeded:false };
+           wbState:{}, templates:[], taskTemplates:{'Pre-Production':[],'Production':[],'Post Production':[]}, brand:{}, retainers:[], seeded:false };
 }
 
 const activeTimers = {};
@@ -346,7 +346,8 @@ function sendWeeklyRecaps() {
 function scheduleWeeklyRecap() {
   const ms = msUntilNextMondayNZT();
   log('✉', `Weekly recap in ~${Math.round(ms/3600000)}h`);
-  setTimeout(() => { sendWeeklyRecaps(); scheduleWeeklyRecap(); }, ms);
+  setTimeout(() => { sendWeeklyRecaps(); scheduleWeeklyRecap();
+scheduleRetainerCheck(); }, ms);
 }
 
 // ── Assignment notifications ──────────────────────────────────────────────────
@@ -447,6 +448,7 @@ wss.on('connection', socket => {
         if (templates !== undefined) appState.templates = templates;
         if (msg.taskTemplates !== undefined) appState.taskTemplates = msg.taskTemplates;
         if (msg.businessCosts !== undefined) appState.businessCosts = msg.businessCosts;
+        if (msg.retainers !== undefined) appState.retainers = msg.retainers;
         if (brand     !== undefined) appState.brand     = brand;
         appState.seeded = true;
         scheduleSave();
@@ -522,6 +524,48 @@ wss.on('connection', socket => {
         }
         break;
       }
+
+      case 'feedback_submitted': {
+        const fb = msg.entry || {};
+        log('💬', `Feedback from ${fb.user_name || '?'}: [${fb.type}] ${fb.subject}`);
+        const adminEmail = process.env.ADMIN_EMAIL || '';
+        if(adminEmail && adminEmail.includes('@') && RESEND_KEY) {
+          const typeEmoji = {bug:'🐛',feature:'💡',general:'💬'}[fb.type]||'💬';
+          const html = wrap(`
+            <h2>${typeEmoji} New ${fb.type} feedback</h2>
+            <p class="sub">From <strong>${fb.user_name||'Unknown'}</strong> (${fb.user_email||'no email'}) on ${fb.page||'unknown page'}</p>
+            <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
+              <div style="font-size:15px;font-weight:600;color:#111;margin-bottom:8px;">${fb.subject||'(no subject)'}</div>
+              <div style="font-size:14px;color:#444;line-height:1.7;white-space:pre-wrap;">${fb.message||''}</div>
+            </div>
+            <p style="font-size:12px;color:#999;">Submitted ${new Date(fb.created_at||Date.now()).toLocaleString()} · Status: new</p>
+          `);
+          sendEmail({ to: adminEmail, subject: `${typeEmoji} [${fb.type}] ${fb.subject||'Feedback'}`, html });
+        }
+        break;
+      }
+
+      case 'feedback_status_update': {
+        const { to, subject, status, userName, customMessage } = msg;
+        if(!to || !to.includes('@') || !RESEND_KEY) break;
+        const statusMsg = customMessage || {
+          reviewing: "We're looking into this and will keep you posted.",
+          shipped: "Great news — this has been shipped! Update your app to see it.",
+          closed: "We've reviewed this and closed it out. Thanks for taking the time.",
+        }[status] || `Status updated to: ${status}`;
+        const accentColor = status==='shipped'?'#34d399':status==='reviewing'?'#fbbf24':'#7c6fff';
+        const html = wrap(`
+          <h2>${customMessage ? 'Reply to your feedback' : 'Update on your feedback'}</h2>
+          <p class="sub">Re: <strong>${subject||'your feedback'}</strong></p>
+          <div style="background:#f8f8fc;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid ${accentColor};">
+            <div style="font-size:14px;color:#333;line-height:1.75;white-space:pre-wrap;">${statusMsg}</div>
+          </div>
+          <p style="font-size:13px;color:#666;">— ${userName||'The team'}</p>
+        `);
+        sendEmail({ to, subject: `Re: ${subject||'your feedback'}`, html });
+        log('✉', `Feedback reply → ${to}: ${status}`);
+        break;
+      }
     }
   });
 
@@ -532,6 +576,102 @@ wss.on('connection', socket => {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 // ── HTTP server (test endpoints) ─────────────────────────────────────────────
+
+
+// ── Retainer auto-spawn ───────────────────────────────────────────────────────
+
+function spawnRetainerProjects() {
+  if (!appState.seeded) return;
+  const retainers = appState.retainers || [];
+  if (!retainers.length) return;
+
+  const now = new Date();
+  const todayStr = now.toISOString().split('T')[0];
+  const dayOfMonth = now.getUTCDate();
+  const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthLabel = monthNames[now.getUTCMonth()];
+  const year = now.getUTCFullYear();
+
+  let spawned = 0;
+  retainers.forEach(r => {
+    if (r.active === false) return;
+
+    // Determine if we should spawn today
+    let shouldSpawn = false;
+    const targetDay = r.dayOfMonth || 1;
+
+    if (r.frequency === 'monthly' && dayOfMonth === targetDay) shouldSpawn = true;
+    if (r.frequency === 'fortnightly') {
+      // Spawn on targetDay and targetDay+14 (wrapping within month)
+      if (dayOfMonth === targetDay || dayOfMonth === ((targetDay + 13) % 28) + 1) shouldSpawn = true;
+    }
+    if (r.frequency === 'weekly') {
+      // Spawn every 7 days from targetDay
+      const diff = (dayOfMonth - targetDay + 28) % 7;
+      if (diff === 0) shouldSpawn = true;
+    }
+
+    if (!shouldSpawn) return;
+
+    // Don't double-spawn: check lastSpawned is not today
+    if (r.lastSpawned && r.lastSpawned.startsWith(todayStr.slice(0, 7))) {
+      // Already spawned this month
+      log('📅', `Retainer "${r.name}" already spawned this month (${r.lastSpawned})`);
+      return;
+    }
+
+    // Build the project
+    const lastDay = new Date(year, now.getUTCMonth() + 1, 0);
+    const endDate = lastDay.toISOString().split('T')[0];
+    const phaseMap = {preproduction:'Pre-Production', production:'Production', postproduction:'Post Production'};
+    const project = {
+      id: Date.now() + Math.floor(Math.random() * 10000),
+      name: `${r.name} — ${monthLabel} ${year}`,
+      clientId: r.clientId,
+      status: r.status || 'preproduction',
+      phase: phaseMap[r.status] || 'Pre-Production',
+      budget: r.budget || 0,
+      shootBudget: 0, editBudget: 0,
+      budgetSpent: {shoot:0, edit:0},
+      hardCosts: 0,
+      startDate: todayStr,
+      endDate,
+      description: r.description || '',
+      assigned: r.assigned || [],
+      stages: [
+        {id:'s1', name:'Pre-Production', tasks:[]},
+        {id:'s2', name:'Production', tasks:[]},
+        {id:'s3', name:'Post Production', tasks:[]},
+      ],
+      shotList:[], timeLog:[], budgetEntries:[], deliverables:[],
+      retainerId: r.id,
+    };
+
+    appState.projects.push(project);
+    r.lastSpawned = todayStr;
+    spawned++;
+
+    log('📅', `Spawned retainer project: "${project.name}"`);
+    broadcast({ type: 'recurring_spawn', project, retainerId: r.id });
+  });
+
+  if (spawned > 0) scheduleSave();
+}
+
+function scheduleRetainerCheck() {
+  // Run once per day at 7am NZT (UTC+12)
+  const NZT = 12 * 3600000;
+  const nowNzt = new Date(Date.now() + NZT);
+  const secsNow = nowNzt.getUTCHours() * 3600 + nowNzt.getUTCMinutes() * 60 + nowNzt.getUTCSeconds();
+  const target7am = 7 * 3600;
+  let secsUntil = target7am - secsNow;
+  if (secsUntil < 0) secsUntil += 86400;
+  log('📅', `Retainer check in ~${Math.round(secsUntil/3600)}h`);
+  setTimeout(() => {
+    spawnRetainerProjects();
+    scheduleRetainerCheck();
+  }, secsUntil * 1000);
+}
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
