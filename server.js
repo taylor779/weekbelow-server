@@ -234,7 +234,7 @@ async function handleGenerateImage(req, res) {
   if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase not configured' });
   if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
   try {
-    const { prompt, agencyId } = req.body;
+    const { prompt, agencyId, refImageData } = req.body;
     if (!prompt || !agencyId) return res.status(400).json({ error: 'prompt and agencyId required' });
 
     // Read token balance — handle missing row gracefully
@@ -251,7 +251,16 @@ async function handleGenerateImage(req, res) {
     const geminiRes = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=' + process.env.GEMINI_API_KEY,
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } }) }
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              // If a reference image was uploaded, include it first
+              ...(refImageData && refImageData.data ? [{ inlineData: { mimeType: refImageData.mimeType || 'image/jpeg', data: refImageData.data } }] : []),
+              { text: prompt }
+            ]
+          }],
+          generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+        }) }
     );
 
     if (!geminiRes.ok) {
