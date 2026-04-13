@@ -234,8 +234,11 @@ async function handleGenerateImage(req, res) {
   if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase not configured' });
   if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
   try {
-    const { prompt, agencyId, refImageData } = req.body;
+    const { prompt, agencyId, refImages, refImageData } = req.body;
     if (!prompt || !agencyId) return res.status(400).json({ error: 'prompt and agencyId required' });
+    // Support both single refImageData (legacy) and refImages array
+    const imageRefs = refImages ? (Array.isArray(refImages) ? refImages : [refImages])
+                     : refImageData ? [refImageData] : [];
 
     // Read token balance — handle missing row gracefully
     const settingsResult = await supabaseAdmin.from('agency_settings')
@@ -254,8 +257,10 @@ async function handleGenerateImage(req, res) {
         body: JSON.stringify({
           contents: [{
             parts: [
-              // If a reference image was uploaded, include it first
-              ...(refImageData && refImageData.data ? [{ inlineData: { mimeType: refImageData.mimeType || 'image/jpeg', data: refImageData.data } }] : []),
+              // Include all reference images (scene ref, character refs)
+              ...imageRefs.filter(function(r){ return r && r.data; }).map(function(r) {
+                return { inlineData: { mimeType: r.mimeType || 'image/jpeg', data: r.data } };
+              }),
               { text: prompt }
             ]
           }],
