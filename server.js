@@ -138,7 +138,7 @@ const app = express();
 // Stripe webhook MUST use raw body — register BEFORE express.json()
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 
 // CORS
 app.use((req, res, next) => {
