@@ -251,7 +251,7 @@ async function handleGenerateImage(req, res) {
     const geminiRes = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=' + process.env.GEMINI_API_KEY,
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'] } }) }
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } }) }
     );
 
     if (!geminiRes.ok) {
@@ -259,6 +259,10 @@ async function handleGenerateImage(req, res) {
       console.error('Gemini API error', geminiRes.status, errBody.slice(0, 400));
       // Refund the token since generation failed
       await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: balance });
+      // Handle rate limiting specifically
+      if (geminiRes.status === 429) {
+        return res.status(429).json({ error: 'Rate limit hit — please wait a few seconds and try again.' });
+      }
       return res.status(500).json({ error: 'Gemini error ' + geminiRes.status + ': ' + errBody.slice(0,200) });
     }
 
@@ -267,8 +271,12 @@ async function handleGenerateImage(req, res) {
       .find(p => p.inlineData?.mimeType?.startsWith('image/'));
 
     if (!imgPart) {
-      await supabaseAdmin.from('agency_settings').update({ token_balance: balance }).eq('agency_id', agencyId);
-      return res.status(500).json({ error: 'No image returned from Gemini' });
+      // Log full response to understand why no image was returned
+      console.error('No image part in Gemini response:', JSON.stringify(geminiData).slice(0, 400));
+      // Refund the token
+      await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: balance });
+      const reason = geminiData?.candidates?.[0]?.finishReason || 'unknown';
+      return res.status(500).json({ error: 'No image returned from Gemini (finish reason: ' + reason + ')' });
     }
 
     log('🎬', `Generated image for ${agencyId} — ${newBalance} tokens remaining`);
