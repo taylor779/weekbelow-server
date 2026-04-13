@@ -80,9 +80,9 @@ const supabaseAdmin = SUPA_URL && SUPA_KEY ? {
 } : null;
 
 const TOKEN_PACKAGES = {
-  tokens_10:  { tokens: 40,  priceNzd: 10, name: '40 BSMNT Tokens — $10 NZD' },
-  tokens_25:  { tokens: 100, priceNzd: 25, name: '100 BSMNT Tokens — $25 NZD' },
-  tokens_50:  { tokens: 200, priceNzd: 50, name: '200 BSMNT Tokens — $50 NZD' },
+  tokens_10:  { tokens: 67,  priceNzd: 10, name: '67 BSMNT Tokens — $10 NZD' },
+  tokens_25:  { tokens: 167, priceNzd: 25, name: '167 BSMNT Tokens — $25 NZD' },
+  tokens_50:  { tokens: 334, priceNzd: 50, name: '334 BSMNT Tokens — $50 NZD' },
 };
 
 // ── Core config ───────────────────────────────────────────────────────────────
