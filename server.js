@@ -21,15 +21,63 @@ const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
-// ── Stripe + Supabase (token payments) ───────────────────────────────────────
+// ── Stripe (token payments) ──────────────────────────────────────────────────
 const Stripe = require('stripe');
-const { createClient } = require('@supabase/supabase-js');
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-const supabaseAdmin = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY) : null;
+// ── Supabase REST helper (no SDK — works on any Node version) ─────────────────
+const SUPA_URL = process.env.SUPABASE_URL || '';
+const SUPA_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+
+function supaRest(method, table, params, body) {
+  // params: query string e.g. 'agency_id=eq.123'
+  // body: object for POST/PATCH, or null
+  return new Promise((resolve, reject) => {
+    const path = `/rest/v1/${table}${params ? '?' + params : ''}`;
+    const url = new URL(SUPA_URL);
+    const bodyStr = body ? JSON.stringify(body) : null;
+    const headers = {
+      'apikey': SUPA_KEY,
+      'Authorization': 'Bearer ' + SUPA_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Prefer': method === 'POST' ? 'return=representation' : 'return=minimal',
+    };
+    if (bodyStr) headers['Content-Length'] = Buffer.byteLength(bodyStr);
+    const req = https.request({
+      hostname: url.hostname,
+      path,
+      method,
+      headers,
+    }, res => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(data ? JSON.parse(data) : null); }
+        catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+const supabaseAdmin = SUPA_URL && SUPA_KEY ? {
+  from: (table) => ({
+    select: (cols) => ({
+      eq: (col, val) => ({
+        maybeSingle: () => supaRest('GET', table, `${col}=eq.${encodeURIComponent(val)}&select=${cols}`).then(r => ({ data: Array.isArray(r) ? r[0] || null : r }))
+      })
+    }),
+    update: (body) => ({
+      eq: (col, val) => supaRest('PATCH', table, `${col}=eq.${encodeURIComponent(val)}`, body).then(r => ({ data: r }))
+    }),
+    insert: (body) => supaRest('POST', table, null, body).then(r => ({ data: r }))
+  })
+} : null;
 
 const TOKEN_PACKAGES = {
   tokens_10:  { tokens: 40,  priceNzd: 10, name: '40 BSMNT Tokens — $10 NZD' },
