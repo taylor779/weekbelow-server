@@ -43,7 +43,7 @@ function supaRest(method, table, params, body) {
       'Authorization': 'Bearer ' + SUPA_KEY,
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'Prefer': method === 'POST' ? 'return=representation' : 'return=minimal',
+      'Prefer': method === 'POST' ? 'resolution=merge-duplicates,return=representation' : 'return=minimal',
     };
     if (bodyStr) headers['Content-Length'] = Buffer.byteLength(bodyStr);
     const req = https.request({
@@ -237,23 +237,29 @@ async function handleGenerateImage(req, res) {
     const { prompt, agencyId } = req.body;
     if (!prompt || !agencyId) return res.status(400).json({ error: 'prompt and agencyId required' });
 
-    const { data: settings } = await supabaseAdmin.from('agency_settings')
+    // Read token balance — handle missing row gracefully
+    const settingsResult = await supabaseAdmin.from('agency_settings')
       .select('token_balance').eq('agency_id', agencyId).maybeSingle();
-    const balance = (settings && settings.token_balance) || 0;
+    const settings = settingsResult?.data;
+    const balance = (settings && typeof settings.token_balance === 'number') ? settings.token_balance : 0;
     if (balance <= 0) return res.status(402).json({ error: 'No tokens remaining. Purchase more in the app.' });
 
     const newBalance = balance - 1;
-    await supabaseAdmin.from('agency_settings').update({ token_balance: newBalance }).eq('agency_id', agencyId);
+    // Upsert so it works even if the row doesn't exist yet
+    await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: newBalance });
 
     const geminiRes = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key=' + process.env.GEMINI_API_KEY,
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=' + process.env.GEMINI_API_KEY,
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE','TEXT'] } }) }
     );
 
     if (!geminiRes.ok) {
-      await supabaseAdmin.from('agency_settings').update({ token_balance: balance }).eq('agency_id', agencyId);
-      return res.status(500).json({ error: 'Gemini error: ' + (await geminiRes.text()).slice(0,200) });
+      const errBody = await geminiRes.text();
+      console.error('Gemini API error', geminiRes.status, errBody.slice(0, 400));
+      // Refund the token since generation failed
+      await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: balance });
+      return res.status(500).json({ error: 'Gemini error ' + geminiRes.status + ': ' + errBody.slice(0,200) });
     }
 
     const geminiData = await geminiRes.json();
