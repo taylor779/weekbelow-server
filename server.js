@@ -80,9 +80,10 @@ const supabaseAdmin = SUPA_URL && SUPA_KEY ? {
 } : null;
 
 const TOKEN_PACKAGES = {
-  tokens_10:  { tokens: 67,  priceNzd: 10, name: '67 BSMNT Tokens — $10 NZD' },
-  tokens_25:  { tokens: 167, priceNzd: 25, name: '167 BSMNT Tokens — $25 NZD' },
-  tokens_50:  { tokens: 334, priceNzd: 50, name: '334 BSMNT Tokens — $50 NZD' },
+  tokens_5:   { tokens: 20,  priceUsd: 5,  name: '20 Tokens — $5 USD'  },
+  tokens_10:  { tokens: 60,  priceUsd: 10, name: '60 Tokens — $10 USD' },
+  tokens_18:  { tokens: 150, priceUsd: 18, name: '150 Tokens — $18 USD' },
+  tokens_40:  { tokens: 400, priceUsd: 40, name: '400 Tokens — $40 USD' },
 };
 
 // ── Core config ───────────────────────────────────────────────────────────────
@@ -152,6 +153,9 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.send('BSMNT OK'));
 app.post('/create-checkout', handleCreateCheckout);
 app.post('/generate-image',  handleGenerateImage);
+app.post('/gift-tokens-email', handleGiftTokensEmail);
+app.get('/project-report/:agencyId/:projectId', handleProjectReport);
+app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 });
@@ -170,6 +174,131 @@ function sendSnapshot(socket) {
 
 // ── Token / Payment handlers ──────────────────────────────────────────────────
 
+
+
+// ── Friday 3PM recap scheduler ────────────────────────────────────────
+const _sentThisWeek = new Set();
+
+function _getWeekKey() {
+  const now = new Date();
+  const jan1 = new Date(now.getFullYear(), 0, 1);
+  return now.getFullYear() + '_w' + Math.ceil(((now - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+}
+
+function _buildUserRecap(user, state) {
+  const projects = state.projects || [];
+  const now = new Date();
+  const weekAgo = new Date(now - 7 * 86400000);
+  const myProjects = projects.filter(p => {
+    const ws = (state.wbState || {})[p.id] || {};
+    return String(ws.userId) === String(user.id) || (ws.split || []).map(String).includes(String(user.id));
+  });
+  const completedThisWeek = projects.filter(p => p.status === 'done' && p.endDate && new Date(p.endDate) >= weekAgo);
+  const hoursLastWeek = (state.projects || []).flatMap(p => p.timeLog || [])
+    .filter(l => String(l.user) === String(user.id) && new Date(l.date) >= weekAgo)
+    .reduce((s, l) => s + l.hours, 0);
+  const dueItems = myProjects.filter(p => {
+    if (!p.endDate || p.status === 'done') return false;
+    const d = new Date(p.endDate + 'T23:59:59');
+    return d >= now && d <= new Date(now.getTime() + 7 * 86400000);
+  });
+  const overdueItems = myProjects.filter(p => {
+    if (!p.endDate || p.status === 'done') return false;
+    return new Date(p.endDate + 'T23:59:59') < now;
+  });
+  return { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems };
+}
+
+function scheduleFridayRecaps() {
+  setInterval(async function() {
+    try {
+      const { data: states } = await supabaseAdmin.from('app_state').select('agency_id,users,brand');
+      if (!states) return;
+      for (const state of states) {
+        const users = state.users || [];
+        for (const user of users) {
+          if (!user.email || !user.email.includes('@')) continue;
+          if (user.active === false) continue;
+          const tz = state.brand?.timezone || 'Pacific/Auckland';
+          const userNow = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+          const dayOfWeek = userNow.getDay();
+          const hour = userNow.getHours();
+          const minute = userNow.getMinutes();
+          if (dayOfWeek === 5 && hour === 15 && minute < 5) {
+            const weekKey = 'recap_' + state.agency_id + '_' + user.id + '_' + _getWeekKey();
+            if (_sentThisWeek.has(weekKey)) continue;
+            _sentThisWeek.add(weekKey);
+            const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', state.agency_id).maybeSingle();
+            if (agData) {
+              const recapData = _buildUserRecap(user, agData);
+              await sendEmail(weeklyEmail(user, recapData));
+              log('📬', `Friday recap sent to ${user.email} (${tz})`);
+            }
+          }
+        }
+      }
+    } catch(e) { log('⚠', 'Friday scheduler: ' + e.message); }
+  }, 5 * 60 * 1000);
+}
+scheduleFridayRecaps();
+
+async function handleGiftTokensEmail(req, res) {
+  const { agencyId, tokens, message } = req.body || {};
+  if (!agencyId || !tokens) return res.status(400).json({ error: 'agencyId and tokens required' });
+
+  res.json({ ok: true }); // respond immediately, send email async
+
+  try {
+    // Look up the agency's admin email from agency_members
+    const { data: members } = await supabaseAdmin
+      .from('agency_members')
+      .select('email,name')
+      .eq('agency_id', agencyId)
+      .eq('role', 'admin')
+      .limit(1);
+
+    const recipient = members?.[0];
+    if (!recipient?.email) return log('🎁', `No admin email found for ${agencyId}`);
+
+    const firstName = (recipient.name || 'there').split(' ')[0];
+    const msgLine = message ? `<p style="font-style:italic;color:#9898aa;margin:0 0 16px;">"${message}"</p>` : '';
+
+    await sendEmail({
+      to: recipient.email,
+      subject: `🎁 You've been gifted ${tokens} tokens on Week Below`,
+      html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;">
+        <div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;">
+          <div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;">
+            <div style="font-size:48px;margin-bottom:12px;">🎁</div>
+            <h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">You've got tokens!</h1>
+            <p style="color:#9898aa;font-size:13px;margin:0;">From the Week Below team</p>
+          </div>
+          <div style="padding:28px 32px;">
+            <p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p>
+            <p style="color:#c8c8d8;font-size:15px;margin:0 0 20px;">We've just added <strong style="color:#c084fc;font-size:18px;">+${tokens} storyboard tokens</strong> to your account.</p>
+            ${msgLine}
+            <p style="color:#9898aa;font-size:13px;margin:0 0 24px;">Tokens are used to generate AI storyboard panels and character references. They roll over month to month so nothing goes to waste.</p>
+            <div style="background:#0c0c0e;border:1px solid #2c2c36;border-radius:10px;padding:16px;text-align:center;margin-bottom:24px;">
+              <div style="font-size:32px;font-weight:700;color:#7c6fff;font-family:monospace;">+${tokens}</div>
+              <div style="font-size:11px;color:#55556a;text-transform:uppercase;letter-spacing:1px;">tokens added to your balance</div>
+            </div>
+            <a href="https://bsmnt.co.nz" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:12px;border-radius:8px;text-align:center;font-weight:600;font-size:14px;">Open Week Below →</a>
+          </div>
+          <div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;">
+            <p style="color:#55556a;font-size:11px;margin:0;">Week Below · Built by BSMNT</p>
+          </div>
+        </div>
+      </body></html>`,
+    });
+    log('🎁', `Gift email sent to ${recipient.email} (${tokens} tokens)`);
+  } catch(e) {
+    log('⚠', 'Gift email error: ' + e.message);
+  }
+}
+
+
+
+
 async function handleCreateCheckout(req, res) {
   if (!stripe) return res.status(500).json({ error: 'Stripe not configured — add STRIPE_SECRET_KEY' });
   try {
@@ -181,9 +310,9 @@ async function handleCreateCheckout(req, res) {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [{ price_data: {
-        currency: 'nzd',
+        currency: 'usd',
         product_data: { name: pkg.name, description: pkg.tokens + ' AI storyboard image credits' },
-        unit_amount: pkg.priceNzd * 100,
+        unit_amount: pkg.priceUsd * 100,
       }, quantity: 1 }],
       mode: 'payment',
       success_url: (returnUrl || 'https://bsmnt.co.nz') + '?payment=success',
@@ -706,6 +835,45 @@ function scheduleRetainerCheck() {
   let secsUntil=7*3600-secsNow; if (secsUntil<=0) secsUntil+=86400;
   log('📅', `Retainer check in ~${Math.round(secsUntil/3600)}h`);
   setTimeout(()=>{ spawnRetainerProjects(); scheduleRetainerCheck(); }, secsUntil*1000);
+}
+
+
+async function handleProjectReport(req, res) {
+  const { agencyId, projectId } = req.params;
+  try {
+    const { data: state } = await supabaseAdmin.from('app_state')
+      .select('projects,clients,users,wbState,brand').eq('agency_id', agencyId).maybeSingle();
+    if (!state) return res.status(404).send('Studio not found');
+    const proj = (state.projects||[]).find(p => String(p.id) === String(projectId));
+    if (!proj) return res.status(404).send('Project not found');
+    const client = (state.clients||[]).find(c => String(c.id) === String(proj.clientId));
+    const ws = (state.wbState||{})[proj.id] || {};
+    const brand = state.brand || {};
+    const users = state.users || [];
+    let totalHours = 0, totalBilled = 0, totalCost = 0;
+    (proj.timeLog||[]).forEach(l => {
+      const u = users.find(u => String(u.id) === String(l.user));
+      totalHours += l.hours;
+      totalBilled += l.hours * (u?.chargeRate || 0);
+      totalCost += l.hours * (u?.costRate || 0);
+    });
+    const profit = totalBilled - totalCost;
+    const allTasks = (proj.stages||[]).flatMap(s => (s.tasks||[]).map(t => ({...t, stageName: s.name})));
+    const doneTasks = allTasks.filter(t => t.done);
+    const stageLabel = {wip:'WIP',v0:'Draft',v1:'V1 Review',v2:'V2 Review',final:'Final',done:'Completed'}[ws.stage||'v0']||ws.stage;
+    const accent = brand.accentColor || '#7c6fff';
+    const logoHtml = brand.logo ? `<img src="${brand.logo}" style="height:36px;object-fit:contain;" />` : `<span style="font-size:16px;font-weight:700;color:${accent};">${brand.name||'Week Below'}</span>`;
+    const reportUrl = `${req.protocol}://${req.get('host')}/project-report/${agencyId}/${projectId}`;
+    const stagesHtml = (proj.stages||[]).map(s => {
+      const tasks = s.tasks||[];
+      const done = tasks.filter(t=>t.done).length;
+      const pct = tasks.length ? Math.round(done/tasks.length*100) : 0;
+      return `<tr><td style="padding:8px 0;font-weight:500;">${s.name}</td><td style="padding:8px;"><div style="height:5px;background:#eee;border-radius:3px;"><div style="width:${pct}%;height:100%;background:${accent};border-radius:3px;"></div></div></td><td style="padding:8px 0;text-align:right;font-size:12px;color:#888;">${done}/${tasks.length}</td></tr>`;
+    }).join('');
+    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${proj.name} — Report</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f5f5f7;color:#111;font-size:14px;line-height:1.6;}a{color:${accent}}.wrap{max-width:680px;margin:0 auto;padding:40px 24px 80px;}.card{background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:14px;border:1px solid #e8e8e8;}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}.stat{background:#fff;border-radius:10px;padding:14px;border:1px solid #e8e8e8;}.sn{font-size:20px;font-weight:700;letter-spacing:-.4px;}.sl{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;}.sec-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#888;margin-bottom:12px;}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr);}.wrap{padding:20px 16px;}}@media print{body{background:#fff;}}</style></head><body><div class="wrap"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid #e0e0e0;">${logoHtml}<div style="text-align:right;font-size:11px;color:#888;">Generated ${new Date().toLocaleDateString('en-NZ',{day:'numeric',month:'long',year:'numeric'})}</div></div><div style="margin-bottom:20px;"><div style="font-size:24px;font-weight:700;letter-spacing:-.4px;margin-bottom:4px;">${proj.name}</div><div style="font-size:13px;color:#666;">${client?client.name+' · ':''}<span style="background:${accent}22;color:${accent};padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;">${stageLabel}</span></div>${proj.description?`<div style="margin-top:8px;font-size:13px;color:#555;">${proj.description}</div>`:''}</div><div class="stats" style="margin-bottom:14px;"><div class="stat"><div class="sn">${totalHours.toFixed(1)}h</div><div class="sl">Hours logged</div></div>${proj.budget?`<div class="stat"><div class="sn" style="color:${profit>=0?'#22c55e':'#ef4444'};">${profit>=0?'+':'-'}$${Math.round(Math.abs(profit)).toLocaleString()}</div><div class="sl">Profit/Loss</div></div><div class="stat"><div class="sn">$${Math.round(totalBilled).toLocaleString()}</div><div class="sl">Billed</div></div>`:''}<div class="stat"><div class="sn">${doneTasks.length}/${allTasks.length}</div><div class="sl">Tasks done</div></div></div>${stagesHtml?`<div class="card"><div class="sec-title">Production stages</div><table style="width:100%;border-collapse:collapse;">${stagesHtml}</table></div>`:''}<div style="text-align:center;margin-top:28px;"><a href="https://bsmnt.co.nz" style="display:inline-block;background:${accent};color:#fff;padding:10px 24px;border-radius:8px;font-weight:600;font-size:13px;">View live →</a><div style="margin-top:10px;font-size:11px;color:#aaa;">Shareable link: <a href="${reportUrl}">${reportUrl}</a></div></div><div style="text-align:center;margin-top:32px;font-size:11px;color:#bbb;">Report by Week Below · Built by BSMNT</div></div></body></html>`;
+    res.setHeader('Content-Type','text/html');
+    res.send(html);
+  } catch(e) { res.status(500).send('Error: '+e.message); }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
