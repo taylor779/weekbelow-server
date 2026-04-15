@@ -151,10 +151,13 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => res.send('BSMNT OK'));
-app.post('/create-checkout', handleCreateCheckout);
-app.post('/generate-image',  handleGenerateImage);
-app.post('/gift-tokens-email', handleGiftTokensEmail);
-app.get('/project-report/:agencyId/:projectId', handleProjectReport);
+app.post('/create-checkout',      handleCreateCheckout);
+app.post('/create-subscription',  handleCreateSubscription);
+app.get('/customer-portal',       handleCustomerPortal);
+app.post('/cancel-subscription',  handleCancelSubscription);
+app.post('/generate-image',       handleGenerateImage);
+app.post('/gift-tokens-email',    handleGiftTokensEmail);
+app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 
 const httpServer = http.createServer(app);
@@ -328,6 +331,124 @@ async function handleCreateCheckout(req, res) {
   }
 }
 
+// ── Subscription price IDs (set these in Railway env vars) ───────────────────
+// STRIPE_PRICE_SOLO   — price_xxx from Stripe Dashboard
+// STRIPE_PRICE_STUDIO — price_xxx from Stripe Dashboard
+// STRIPE_PRICE_AGENCY — price_xxx from Stripe Dashboard
+const PLAN_PRICES = {
+  solo:   process.env.STRIPE_PRICE_SOLO,
+  studio: process.env.STRIPE_PRICE_STUDIO,
+  agency: process.env.STRIPE_PRICE_AGENCY,
+};
+
+async function handleCreateSubscription(req, res) {
+  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+  try {
+    const { planId, agencyId, returnUrl, email } = req.body;
+    if (!planId || !agencyId) return res.status(400).json({ error: 'planId and agencyId required' });
+    const priceId = PLAN_PRICES[planId];
+    if (!priceId) return res.status(400).json({ error: `No price configured for plan "${planId}". Set STRIPE_PRICE_${planId.toUpperCase()} in Railway env vars.` });
+
+    // Look up or create Stripe customer for this agency
+    let customerId = null;
+    try {
+      const { data: settings } = await supabaseAdmin
+        .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+      customerId = settings?.brand?.stripeCustomerId || null;
+    } catch(e) { /* ignore */ }
+
+    const sessionParams = {
+      payment_method_types: ['card'],
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: (returnUrl || 'https://bsmnt.co.nz') + '?subscription=success&plan=' + planId,
+      cancel_url:  (returnUrl || 'https://bsmnt.co.nz') + '?subscription=cancelled',
+      metadata: { agencyId, planId },
+      subscription_data: { metadata: { agencyId, planId } },
+    };
+
+    if (customerId) sessionParams.customer = customerId;
+    else if (email) sessionParams.customer_email = email;
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+    log('💳', `Subscription checkout for agency ${agencyId} — plan: ${planId}`);
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error('create-subscription error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleCustomerPortal(req, res) {
+  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+  try {
+    const { agencyId, returnUrl } = req.query;
+    if (!agencyId) return res.status(400).json({ error: 'agencyId required' });
+
+    // Get Stripe customer ID from app_state
+    const { data: settings } = await supabaseAdmin
+      .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+    const customerId = settings?.brand?.stripeCustomerId;
+    if (!customerId) return res.status(404).json({ error: 'No billing account found. Please subscribe first.' });
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: returnUrl || 'https://bsmnt.co.nz',
+    });
+
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error('customer-portal error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleCancelSubscription(req, res) {
+  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+  try {
+    const { agencyId } = req.body;
+    const { data: settings } = await supabaseAdmin
+      .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+    const subId = settings?.brand?.stripeSubscriptionId;
+    if (!subId) return res.status(404).json({ error: 'No active subscription found' });
+
+    // Cancel at period end (not immediately)
+    await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+    log('❌', `Subscription cancelled at period end for agency ${agencyId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('cancel-subscription error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ── Manual recap trigger (admin only) ────────────────────────────────────────
+async function handleSendRecapNow(req, res) {
+  try {
+    const { agencyId, adminEmail } = req.body;
+    if (adminEmail !== (process.env.ADMIN_EMAIL || 'taylor@below.co.nz'))
+      return res.status(403).json({ error: 'Admin only' });
+
+    const { data: agData } = await supabaseAdmin
+      .from('app_state').select('*').eq('agency_id', agencyId).maybeSingle();
+    if (!agData) return res.status(404).json({ error: 'Agency not found' });
+
+    const users = agData.users || [];
+    let sent = 0;
+    for (const user of users) {
+      if (!user.email || !user.email.includes('@') || user.active === false) continue;
+      const recapData = _buildUserRecap(user, agData);
+      await sendEmail(weeklyEmail(user, recapData));
+      sent++;
+    }
+    log('📬', `Manual recap sent to ${sent} users in agency ${agencyId}`);
+    res.json({ ok: true, sent });
+  } catch (e) {
+    console.error('send-recap error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
 async function handleStripeWebhook(req, res) {
   if (!stripe) return res.status(500).send('Stripe not configured');
   let event;
@@ -338,25 +459,124 @@ async function handleStripeWebhook(req, res) {
     return res.status(400).send('Webhook Error: ' + e.message);
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const { agencyId, tokens } = event.data.object.metadata || {};
-    if (agencyId && tokens) {
-      const tokensToAdd = parseInt(tokens, 10);
-      try {
+  try {
+    // ── Token purchase completed ──────────────────────────────────────────────
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const { agencyId, tokens, planId } = session.metadata || {};
+
+      // Token purchase
+      if (agencyId && tokens && !planId) {
+        const tokensToAdd = parseInt(tokens, 10);
         const { data: current } = await supabaseAdmin
-          .from('agency_settings').select('agency_id,token_balance')
-          .eq('agency_id', agencyId).maybeSingle();
-        const newBalance = ((current && current.token_balance) || 0) + tokensToAdd;
-        if (current) {
-          await supabaseAdmin.from('agency_settings').update({ token_balance: newBalance }).eq('agency_id', agencyId);
-        } else {
-          await supabaseAdmin.from('agency_settings').insert({ agency_id: agencyId, token_balance: newBalance });
-        }
-        log('🪙', `Credited ${tokensToAdd} tokens to ${agencyId} (balance: ${newBalance})`);
-      } catch (e) { console.error('Token credit failed:', e.message); }
+          .from('app_state').select('agency_id,brand').eq('agency_id', agencyId).maybeSingle();
+        const brand = current?.brand || {};
+        const newBalance = ((brand.tokenBalance) || 0) + tokensToAdd;
+        await supabaseAdmin.from('app_state').update({
+          brand: { ...brand, tokenBalance: newBalance }
+        }).eq('agency_id', agencyId);
+        log('🪙', `Credited ${tokensToAdd} tokens to ${agencyId}`);
+      }
+
+      // Subscription started via checkout — store customer + subscription IDs
+      if (agencyId && planId && session.subscription) {
+        await _applySubscription(agencyId, session.customer, session.subscription, planId, 'active');
+      }
     }
+
+    // ── Subscription activated / updated ─────────────────────────────────────
+    if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
+      const sub = event.data.object;
+      const agencyId = sub.metadata?.agencyId;
+      if (agencyId) {
+        const planId = _planFromSubscription(sub);
+        const status  = sub.status; // active, trialing, past_due, canceled, etc.
+        const periodEnd = sub.current_period_end;
+        await _applySubscription(agencyId, sub.customer, sub.id, planId, status, periodEnd);
+        log('📋', `Subscription ${event.type} for agency ${agencyId} — plan: ${planId}, status: ${status}`);
+      }
+    }
+
+    // ── Subscription cancelled / expired ─────────────────────────────────────
+    if (event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      const agencyId = sub.metadata?.agencyId;
+      if (agencyId) {
+        await _applySubscription(agencyId, sub.customer, null, 'free', 'cancelled', null);
+        log('❌', `Subscription cancelled for agency ${agencyId} — reverted to free`);
+      }
+    }
+
+    // ── Payment failed ────────────────────────────────────────────────────────
+    if (event.type === 'invoice.payment_failed') {
+      const invoice = event.data.object;
+      const sub = invoice.subscription ? await stripe.subscriptions.retrieve(invoice.subscription) : null;
+      const agencyId = sub?.metadata?.agencyId;
+      if (agencyId) {
+        await _patchBrand(agencyId, { planStatus: 'past_due' });
+        log('⚠', `Payment failed for agency ${agencyId}`);
+      }
+    }
+
+    // ── Payment succeeded (renewing subscription) ─────────────────────────────
+    if (event.type === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      if (invoice.billing_reason === 'subscription_cycle' && invoice.subscription) {
+        const sub = await stripe.subscriptions.retrieve(invoice.subscription);
+        const agencyId = sub?.metadata?.agencyId;
+        if (agencyId) {
+          const planId = _planFromSubscription(sub);
+          await _applySubscription(agencyId, sub.customer, sub.id, planId, 'active', sub.current_period_end);
+
+          // Add monthly token allowance
+          const monthlyTokens = { solo: 0, studio: 20, agency: 100 };
+          const bonus = monthlyTokens[planId] || 0;
+          if (bonus > 0) {
+            const { data: current } = await supabaseAdmin
+              .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+            const brand = current?.brand || {};
+            await supabaseAdmin.from('app_state').update({
+              brand: { ...brand, tokenBalance: ((brand.tokenBalance) || 0) + bonus }
+            }).eq('agency_id', agencyId);
+            log('🪙', `Monthly ${bonus} tokens added for agency ${agencyId} (${planId})`);
+          }
+        }
+      }
+    }
+
+  } catch (e) {
+    console.error('Webhook handler error:', e.message);
   }
+
   res.json({ received: true });
+}
+
+// ── Subscription helpers ──────────────────────────────────────────────────────
+function _planFromSubscription(sub) {
+  // Map price ID back to plan name
+  const priceId = sub.items?.data?.[0]?.price?.id;
+  if (priceId === process.env.STRIPE_PRICE_AGENCY) return 'agency';
+  if (priceId === process.env.STRIPE_PRICE_STUDIO) return 'studio';
+  if (priceId === process.env.STRIPE_PRICE_SOLO)   return 'solo';
+  return sub.metadata?.planId || 'solo';
+}
+
+async function _patchBrand(agencyId, patch) {
+  const { data: current } = await supabaseAdmin
+    .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+  const brand = current?.brand || {};
+  await supabaseAdmin.from('app_state')
+    .update({ brand: { ...brand, ...patch } }).eq('agency_id', agencyId);
+}
+
+async function _applySubscription(agencyId, customerId, subscriptionId, planId, status, periodEnd) {
+  await _patchBrand(agencyId, {
+    plan: planId,
+    planStatus: status,
+    stripeCustomerId: customerId || undefined,
+    stripeSubscriptionId: subscriptionId || undefined,
+    planPeriodEnd: periodEnd ? new Date(periodEnd * 1000).toISOString() : undefined,
+  });
 }
 
 async function handleGenerateImage(req, res) {
