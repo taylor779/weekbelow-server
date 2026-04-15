@@ -156,6 +156,7 @@ app.post('/create-subscription',  handleCreateSubscription);
 app.get('/customer-portal',       handleCustomerPortal);
 app.post('/cancel-subscription',  handleCancelSubscription);
 app.post('/generate-image',       handleGenerateImage);
+app.post('/briefing',             handleBriefing);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
@@ -646,6 +647,43 @@ async function handleGenerateImage(req, res) {
     res.json({ imageUrl: 'data:' + imgPart.inlineData.mimeType + ';base64,' + imgPart.inlineData.data, tokenBalance: newBalance });
   } catch (e) {
     console.error('generate-image error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+
+// ── AI Briefing (text-only, for dashboard insight) ───────────────────────────
+async function handleBriefing(req, res) {
+  if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    const geminiRes = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + process.env.GEMINI_API_KEY,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 150, temperature: 0.8 }
+        })
+      }
+    );
+
+    if (!geminiRes.ok) {
+      const err = await geminiRes.text();
+      return res.status(500).json({ error: 'Gemini error: ' + err.slice(0, 200) });
+    }
+
+    const data = await geminiRes.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!text) return res.status(500).json({ error: 'No text returned from Gemini' });
+
+    log('💬', 'Briefing generated (' + text.length + ' chars)');
+    res.json({ text: text.trim() });
+  } catch (e) {
+    console.error('briefing error:', e.message);
     res.status(500).json({ error: e.message });
   }
 }
