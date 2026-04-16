@@ -80,7 +80,11 @@ function _makeSupaQuery(table) {
     insert(body) { s.method = 'POST'; s.body = body; return q; },
     upsert(body, opts) { s.method = 'POST'; s.body = body; s.upsertConflict = (opts && opts.onConflict) ? opts.onConflict : ''; return q; },
     delete() { s.method = 'DELETE'; return q; },
-    then(resolve, reject) { return q._exec().then(resolve, reject); },
+    then(resolve, reject) {
+      return q._exec()
+        .then(r => resolve({ data: r, error: null }))
+        .catch(e => resolve({ data: null, error: e }));
+    },
     async maybeSingle() {
       try { s.limitN = 1; const r = await q._exec(); return { data: Array.isArray(r) ? (r[0] || null) : r, error: null }; }
       catch(e) { return { data: null, error: e }; }
