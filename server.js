@@ -31,7 +31,7 @@ const stripe = process.env.STRIPE_SECRET_KEY
 const SUPA_URL = process.env.SUPABASE_URL || '';
 const SUPA_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
-function supaRest(method, table, params, body) {
+function supaRest(method, table, params, body, extraHeaders) {
   // params: query string e.g. 'agency_id=eq.123'
   // body: object for POST/PATCH, or null
   return new Promise((resolve, reject) => {
@@ -44,7 +44,7 @@ function supaRest(method, table, params, body) {
       ...(extraHeaders || {}),
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'Prefer': method === 'POST' ? 'resolution=merge-duplicates,return=representation' : 'return=minimal',
+      'Prefer': 'return=representation',
     };
     if (bodyStr) headers['Content-Length'] = Buffer.byteLength(bodyStr);
     const req = https.request({
