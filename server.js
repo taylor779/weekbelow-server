@@ -291,6 +291,18 @@ async function handleGiftTokensEmail(req, res) {
   res.json({ ok: true }); // respond immediately, send email async
 
   try {
+    // Write tokens to agency_settings using service key (bypasses RLS)
+    const { data: current } = await supabaseAdmin
+      .from('agency_settings').select('token_balance').eq('agency_id', agencyId).maybeSingle();
+    const newBalance = ((current?.token_balance) || 0) + tokens;
+    await supabaseAdmin.from('agency_settings').upsert({
+      agency_id: agencyId,
+      token_balance: newBalance,
+      pending_gift_tokens: tokens,
+      pending_gift_message: message || null,
+    }, { onConflict: 'agency_id' });
+    log('🎁', `Tokens written: ${agencyId} now has ${newBalance} tokens`);
+
     // Look up the agency's admin email from agency_members
     const { data: members } = await supabaseAdmin
       .from('agency_members')
@@ -711,12 +723,18 @@ async function handleBriefing(req, res) {
 
     if (!geminiRes.ok) {
       const err = await geminiRes.text();
-      return res.status(500).json({ error: 'Gemini error: ' + err.slice(0, 200) });
+      const status = geminiRes.status;
+      // Rate limit — return 429 so app can handle gracefully
+      if (status === 429) return res.status(429).json({ error: 'Rate limited — try again in a moment' });
+      return res.status(500).json({ error: 'Gemini error ' + status + ': ' + err.slice(0, 200) });
     }
 
     const data = await geminiRes.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    if (!text) return res.status(500).json({ error: 'No text returned from Gemini' });
+    if (!text) {
+      const reason = data?.candidates?.[0]?.finishReason || 'unknown';
+      return res.status(500).json({ error: 'No text returned (finishReason: ' + reason + ')' });
+    }
 
     log('💬', 'Briefing generated (' + text.length + ' chars)');
     res.json({ text: text.trim() });
