@@ -169,12 +169,13 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), handleStr
 
 app.use(express.json({ limit: '20mb' }));
 
-// CORS
+// CORS — must be first middleware so preflight OPTIONS always gets headers
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Max-Age', '86400'); // cache preflight 24h
+  if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
 
