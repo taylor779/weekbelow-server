@@ -194,6 +194,7 @@ app.post('/send-project-invite',  handleSendProjectInvite);
 app.post('/invite-member',         handleInviteMember);
 app.post('/accept-project-invite',handleAcceptProjectInvite);
 app.get('/project-invites/:email', handleGetProjectInvites);
+app.get('/project-invites/id/:inviteId', handleGetInviteById);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
@@ -773,19 +774,25 @@ async function handleSendProjectInvite(req, res) {
       .eq('project_id', projectId).eq('invited_email', invitedEmail).maybeSingle();
     if (existing?.status === 'pending')  return res.status(409).json({ error: 'Invite already sent' });
     if (existing?.status === 'accepted') return res.status(409).json({ error: 'Already collaborating' });
+    // Insert invite and fetch the generated ID for the deep link
     const { error: ie } = await supabaseAdmin.from('project_invites').insert({
       project_id: projectId, project_name: projectName,
       owner_agency_id: inviterAgencyId, owner_name: inviterName,
       invited_email: invitedEmail, status: 'pending'
     });
     if (ie) throw ie;
+    // Fetch the invite ID we just created
+    const { data: newInvite } = await supabaseAdmin.from('project_invites')
+      .select('id').eq('invited_email', invitedEmail).eq('project_id', projectId)
+      .eq('owner_agency_id', inviterAgencyId).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    const inviteId = newInvite?.id || '';
     const firstName = (guestMember.name || 'there').split(' ')[0];
     const pn = projectName || 'a project';
     const inn = inviterName || 'Someone';
     sendEmail({
       to: invitedEmail,
       subject: `${inn} invited you to collaborate on "${pn}"`,
-      html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;"><div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;"><div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;"><div style="font-size:48px;margin-bottom:12px;">🎬</div><h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">Project Invite</h1><p style="color:#9898aa;font-size:13px;margin:0;">via BSMNT</p></div><div style="padding:28px 32px;"><p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p><p style="color:#c8c8d8;font-size:15px;margin:0 0 20px;"><strong style="color:#eeeef2;">${inn}</strong> has invited you to collaborate on <strong style="color:#7c6fff;">${pn}</strong>.</p><p style="color:#9898aa;font-size:13px;margin:0 0 24px;">Open BSMNT to accept or decline — the invite is waiting in your notifications.</p><a href="https://bsmnt.co.nz/app.html" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:12px;border-radius:8px;text-align:center;font-weight:600;font-size:14px;">Open BSMNT \u2192</a></div><div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;"><p style="color:#55556a;font-size:11px;margin:0;">BSMNT \u00b7 Week Below</p></div></div></body></html>`,
+      html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;"><div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;"><div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;"><div style="font-size:48px;margin-bottom:12px;">🎬</div><h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">Project Invite</h1><p style="color:#9898aa;font-size:13px;margin:0;">via BSMNT</p></div><div style="padding:28px 32px;"><p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p><p style="color:#c8c8d8;font-size:15px;margin:0 0 20px;"><strong style="color:#eeeef2;">${inn}</strong> has invited you to collaborate on <strong style="color:#7c6fff;">${pn}</strong>.</p><p style="color:#9898aa;font-size:13px;margin:0 0 24px;">Open BSMNT to accept or decline — the invite is waiting in your notifications.</p><a href="https://bsmnt.co.nz/app.html?accept_invite=${inviteId}" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:14px;border-radius:8px;text-align:center;font-weight:600;font-size:15px;">Accept project invite \u2192</a><p style="color:#55556a;font-size:12px;margin:16px 0 0;text-align:center;">You can also decline from within the BSMNT app.</p></div><div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;"><p style="color:#55556a;font-size:11px;margin:0;">BSMNT \u00b7 Week Below</p></div></div></body></html>`,
     }).catch(e => log('invite email err', e.message));
     log('🤝', `Project invite sent: ${invitedEmail} to ${pn}`);
     res.json({ ok: true });
@@ -808,10 +815,13 @@ async function handleAcceptProjectInvite(req, res) {
     if (!invite) return res.status(404).json({ error: 'Invite not found' });
     const newStatus = accept ? 'accepted' : 'declined';
     await supabaseAdmin.from('project_invites').update({ status: newStatus }).eq('id', inviteId);
+    let projectData = null;
     if (accept) {
+      // Create collaboration link
       await supabaseAdmin.from('shared_projects').upsert({
         project_id: invite.project_id, owner_agency_id: invite.owner_agency_id, guest_agency_id: guestAgencyId,
       }, { onConflict: 'project_id,guest_agency_id' });
+      // Copy project JSON from owner's app_state
       const { data: ownerState } = await supabaseAdmin.from('app_state').select('projects').eq('agency_id', invite.owner_agency_id).maybeSingle();
       const project = (ownerState?.projects || []).find(p => String(p.id) === String(invite.project_id));
       if (project) {
@@ -819,12 +829,31 @@ async function handleAcceptProjectInvite(req, res) {
           project_id: invite.project_id, owner_agency_id: invite.owner_agency_id,
           project_json: project, updated_by: 'system', updated_at: new Date().toISOString(),
         }, { onConflict: 'project_id,owner_agency_id' });
+        // Return project to guest app so it appears immediately
+        projectData = Object.assign({}, project, {
+          _shared: true,
+          _ownerAgencyId: invite.owner_agency_id,
+        });
       }
-      log('🤝', `Collaboration accepted: ${invite.project_name}`);
+      log('🤝', `Collaboration accepted: ${invite.project_name} by agency ${guestAgencyId}`);
     }
-    res.json({ ok: true, status: newStatus });
+    res.json({ ok: true, status: newStatus, project: projectData });
   } catch(e) {
     console.error('accept-project-invite:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+
+async function handleGetInviteById(req, res) {
+  const { inviteId } = req.params;
+  if (!inviteId) return res.status(400).json({ error: 'inviteId required' });
+  try {
+    const { data: invite } = await supabaseAdmin.from('project_invites')
+      .select('*').eq('id', inviteId).maybeSingle();
+    if (!invite) return res.status(404).json({ error: 'Invite not found' });
+    res.json({ invite });
+  } catch(e) {
     res.status(500).json({ error: e.message });
   }
 }
