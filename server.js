@@ -157,6 +157,10 @@ app.get('/customer-portal',       handleCustomerPortal);
 app.post('/cancel-subscription',  handleCancelSubscription);
 app.post('/generate-image',       handleGenerateImage);
 app.post('/briefing',             handleBriefing);
+app.post('/send-project-invite',  handleSendProjectInvite);
+app.post('/invite-member',         handleInviteMember);
+app.post('/accept-project-invite',handleAcceptProjectInvite);
+app.get('/project-invites/:email', handleGetProjectInvites);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
@@ -614,7 +618,7 @@ async function handleGenerateImage(req, res) {
               { text: prompt }
             ]
           }],
-          generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+          generationConfig: { responseModalities: ['TEXT', 'IMAGE'], aspectRatio: '16:9' }
         }) }
     );
 
@@ -684,6 +688,118 @@ async function handleBriefing(req, res) {
     res.json({ text: text.trim() });
   } catch (e) {
     console.error('briefing error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+
+// ── Project Collaboration Invites ─────────────────────────────────────────────
+
+
+async function handleInviteMember(req, res) {
+  const { agencyId, email, role, memberData } = req.body || {};
+  if (!agencyId || !email) return res.status(400).json({ error: 'agencyId and email required' });
+  try {
+    const expires = new Date(Date.now() + 7*24*60*60*1000).toISOString();
+    const { error } = await supabaseAdmin.from('invites').insert({
+      agency_id: agencyId,
+      email: email.toLowerCase().trim(),
+      role: role || 'member',
+      expires_at: expires,
+      member_name:       memberData?.name       || email.split('@')[0],
+      member_initials:   memberData?.initials   || email.slice(0,2).toUpperCase(),
+      member_color:      memberData?.color      || '#7c6fff',
+      cost_rate:         memberData?.costRate   || 0,
+      charge_rate:       memberData?.chargeRate || 0,
+      can_access_reports: memberData?.canAccessReports || false,
+      can_edit_budgets:   memberData?.canEditBudgets   || false,
+    });
+    if (error) throw error;
+    log('✉', `Member invite created: ${email} → agency ${agencyId}`);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('invite-member error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleSendProjectInvite(req, res) {
+  const { inviterAgencyId, inviterName, projectId, projectName, invitedEmail } = req.body || {};
+  if (!inviterAgencyId || !projectId || !invitedEmail)
+    return res.status(400).json({ error: 'Missing required fields' });
+  try {
+    const { data: members } = await supabaseAdmin
+      .from('agency_members').select('id,name,agency_id,email').eq('email', invitedEmail).limit(1);
+    if (!members?.length)
+      return res.status(404).json({ error: 'No BSMNT account found for that email' });
+    const guestMember = members[0];
+    if (String(guestMember.agency_id) === String(inviterAgencyId))
+      return res.status(400).json({ error: 'That user is already in your studio' });
+    const { data: existing } = await supabaseAdmin
+      .from('project_invites').select('id,status')
+      .eq('project_id', projectId).eq('invited_email', invitedEmail).maybeSingle();
+    if (existing?.status === 'pending')  return res.status(409).json({ error: 'Invite already sent' });
+    if (existing?.status === 'accepted') return res.status(409).json({ error: 'Already collaborating' });
+    const { data: invite, error: ie } = await supabaseAdmin.from('project_invites').insert({
+      project_id: projectId, project_name: projectName,
+      owner_agency_id: inviterAgencyId, owner_name: inviterName,
+      invited_email: invitedEmail, status: 'pending'
+    }).select('id').single();
+    if (ie) throw ie;
+    const firstName = (guestMember.name || 'there').split(' ')[0];
+    const pn = projectName || 'a project';
+    const inn = inviterName || 'Someone';
+    sendEmail({
+      to: invitedEmail,
+      subject: `${inn} invited you to collaborate on "${pn}"`,
+      html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;"><div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;"><div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;"><div style="font-size:48px;margin-bottom:12px;">🎬</div><h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">Project Invite</h1><p style="color:#9898aa;font-size:13px;margin:0;">via BSMNT</p></div><div style="padding:28px 32px;"><p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p><p style="color:#c8c8d8;font-size:15px;margin:0 0 20px;"><strong style="color:#eeeef2;">${inn}</strong> has invited you to collaborate on <strong style="color:#7c6fff;">${pn}</strong>.</p><p style="color:#9898aa;font-size:13px;margin:0 0 24px;">Open BSMNT to accept or decline — the invite is waiting in your notifications.</p><a href="https://bsmnt.co.nz/app.html" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:12px;border-radius:8px;text-align:center;font-weight:600;font-size:14px;">Open BSMNT \u2192</a></div><div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;"><p style="color:#55556a;font-size:11px;margin:0;">BSMNT \u00b7 Week Below</p></div></div></body></html>`,
+    }).catch(e => log('invite email err', e.message));
+    log('🤝', `Project invite sent: ${invitedEmail} to ${pn}`);
+    res.json({ ok: true, inviteId: invite.id });
+  } catch(e) {
+    console.error('send-project-invite:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleAcceptProjectInvite(req, res) {
+  const { inviteId, guestAgencyId, accept } = req.body || {};
+  if (!inviteId || !guestAgencyId) return res.status(400).json({ error: 'inviteId and guestAgencyId required' });
+  try {
+    const { data: invite } = await supabaseAdmin.from('project_invites').select('*').eq('id', inviteId).maybeSingle();
+    if (!invite) return res.status(404).json({ error: 'Invite not found' });
+    const newStatus = accept ? 'accepted' : 'declined';
+    await supabaseAdmin.from('project_invites').update({ status: newStatus }).eq('id', inviteId);
+    if (accept) {
+      await supabaseAdmin.from('shared_projects').upsert({
+        project_id: invite.project_id, owner_agency_id: invite.owner_agency_id, guest_agency_id: guestAgencyId,
+      }, { onConflict: 'project_id,guest_agency_id' });
+      const { data: ownerState } = await supabaseAdmin.from('app_state').select('projects').eq('agency_id', invite.owner_agency_id).maybeSingle();
+      const project = (ownerState?.projects || []).find(p => String(p.id) === String(invite.project_id));
+      if (project) {
+        await supabaseAdmin.from('shared_project_data').upsert({
+          project_id: invite.project_id, owner_agency_id: invite.owner_agency_id,
+          project_json: project, updated_by: 'system', updated_at: new Date().toISOString(),
+        }, { onConflict: 'project_id,owner_agency_id' });
+      }
+      log('🤝', `Collaboration accepted: ${invite.project_name}`);
+    }
+    res.json({ ok: true, status: newStatus });
+  } catch(e) {
+    console.error('accept-project-invite:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+async function handleGetProjectInvites(req, res) {
+  const { email } = req.params;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  try {
+    const { data } = await supabaseAdmin.from('project_invites')
+      .select('*').eq('invited_email', decodeURIComponent(email)).eq('status', 'pending')
+      .order('created_at', { ascending: false });
+    res.json({ invites: data || [] });
+  } catch(e) {
     res.status(500).json({ error: e.message });
   }
 }
