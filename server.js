@@ -41,6 +41,7 @@ function supaRest(method, table, params, body) {
     const headers = {
       'apikey': SUPA_KEY,
       'Authorization': 'Bearer ' + SUPA_KEY,
+      ...(extraHeaders || {}),
       'Content-Type': 'application/json',
       'Accept': 'application/json',
       'Prefer': method === 'POST' ? 'resolution=merge-duplicates,return=representation' : 'return=minimal',
@@ -65,19 +66,46 @@ function supaRest(method, table, params, body) {
   });
 }
 
-const supabaseAdmin = SUPA_URL && SUPA_KEY ? {
-  from: (table) => ({
-    select: (cols) => ({
-      eq: (col, val) => ({
-        maybeSingle: () => supaRest('GET', table, `${col}=eq.${encodeURIComponent(val)}&select=${cols}`).then(r => ({ data: Array.isArray(r) ? r[0] || null : r }))
-      })
-    }),
-    update: (body) => ({
-      eq: (col, val) => supaRest('PATCH', table, `${col}=eq.${encodeURIComponent(val)}`, body).then(r => ({ data: r }))
-    }),
-    insert: (body) => supaRest('POST', table, null, body).then(r => ({ data: r }))
-  })
-} : null;
+// ── Supabase Admin — fluent query builder ───────────────────────────────────
+function _makeSupaQuery(table) {
+  const s = { table, filters: [], cols: '*', limitN: null, orderBy: null, body: null, method: 'GET', upsertConflict: null };
+  const q = {
+    select(cols) { s.cols = cols || '*'; s.method = 'GET'; return q; },
+    eq(col, val) { s.filters.push(`${col}=eq.${encodeURIComponent(val)}`); return q; },
+    in(col, vals) { s.filters.push(`${col}=in.(${vals.map(v => encodeURIComponent(v)).join(',')})`); return q; },
+    order(col, opts) { s.orderBy = `${col}.${(opts && opts.ascending === false) ? 'desc' : 'asc'}`; return q; },
+    limit(n) { s.limitN = n; return q; },
+    range(from, to) { s.limitN = (to - from + 1); return q; },
+    update(body) { s.method = 'PATCH'; s.body = body; return q; },
+    insert(body) { s.method = 'POST'; s.body = body; return q; },
+    upsert(body, opts) { s.method = 'POST'; s.body = body; s.upsertConflict = (opts && opts.onConflict) ? opts.onConflict : ''; return q; },
+    delete() { s.method = 'DELETE'; return q; },
+    then(resolve, reject) { return q._exec().then(resolve, reject); },
+    async maybeSingle() {
+      try { s.limitN = 1; const r = await q._exec(); return { data: Array.isArray(r) ? (r[0] || null) : r, error: null }; }
+      catch(e) { return { data: null, error: e }; }
+    },
+    async single() {
+      try { s.limitN = 1; const r = await q._exec(); return { data: Array.isArray(r) ? (r[0] || null) : r, error: null }; }
+      catch(e) { return { data: null, error: e }; }
+    },
+    _qs() {
+      const parts = [...s.filters];
+      if (s.cols && s.method === 'GET') parts.push(`select=${s.cols}`);
+      if (s.orderBy) parts.push(`order=${s.orderBy}`);
+      if (s.limitN != null) parts.push(`limit=${s.limitN}`);
+      if (s.upsertConflict != null) parts.push(`on_conflict=${encodeURIComponent(s.upsertConflict)}`);
+      return parts.join('&') || null;
+    },
+    async _exec() {
+      const extraH = {};
+      if (s.upsertConflict != null) extraH['Prefer'] = 'resolution=merge-duplicates,return=representation';
+      return supaRest(s.method, s.table, q._qs(), s.body, extraH);
+    },
+  };
+  return q;
+}
+const supabaseAdmin = SUPA_URL && SUPA_KEY ? { from: (table) => _makeSupaQuery(table) } : null;
 
 const TOKEN_PACKAGES = {
   tokens_5:   { tokens: 20,  priceUsd: 5,  name: '20 Tokens — $5 USD'  },
