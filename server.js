@@ -196,6 +196,7 @@ app.post('/accept-project-invite',handleAcceptProjectInvite);
 app.get('/project-invites/:email', handleGetProjectInvites);
 app.get('/project-invites/id/:inviteId', handleGetInviteById);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
+app.post('/bulk-email',           handleBulkEmail);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 
@@ -890,6 +891,54 @@ async function handleGetProjectInvites(req, res) {
 }
 
 // ── Email via Resend ──────────────────────────────────────────────────────────
+
+
+async function handleBulkEmail(req, res) {
+  const { subject, body, senderName, agencyId } = req.body || {};
+  if (!subject || !body) return res.status(400).json({ error: 'subject and body required' });
+  // Only allow Taylor to send bulk emails
+  if (agencyId !== 'b29ba033-e4a6-4e61-a7c4-1ec3a6c6708f') {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    // Fetch all agency admin emails from agency_members
+    const { data: members } = await supabaseAdmin
+      .from('agency_members')
+      .select('email, name, agency_id')
+      .eq('role', 'admin')
+      .eq('active', true);
+
+    if (!members || !members.length) return res.json({ ok: true, sent: 0 });
+
+    // Dedupe by email
+    const seen = new Set();
+    const recipients = members.filter(m => {
+      if (!m.email || seen.has(m.email)) return false;
+      seen.add(m.email);
+      return true;
+    });
+
+    let sent = 0, failed = 0;
+    for (const r of recipients) {
+      const firstName = (r.name || 'there').split(' ')[0];
+      const personalised = body.replace(/\[first name\]/gi, firstName).replace(/\[name\]/gi, r.name || 'there');
+      try {
+        await sendEmail({ to: r.email, subject, html: personalised });
+        sent++;
+      } catch(e) {
+        log('✉ bulk-email error for', r.email, e.message);
+        failed++;
+      }
+    }
+
+    log('✉', `Bulk email sent: ${sent} ok, ${failed} failed. Subject: "${subject}"`);
+    res.json({ ok: true, sent, failed, total: recipients.length });
+  } catch(e) {
+    log('✉ bulk-email error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
 
 function sendEmail({ to, subject, html }) {
   if (!RESEND_KEY) { log('✉', `[no key] Would send to ${to}: ${subject}`); return Promise.resolve(); }
