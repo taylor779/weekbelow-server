@@ -197,6 +197,7 @@ app.get('/project-invites/:email', handleGetProjectInvites);
 app.get('/project-invites/id/:inviteId', handleGetInviteById);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
 app.post('/bulk-email',           handleBulkEmail);
+app.post('/save-user-pref',       handleSaveUserPref);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 
@@ -274,7 +275,7 @@ function scheduleFridayRecaps() {
             const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', state.agency_id).maybeSingle();
             if (agData) {
               const recapData = _buildUserRecap(user, agData);
-              await sendEmail(weeklyEmail(user, recapData));
+              await sendEmail(await weeklyEmail(user, {...recapData, agencyId: agency.agency_id}));
               log('📬', `Friday recap sent to ${user.email} (${tz})`);
             }
           }
@@ -318,15 +319,17 @@ async function handleGiftTokensEmail(req, res) {
     const firstName = (recipient.name || 'there').split(' ')[0];
     const msgLine = message ? `<p style="font-style:italic;color:#9898aa;margin:0 0 16px;">"${message}"</p>` : '';
 
+    const _giftLogo = await getAgencyLogoHtml(agencyId, '32px');
+    const _giftLogoBlock = _giftLogo ? `<div style="margin-bottom:16px;">${_giftLogo}</div>` : '';
     await sendEmail({
       to: recipient.email,
-      subject: `🎁 You've been gifted ${tokens} tokens on Week Below`,
+      subject: `🎁 You've been gifted ${tokens} tokens on BSMNT`,
       html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;">
         <div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;">
           <div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;">
-            <div style="font-size:48px;margin-bottom:12px;">🎁</div>
+            ${_giftLogoBlock}<div style="font-size:48px;margin-bottom:12px;">🎁</div>
             <h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">You've got tokens!</h1>
-            <p style="color:#9898aa;font-size:13px;margin:0;">From the Week Below team</p>
+            <p style="color:#9898aa;font-size:13px;margin:0;">From the BSMNT team</p>
           </div>
           <div style="padding:28px 32px;">
             <p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p>
@@ -340,7 +343,7 @@ async function handleGiftTokensEmail(req, res) {
             <a href="https://bsmnt.co.nz" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:12px;border-radius:8px;text-align:center;font-weight:600;font-size:14px;">Open Week Below →</a>
           </div>
           <div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;">
-            <p style="color:#55556a;font-size:11px;margin:0;">Week Below · Built by BSMNT</p>
+            <p style="color:#55556a;font-size:11px;margin:0;">BSMNT &middot; bsmnt.co.nz</p>
           </div>
         </div>
       </body></html>`,
@@ -490,7 +493,7 @@ async function handleSendRecapNow(req, res) {
     for (const user of users) {
       if (!user.email || !user.email.includes('@') || user.active === false) continue;
       const recapData = _buildUserRecap(user, agData);
-      await sendEmail(weeklyEmail(user, recapData));
+      await sendEmail(await weeklyEmail(user, {...recapData, agencyId: agency.agency_id}));
       sent++;
     }
     log('📬', `Manual recap sent to ${sent} users in agency ${agencyId}`);
@@ -893,6 +896,35 @@ async function handleGetProjectInvites(req, res) {
 // ── Email via Resend ──────────────────────────────────────────────────────────
 
 
+
+async function handleSaveUserPref(req, res) {
+  const { userId, agencyId, key, value } = req.body || {};
+  if (!userId || !agencyId || !key) return res.status(400).json({ error: 'userId, agencyId, key required' });
+  // Whitelist allowed pref keys — never let clients write arbitrary fields
+  const ALLOWED = ['uiTheme', 'cardStyle', 'bgTheme', 'accentColor', 'navOrder', 'lightMode'];
+  if (!ALLOWED.includes(key)) return res.status(400).json({ error: 'Key not allowed: ' + key });
+  try {
+    // Fetch current preferences first
+    const { data: row } = await supabaseAdmin
+      .from('agency_members')
+      .select('preferences')
+      .eq('id', userId)
+      .eq('agency_id', agencyId)
+      .maybeSingle();
+    if (!row) return res.status(404).json({ error: 'Member not found' });
+    const prefs = Object.assign({}, row.preferences || {}, { [key]: value });
+    const { error } = await supabaseAdmin
+      .from('agency_members')
+      .update({ preferences: prefs })
+      .eq('id', userId)
+      .eq('agency_id', agencyId);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
 async function handleBulkEmail(req, res) {
   const { subject, body, senderName, agencyId } = req.body || {};
   if (!subject || !body) return res.status(400).json({ error: 'subject and body required' });
@@ -940,6 +972,18 @@ async function handleBulkEmail(req, res) {
   }
 }
 
+async function getAgencyLogoHtml(agencyId, height='36px') {
+  try {
+    if (!agencyId) return null;
+    const { data } = await supabaseAdmin
+      .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+    const b = data?.brand || {};
+    if (b.logoBase64) return `<img src="${b.logoBase64}" style="height:${height};max-width:160px;object-fit:contain;display:block;margin:0 auto;" alt="logo"/>`;
+    if (b.appName) return `<div style="font-size:20px;font-weight:700;color:#fff;letter-spacing:-0.5px;">${b.appName}</div>`;
+  } catch(e) {}
+  return null;
+}
+
 function sendEmail({ to, subject, html }) {
   if (!RESEND_KEY) { log('✉', `[no key] Would send to ${to}: ${subject}`); return Promise.resolve(); }
   if (!to || !to.includes('@')) { log('✉', `Skipping — invalid address: ${to}`); return Promise.resolve(); }
@@ -985,21 +1029,21 @@ const BASE_STYLE = `
   .ftr{padding:20px 36px;text-align:center;font-size:11px;color:#3a3a50;line-height:1.8;border-top:1px solid #25252f;}
 `;
 
-function wrap(body) {
+function wrap(body, logoHtml) {
+  const _logo = logoHtml ||
+    `<div style="display:inline-block;background:#7c6fff;border-radius:10px;width:40px;height:40px;line-height:40px;text-align:center;font-size:20px;font-weight:700;color:#fff;">B</div>
+     <div style="font-size:18px;font-weight:700;color:#fff;margin-top:6px;">BSMNT</div>`;
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>${BASE_STYLE}</style></head>
 <body><div class="wrap">
-  <div style="text-align:center;padding-bottom:24px;">
-    <div style="display:inline-block;background:#7c6fff;border-radius:10px;width:40px;height:40px;line-height:40px;text-align:center;font-size:20px;font-weight:700;color:#fff;">B</div>
-    <div style="font-size:18px;font-weight:700;color:#fff;margin-top:8px;">BSMNT</div>
-    <div style="font-size:10px;color:#55556a;letter-spacing:1px;text-transform:uppercase;">Studio Management</div>
-  </div>
+  <div style="text-align:center;padding-bottom:24px;">${_logo}</div>
   <div class="card"><div class="body">${body}</div>
-  <div class="ftr">BSMNT Studio Management &middot; bsmnt.co.nz<br>You're receiving this as a member of your studio.</div>
+  <div class="ftr">BSMNT &middot; bsmnt.co.nz<br>You're receiving this as a member of your studio.</div>
   </div>
 </div></body></html>`;
 }
 
-function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems }) {
+async function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems, agencyId }) {
+  const _wLogo = agencyId ? await getAgencyLogoHtml(agencyId) : null;
   const dateLabel = new Date().toLocaleDateString('en-NZ', { day:'numeric', month:'long', year:'numeric' });
   const firstName = user.name.split(' ')[0];
   const projRows = myProjects.map(p => {
@@ -1020,7 +1064,7 @@ function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueIt
       <div class="stat"><div class="sn">${myProjects.length}</div><div class="sl">Active projects</div></div>
       <div class="stat"><div class="sn" style="color:#34d399">${completedThisWeek}</div><div class="sl">Tasks done</div></div></div>
       <div class="slabel">Your Active Projects</div>${projRows}
-      <div class="slabel">Due This Week / Overdue</div>${dueRows}`, _agLogo),
+      <div class="slabel">Due This Week / Overdue</div>${dueRows}`, _wLogo),
   };
 }
 
@@ -1370,7 +1414,7 @@ async function handleProjectReport(req, res) {
     const doneTasks = allTasks.filter(t => t.done);
     const stageLabel = {wip:'WIP',v0:'Draft',v1:'V1 Review',v2:'V2 Review',final:'Final',done:'Completed'}[ws.stage||'v0']||ws.stage;
     const accent = brand.accentColor || '#7c6fff';
-    const logoHtml = brand.logo ? `<img src="${brand.logo}" style="height:36px;object-fit:contain;" />` : `<span style="font-size:16px;font-weight:700;color:${accent};">${brand.name||'Week Below'}</span>`;
+    const logoHtml = brand.logoBase64 ? `<img src="${brand.logoBase64}" style="height:36px;max-width:160px;object-fit:contain;" />` : `<span style="font-size:16px;font-weight:700;color:${accent};">${brand.appName||brand.name||'BSMNT'}</span>`;
     const reportUrl = `${req.protocol}://${req.get('host')}/project-report/${agencyId}/${projectId}`;
     const stagesHtml = (proj.stages||[]).map(s => {
       const tasks = s.tasks||[];
@@ -1378,7 +1422,7 @@ async function handleProjectReport(req, res) {
       const pct = tasks.length ? Math.round(done/tasks.length*100) : 0;
       return `<tr><td style="padding:8px 0;font-weight:500;">${s.name}</td><td style="padding:8px;"><div style="height:5px;background:#eee;border-radius:3px;"><div style="width:${pct}%;height:100%;background:${accent};border-radius:3px;"></div></div></td><td style="padding:8px 0;text-align:right;font-size:12px;color:#888;">${done}/${tasks.length}</td></tr>`;
     }).join('');
-    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${proj.name} — Report</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f5f5f7;color:#111;font-size:14px;line-height:1.6;}a{color:${accent}}.wrap{max-width:680px;margin:0 auto;padding:40px 24px 80px;}.card{background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:14px;border:1px solid #e8e8e8;}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}.stat{background:#fff;border-radius:10px;padding:14px;border:1px solid #e8e8e8;}.sn{font-size:20px;font-weight:700;letter-spacing:-.4px;}.sl{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;}.sec-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#888;margin-bottom:12px;}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr);}.wrap{padding:20px 16px;}}@media print{body{background:#fff;}}</style></head><body><div class="wrap"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid #e0e0e0;">${logoHtml}<div style="text-align:right;font-size:11px;color:#888;">Generated ${new Date().toLocaleDateString('en-NZ',{day:'numeric',month:'long',year:'numeric'})}</div></div><div style="margin-bottom:20px;"><div style="font-size:24px;font-weight:700;letter-spacing:-.4px;margin-bottom:4px;">${proj.name}</div><div style="font-size:13px;color:#666;">${client?client.name+' · ':''}<span style="background:${accent}22;color:${accent};padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;">${stageLabel}</span></div>${proj.description?`<div style="margin-top:8px;font-size:13px;color:#555;">${proj.description}</div>`:''}</div><div class="stats" style="margin-bottom:14px;"><div class="stat"><div class="sn">${totalHours.toFixed(1)}h</div><div class="sl">Hours logged</div></div>${proj.budget?`<div class="stat"><div class="sn" style="color:${profit>=0?'#22c55e':'#ef4444'};">${profit>=0?'+':'-'}$${Math.round(Math.abs(profit)).toLocaleString()}</div><div class="sl">Profit/Loss</div></div><div class="stat"><div class="sn">$${Math.round(totalBilled).toLocaleString()}</div><div class="sl">Billed</div></div>`:''}<div class="stat"><div class="sn">${doneTasks.length}/${allTasks.length}</div><div class="sl">Tasks done</div></div></div>${stagesHtml?`<div class="card"><div class="sec-title">Production stages</div><table style="width:100%;border-collapse:collapse;">${stagesHtml}</table></div>`:''}<div style="text-align:center;margin-top:28px;"><a href="https://bsmnt.co.nz" style="display:inline-block;background:${accent};color:#fff;padding:10px 24px;border-radius:8px;font-weight:600;font-size:13px;">View live →</a><div style="margin-top:10px;font-size:11px;color:#aaa;">Shareable link: <a href="${reportUrl}">${reportUrl}</a></div></div><div style="text-align:center;margin-top:32px;font-size:11px;color:#bbb;">Report by Week Below · Built by BSMNT</div></div></body></html>`;
+    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${proj.name} — Report</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f5f5f7;color:#111;font-size:14px;line-height:1.6;}a{color:${accent}}.wrap{max-width:680px;margin:0 auto;padding:40px 24px 80px;}.card{background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:14px;border:1px solid #e8e8e8;}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}.stat{background:#fff;border-radius:10px;padding:14px;border:1px solid #e8e8e8;}.sn{font-size:20px;font-weight:700;letter-spacing:-.4px;}.sl{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;}.sec-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#888;margin-bottom:12px;}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr);}.wrap{padding:20px 16px;}}@media print{body{background:#fff;}}</style></head><body><div class="wrap"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid #e0e0e0;">${logoHtml}<div style="text-align:right;font-size:11px;color:#888;">Generated ${new Date().toLocaleDateString('en-NZ',{day:'numeric',month:'long',year:'numeric'})}</div></div><div style="margin-bottom:20px;"><div style="font-size:24px;font-weight:700;letter-spacing:-.4px;margin-bottom:4px;">${proj.name}</div><div style="font-size:13px;color:#666;">${client?client.name+' · ':''}<span style="background:${accent}22;color:${accent};padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;">${stageLabel}</span></div>${proj.description?`<div style="margin-top:8px;font-size:13px;color:#555;">${proj.description}</div>`:''}</div><div class="stats" style="margin-bottom:14px;"><div class="stat"><div class="sn">${totalHours.toFixed(1)}h</div><div class="sl">Hours logged</div></div>${proj.budget?`<div class="stat"><div class="sn" style="color:${profit>=0?'#22c55e':'#ef4444'};">${profit>=0?'+':'-'}$${Math.round(Math.abs(profit)).toLocaleString()}</div><div class="sl">Profit/Loss</div></div><div class="stat"><div class="sn">$${Math.round(totalBilled).toLocaleString()}</div><div class="sl">Billed</div></div>`:''}<div class="stat"><div class="sn">${doneTasks.length}/${allTasks.length}</div><div class="sl">Tasks done</div></div></div>${stagesHtml?`<div class="card"><div class="sec-title">Production stages</div><table style="width:100%;border-collapse:collapse;">${stagesHtml}</table></div>`:''}<div style="text-align:center;margin-top:28px;"><a href="https://bsmnt.co.nz" style="display:inline-block;background:${accent};color:#fff;padding:10px 24px;border-radius:8px;font-weight:600;font-size:13px;">View live →</a><div style="margin-top:10px;font-size:11px;color:#aaa;">Shareable link: <a href="${reportUrl}">${reportUrl}</a></div></div><div style="text-align:center;margin-top:32px;font-size:11px;color:#bbb;">BSMNT &middot; bsmnt.co.nz</div></div></body></html>`;
     res.setHeader('Content-Type','text/html');
     res.send(html);
   } catch(e) { res.status(500).send('Error: '+e.message); }
