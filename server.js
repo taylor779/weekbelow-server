@@ -1020,11 +1020,11 @@ function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueIt
       <div class="stat"><div class="sn">${myProjects.length}</div><div class="sl">Active projects</div></div>
       <div class="stat"><div class="sn" style="color:#34d399">${completedThisWeek}</div><div class="sl">Tasks done</div></div></div>
       <div class="slabel">Your Active Projects</div>${projRows}
-      <div class="slabel">Due This Week / Overdue</div>${dueRows}`),
+      <div class="slabel">Due This Week / Overdue</div>${dueRows}`, _agLogo),
   };
 }
 
-function assignmentEmail(user, project, byName) {
+function assignmentEmail(user, project, byName, logoHtml) {
   const firstName = (user.name || 'there').split(' ')[0];
   const dueFmt = project.endDate ? new Date(project.endDate+'T12:00:00').toLocaleDateString('en-NZ',{day:'numeric',month:'long',year:'numeric'}) : null;
   return {
@@ -1037,7 +1037,7 @@ function assignmentEmail(user, project, byName) {
         ${dueFmt?`<div class="proj-card-due">📅 Due ${dueFmt}</div>`:''}
         ${project.description?`<div class="proj-card-desc">${project.description}</div>`:''}
       </div>
-      <p style="font-size:13px;color:#8080a0;line-height:1.7;margin:0;">Log in to BSMNT to view the full brief, track your time, and check the run sheet.</p>`),
+      <p style="font-size:13px;color:#8080a0;line-height:1.7;margin:0;">Log in to BSMNT to view the full brief, track your time, and check the run sheet.</p>`, logoHtml),
   };
 }
 
