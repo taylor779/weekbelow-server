@@ -198,6 +198,8 @@ app.get('/project-invites/id/:inviteId', handleGetInviteById);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
 app.post('/bulk-email',           handleBulkEmail);
 app.post('/save-user-pref',       handleSaveUserPref);
+app.post('/set-member-active',    handleSetMemberActive);
+app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 
@@ -896,6 +898,67 @@ async function handleGetProjectInvites(req, res) {
 // ── Email via Resend ──────────────────────────────────────────────────────────
 
 
+
+
+async function handleAppendTimeLog(req, res) {
+  const { agencyId, projectId, entry } = req.body || {};
+  if (!agencyId || !projectId || !entry) {
+    return res.status(400).json({ error: 'agencyId, projectId, entry required' });
+  }
+  if (!entry.hours || !entry.date || !entry.user) {
+    return res.status(400).json({ error: 'entry must have hours, date, user' });
+  }
+  try {
+    // Read current projects
+    const { data: row, error: readErr } = await supabaseAdmin
+      .from('app_state')
+      .select('projects')
+      .eq('agency_id', agencyId)
+      .maybeSingle();
+    if (readErr) return res.status(500).json({ error: readErr.message });
+    if (!row) return res.status(404).json({ error: 'Agency state not found' });
+
+    // Find the project and append the entry atomically on the server
+    const projects = (row.projects || []).map(function(p) {
+      if (String(p.id) !== String(projectId)) return p;
+      const timeLog = Array.isArray(p.timeLog) ? p.timeLog : [];
+      return Object.assign({}, p, { timeLog: timeLog.concat([entry]) });
+    });
+
+    // Write back — using service key so RLS is bypassed
+    const { error: writeErr } = await supabaseAdmin
+      .from('app_state')
+      .update({ projects })
+      .eq('agency_id', agencyId);
+    if (writeErr) return res.status(500).json({ error: writeErr.message });
+
+    log('⏱', `Time log appended: ${entry.hours}h to project ${projectId} for agency ${agencyId}`);
+    res.json({ ok: true });
+  } catch(e) {
+    log('⏱ append-time-log error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+
+async function handleSetMemberActive(req, res) {
+  const { userId, agencyId, active } = req.body || {};
+  if (!userId || !agencyId || active === undefined) {
+    return res.status(400).json({ error: 'userId, agencyId, active required' });
+  }
+  try {
+    const { error } = await supabaseAdmin
+      .from('agency_members')
+      .update({ active: !!active })
+      .eq('id', userId)
+      .eq('agency_id', agencyId);
+    if (error) return res.status(500).json({ error: error.message });
+    log('👤', `Member ${userId} active=${active} in agency ${agencyId}`);
+    res.json({ ok: true });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+}
 
 async function handleSaveUserPref(req, res) {
   const { userId, agencyId, key, value } = req.body || {};
