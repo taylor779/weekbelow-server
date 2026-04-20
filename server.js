@@ -619,11 +619,22 @@ function _planFromSubscription(sub) {
 }
 
 async function _patchBrand(agencyId, patch) {
+  // Write to app_state.brand (for UI sync)
   const { data: current } = await supabaseAdmin
     .from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
   const brand = current?.brand || {};
   await supabaseAdmin.from('app_state')
     .update({ brand: { ...brand, ...patch } }).eq('agency_id', agencyId);
+  // Also write billing fields to agency_settings so the postgres_changes listener fires
+  // This is the authoritative source — app always reads billing from here on load
+  const billingPatch = {};
+  if (patch.plan        !== undefined) billingPatch.plan         = patch.plan;
+  if (patch.planStatus  !== undefined) billingPatch.plan_status  = patch.planStatus;
+  if (patch.planPeriodEnd !== undefined) billingPatch.plan_period_end = patch.planPeriodEnd;
+  if (Object.keys(billingPatch).length) {
+    await supabaseAdmin.from('agency_settings')
+      .upsert({ agency_id: agencyId, ...billingPatch }, { onConflict: 'agency_id' });
+  }
 }
 
 async function _applySubscription(agencyId, customerId, subscriptionId, planId, status, periodEnd) {
