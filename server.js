@@ -198,6 +198,7 @@ app.get('/project-invites/id/:inviteId', handleGetInviteById);
 app.post('/gift-tokens-email',    handleGiftTokensEmail);
 app.post('/bulk-email',           handleBulkEmail);
 app.post('/save-user-pref',       handleSaveUserPref);
+app.post('/link-preview',         handleLinkPreview);
 app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/send-recap',           handleSendRecapNow);
@@ -968,6 +969,36 @@ async function handleSetMemberActive(req, res) {
     res.json({ ok: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
+  }
+}
+
+
+async function handleLinkPreview(req, res) {
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BSMNT/1.0)' },
+      signal: AbortSignal.timeout(5000)
+    });
+    const html = await resp.text();
+    function getMeta(prop) {
+      const patterns = [
+        new RegExp('<meta[^>]+property=["\']' + prop + '["\'][^>]*content=["\']([^"\']+)["\']', 'i'),
+        new RegExp('<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']' + prop + '["\']', 'i'),
+        new RegExp('<meta[^>]+name=["\']' + prop + '["\'][^>]*content=["\']([^"\']+)["\']', 'i'),
+      ];
+      for (const re of patterns) { const m = html.match(re); if (m) return m[1]; }
+      return '';
+    }
+    const titleMatch = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
+    res.json({
+      title: getMeta('og:title') || getMeta('twitter:title') || (titleMatch && titleMatch[1].trim()) || url,
+      description: getMeta('og:description') || getMeta('twitter:description') || getMeta('description') || '',
+      image: getMeta('og:image') || getMeta('twitter:image') || '',
+    });
+  } catch(e) {
+    res.json({ title: url, description: '', image: '' });
   }
 }
 
