@@ -190,6 +190,7 @@ app.get('/customer-portal',       handleCustomerPortal);
 app.post('/cancel-subscription',  handleCancelSubscription);
 app.post('/generate-image',       handleGenerateImage);
 app.post('/briefing',             handleBriefing);
+app.post('/ai-brainstorm',        handleAIBrainstorm);
 app.post('/send-project-invite',  handleSendProjectInvite);
 app.post('/invite-member',         handleInviteMember);
 app.post('/accept-project-invite',handleAcceptProjectInvite);
@@ -203,6 +204,8 @@ app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/send-recap',           handleSendRecapNow);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
+app.get('/project-share/:token',        handleGetProjectShare);
+app.post('/project-share/:token/edit',  handleEditProjectShare);
 
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 });
@@ -758,6 +761,319 @@ async function handleBriefing(req, res) {
     res.json({ text: text.trim() });
   } catch (e) {
     console.error('briefing error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+
+
+
+// ── AI Brainstorm (returns JSON card data for brainstorm board) ──────────────
+async function handleAIBrainstorm(req, res) {
+  if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  try {
+    const { prompt, agencyId } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    const geminiRes = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + process.env.GEMINI_API_KEY,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            maxOutputTokens: 2048,
+            temperature: 0.85,
+            responseMimeType: 'application/json'
+          }
+        })
+      }
+    );
+
+    if (!geminiRes.ok) {
+      const err = await geminiRes.text();
+      const status = geminiRes.status;
+      if (status === 429) return res.status(429).json({ error: 'Rate limited — try again in a moment' });
+      return res.status(500).json({ error: 'Gemini error ' + status + ': ' + err.slice(0, 200) });
+    }
+
+    const data = await geminiRes.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    if (!text) {
+      const reason = data?.candidates?.[0]?.finishReason || 'unknown';
+      return res.status(500).json({ error: 'No response from AI (finishReason: ' + reason + ')' });
+    }
+
+    log('✨', 'AI brainstorm generated for ' + (agencyId || 'unknown') + ' (' + text.length + ' chars)');
+    res.json({ text: text.trim() });
+  } catch (e) {
+    console.error('ai-brainstorm error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ══ PROJECT SHARE SYSTEM ═════════════════════════════════════════════════════
+
+// Fields hidden from all share links (view and edit)
+const SHARE_HIDDEN_FIELDS = [
+  'budget','shootBudget','editBudget','budgetSpent','hardCosts','budgetEntries',
+  'timeLog','hardCostsArr'
+];
+
+// Remove financial data from a project before sending to external users
+function sanitizeProject(p) {
+  const clean = Object.assign({}, p);
+  SHARE_HIDDEN_FIELDS.forEach(f => delete clean[f]);
+  return clean;
+}
+
+// Find a project by share token across all agencies
+async function findProjectByToken(token) {
+  if (!token || token.length < 20) return null;
+  try {
+    // Search app_state rows where projects array contains a matching token
+    const { data: rows, error } = await supabaseAdmin
+      .from('app_state')
+      .select('agency_id, projects, brand');
+    if (error || !rows) return null;
+    for (const row of rows) {
+      const projects = Array.isArray(row.projects) ? row.projects : [];
+      const proj = projects.find(p =>
+        p.shareViewToken === token || p.shareEditToken === token
+      );
+      if (proj) {
+        return {
+          project: proj,
+          agencyId: row.agency_id,
+          brand: row.brand || {},
+          type: proj.shareViewToken === token ? 'view' : 'edit'
+        };
+      }
+    }
+    return null;
+  } catch(e) {
+    console.error('[share] findProjectByToken error:', e.message);
+    return null;
+  }
+}
+
+// GET /project-share/:token — return sanitized project data
+async function handleGetProjectShare(req, res) {
+  const { token } = req.params;
+  try {
+    const found = await findProjectByToken(token);
+    if (!found) return res.status(404).json({ error: 'Link not found or expired' });
+    res.json({
+      project: sanitizeProject(found.project),
+      type: found.type,
+      agencyId: found.agencyId,
+      brand: {
+        name: found.brand.appName || 'BSMNT',
+        logo: found.brand.logoBase64 || null,
+        accentColor: found.brand.accentColor || '#7c6fff',
+      }
+    });
+  } catch(e) {
+    console.error('[share] GET error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// POST /project-share/:token/edit — apply a change and sync back
+async function handleEditProjectShare(req, res) {
+  const { token } = req.params;
+  const { op, payload, guestName } = req.body || {};
+  try {
+    const found = await findProjectByToken(token);
+    if (!found) return res.status(404).json({ error: 'Link not found or expired' });
+    if (found.type !== 'edit') return res.status(403).json({ error: 'This link is read-only' });
+
+    // Load full current state
+    const { data: stateRow } = await supabaseAdmin
+      .from('app_state')
+      .select('*')
+      .eq('agency_id', found.agencyId)
+      .maybeSingle();
+    if (!stateRow) return res.status(404).json({ error: 'State not found' });
+
+    const projects = Array.isArray(stateRow.projects) ? [...stateRow.projects] : [];
+    const projIdx = projects.findIndex(p => p.id === found.project.id);
+    if (projIdx < 0) return res.status(404).json({ error: 'Project not found in state' });
+
+    let proj = { ...projects[projIdx] };
+    const guest = (guestName || 'External').slice(0, 40);
+
+    // ── Apply the operation ───────────────────────────────────────────────────
+    switch(op) {
+
+      // Tasks
+      case 'task_toggle': {
+        const { stageId, taskId, done } = payload;
+        proj.stages = (proj.stages||[]).map(s =>
+          s.id !== stageId ? s : { ...s, tasks: (s.tasks||[]).map(t =>
+            t.id !== taskId ? t : { ...t, done: !!done }
+          )}
+        );
+        break;
+      }
+      case 'task_add': {
+        const { stageId, name } = payload;
+        proj.stages = (proj.stages||[]).map(s =>
+          s.id !== stageId ? s : { ...s, tasks: [...(s.tasks||[]),
+            { id:'t'+Date.now()+Math.random().toString(36).slice(2,5), name, done:false, _addedBy:guest }
+          ]}
+        );
+        break;
+      }
+      case 'task_delete': {
+        const { stageId, taskId } = payload;
+        proj.stages = (proj.stages||[]).map(s =>
+          s.id !== stageId ? s : { ...s, tasks: (s.tasks||[]).filter(t => t.id !== taskId) }
+        );
+        break;
+      }
+      case 'task_note': {
+        const { stageId, taskId, notes } = payload;
+        proj.stages = (proj.stages||[]).map(s =>
+          s.id !== stageId ? s : { ...s, tasks: (s.tasks||[]).map(t =>
+            t.id !== taskId ? t : { ...t, notes }
+          )}
+        );
+        break;
+      }
+
+      // Shot list
+      case 'shot_add': {
+        if (!proj.shotList) proj.shotList = [];
+        proj.shotList.push({
+          id:'sh'+Date.now()+Math.random().toString(36).slice(2,5),
+          desc: payload.desc||'', type: payload.type||'', done:false, _addedBy:guest
+        });
+        break;
+      }
+      case 'shot_update': {
+        proj.shotList = (proj.shotList||[]).map(s =>
+          s.id !== payload.id ? s : { ...s, ...payload.changes }
+        );
+        break;
+      }
+      case 'shot_delete': {
+        proj.shotList = (proj.shotList||[]).filter(s => s.id !== payload.id);
+        break;
+      }
+      case 'shot_toggle': {
+        proj.shotList = (proj.shotList||[]).map(s =>
+          s.id !== payload.id ? s : { ...s, done: !!payload.done }
+        );
+        break;
+      }
+
+      // Deliverables
+      case 'deliverable_toggle': {
+        proj.deliverables = (proj.deliverables||[]).map(d =>
+          d.id !== payload.id ? d : { ...d, done: !!payload.done }
+        );
+        break;
+      }
+
+      // Runsheet rows
+      case 'rs_row_update': {
+        if (proj.runsheet && proj.runsheet.rows) {
+          proj.runsheet = { ...proj.runsheet, rows: (proj.runsheet.rows||[]).map(r =>
+            r.id !== payload.id ? r : { ...r, ...payload.changes }
+          )};
+        }
+        break;
+      }
+      case 'rs_row_add': {
+        if (!proj.runsheet) proj.runsheet = { rows:[], shotListOrdered:[] };
+        if (!proj.runsheet.rows) proj.runsheet.rows = [];
+        proj.runsheet = { ...proj.runsheet, rows: [...proj.runsheet.rows,
+          { id:'rr'+Date.now()+Math.random().toString(36).slice(2,5), ...payload, _addedBy:guest }
+        ]};
+        break;
+      }
+      case 'rs_row_delete': {
+        if (proj.runsheet && proj.runsheet.rows) {
+          proj.runsheet = { ...proj.runsheet, rows: proj.runsheet.rows.filter(r => r.id !== payload.id) };
+        }
+        break;
+      }
+      case 'rs_row_done': {
+        if (proj.runsheet && proj.runsheet.rows) {
+          proj.runsheet = { ...proj.runsheet, rows: proj.runsheet.rows.map(r =>
+            r.id !== payload.id ? r : { ...r, done: !!payload.done }
+          )};
+        }
+        break;
+      }
+
+      // Storyboard panels
+      case 'sb_panel_update': {
+        // Storyboard data lives in runsheet.sbPanels or similar
+        const rsData = proj.runsheet || {};
+        const panels = rsData.sbPanels || rsData.panels || [];
+        const updated = panels.map(p2 =>
+          p2.id !== payload.id ? p2 : { ...p2, ...payload.changes }
+        );
+        proj.runsheet = { ...rsData, [rsData.sbPanels ? 'sbPanels' : 'panels']: updated };
+        break;
+      }
+      case 'sb_panel_add': {
+        const rsData2 = proj.runsheet || {};
+        const key = rsData2.sbPanels ? 'sbPanels' : 'panels';
+        const panels2 = rsData2[key] || [];
+        proj.runsheet = { ...rsData2, [key]: [...panels2,
+          { id: Date.now()+Math.random(), desc:'', shotType:'', cameraMove:'static', narration:'', imageUrl:null, _addedBy:guest }
+        ]};
+        break;
+      }
+
+      // Brainstorm board (per-project)
+      case 'brainstorm_update': {
+        // payload.brainstorm = full brainstorm data object {cards,connectors}
+        proj.brainstorm = payload.brainstorm;
+        break;
+      }
+
+      // Brief
+      case 'brief_update': {
+        proj.brief = { ...(proj.brief||{}), ...payload.changes };
+        break;
+      }
+
+      default:
+        return res.status(400).json({ error: 'Unknown operation: ' + op });
+    }
+
+    // Write back to Supabase
+    projects[projIdx] = proj;
+    const { error: writeErr } = await supabaseAdmin
+      .from('app_state')
+      .update({ projects, updated_by: 'share:' + guest, local_version: Date.now() })
+      .eq('agency_id', found.agencyId);
+
+    if (writeErr) return res.status(500).json({ error: writeErr.message });
+
+    // Broadcast to real users via Supabase Realtime
+    try {
+      const { createClient } = require('@supabase/supabase-js');
+      const broadcastClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+      await broadcastClient
+        .channel('app-state-' + found.agencyId)
+        .send({ type:'broadcast', event:'state_update', payload:{
+          updated_by: 'share:' + guest,
+          agency_id: found.agencyId,
+          ts: Date.now()
+        }});
+    } catch(be) { /* broadcast is best-effort */ }
+
+    log('✏️', `Share edit [${op}] on project ${found.project.name} by ${guest}`);
+    res.json({ ok: true, project: sanitizeProject(proj) });
+
+  } catch(e) {
+    console.error('[share] EDIT error:', e.message);
     res.status(500).json({ error: e.message });
   }
 }
