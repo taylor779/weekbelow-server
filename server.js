@@ -830,66 +830,55 @@ function sanitizeProject(p) {
 
 // Find a project by share token across all agencies
 async function findProjectByToken(token) {
-  if (!token || token.length < 20) {
-    console.log('[share] token too short:', token && token.length);
-    return null;
-  }
+  if (!token || token.length < 10) return null;
   try {
-    // Use Postgres JSONB containment to find the row — avoids full table scan
-    // Try viewToken first, then editToken
-    let found = null;
-    for (const tokenField of ['shareViewToken', 'shareEditToken']) {
-      // Build a containment filter: projects @> '[{"tokenField":"token"}]'
-      // via RPC or raw filter — use the filter() method with cs (contains)
-      const containsFilter = JSON.stringify([{ [tokenField]: token }]);
-      const { data: rows, error } = await supabaseAdmin
-        .from('app_state')
-        .select('agency_id,projects,brand')
-        .filter('projects', 'cs', containsFilter);
-
-      if (error) {
-        // cs (contains) may not work on this column type — fall back to full scan
-        console.log('[share] JSONB filter failed, falling back to full scan:', error.message || error);
-        break;
-      }
-      if (rows && rows.length) {
-        const row = rows[0];
-        let projects = row.projects;
-        if (typeof projects === 'string') { try { projects = JSON.parse(projects); } catch(e) { projects = []; } }
-        const proj = Array.isArray(projects) && projects.find(p => p && p[tokenField] === token);
-        if (proj) {
-          let brand = row.brand;
-          if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { brand = {}; } }
-          console.log('[share] token matched via', tokenField, '— project:', proj.name);
-          found = { project: proj, agencyId: row.agency_id, brand: brand || {}, type: tokenField === 'shareViewToken' ? 'view' : 'edit' };
-          break;
-        }
-      }
-    }
-    if (found) return found;
-
-    // Fallback: full scan (handles non-JSONB column types)
-    console.log('[share] JSONB filter found nothing, trying full scan');
-    const { data: allRows, error: scanErr } = await supabaseAdmin
+    const { data: rows, error } = await supabaseAdmin
       .from('app_state')
       .select('agency_id,projects,brand');
-    if (scanErr || !allRows) { console.error('[share] full scan error:', scanErr); return null; }
-    for (const row of allRows) {
+
+    if (error) {
+      console.error('[share] Supabase error:', JSON.stringify(error));
+      return null;
+    }
+    if (!rows || !rows.length) {
+      console.log('[share] No rows returned from app_state');
+      return null;
+    }
+
+    console.log('[share] Scanning', rows.length, 'row(s) for token:', token.slice(0,8) + '...');
+
+    for (const row of rows) {
       let projects = row.projects;
-      if (typeof projects === 'string') { try { projects = JSON.parse(projects); } catch(e) { projects = []; } }
-      if (!Array.isArray(projects)) continue;
-      const proj = projects.find(p => p && (p.shareViewToken === token || p.shareEditToken === token));
+      if (typeof projects === 'string') {
+        try { projects = JSON.parse(projects); } catch(e) { continue; }
+      }
+      if (!Array.isArray(projects)) {
+        console.log('[share] agency', row.agency_id, '— projects is', typeof projects, '(not array)');
+        continue;
+      }
+      console.log('[share] agency', row.agency_id, '—', projects.length, 'projects, checking tokens...');
+      const tokenProjects = projects.filter(p => p && (p.shareViewToken || p.shareEditToken));
+      console.log('[share]  projects with tokens:', tokenProjects.map(p => p.name + ':' + (p.shareViewToken||'').slice(0,6) + '/' + (p.shareEditToken||'').slice(0,6)));
+
+      const proj = projects.find(p =>
+        p && (p.shareViewToken === token || p.shareEditToken === token)
+      );
       if (proj) {
         let brand = row.brand;
         if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { brand = {}; } }
-        console.log('[share] full scan matched project:', proj.name);
-        return { project: proj, agencyId: row.agency_id, brand: brand || {}, type: proj.shareViewToken === token ? 'view' : 'edit' };
+        console.log('[share] ✅ Token matched project:', proj.name);
+        return {
+          project: proj,
+          agencyId: row.agency_id,
+          brand: brand || {},
+          type: proj.shareViewToken === token ? 'view' : 'edit'
+        };
       }
     }
-    console.log('[share] token not found');
+    console.log('[share] ❌ Token not found in any project');
     return null;
   } catch(e) {
-    console.error('[share] findProjectByToken error:', e.message, e.stack);
+    console.error('[share] Exception:', e.message);
     return null;
   }
 }
