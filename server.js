@@ -1102,18 +1102,7 @@ async function handleEditProjectShare(req, res) {
 
     if (writeErr) return res.status(500).json({ error: writeErr.message });
 
-    // Broadcast to real users via Supabase Realtime
-    try {
-      const { createClient } = require('@supabase/supabase-js');
-      const broadcastClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-      await broadcastClient
-        .channel('app-state-' + found.agencyId)
-        .send({ type:'broadcast', event:'state_update', payload:{
-          updated_by: 'share:' + guest,
-          agency_id: found.agencyId,
-          ts: Date.now()
-        }});
-    } catch(be) { /* broadcast is best-effort */ }
+    // The Supabase DB write above triggers postgres_changes on the studio side automatically
 
     log('✏️', `Share edit [${op}] on project ${found.project.name} by ${guest}`);
     res.json({ ok: true, project: sanitizeProject(proj) });
