@@ -1840,38 +1840,248 @@ async function handleProjectReport(req, res) {
   const { agencyId, projectId } = req.params;
   try {
     const { data: state } = await supabaseAdmin.from('app_state')
-      .select('projects,clients,users,wbState,brand').eq('agency_id', agencyId).maybeSingle();
+      .select('projects,clients,users,brand').eq('agency_id', agencyId).maybeSingle();
     if (!state) return res.status(404).send('Studio not found');
     const proj = (state.projects||[]).find(p => String(p.id) === String(projectId));
     if (!proj) return res.status(404).send('Project not found');
-    const client = (state.clients||[]).find(c => String(c.id) === String(proj.clientId));
-    const ws = (state.wbState||{})[proj.id] || {};
-    const brand = state.brand || {};
-    const users = state.users || [];
-    let totalHours = 0, totalBilled = 0, totalCost = 0;
-    (proj.timeLog||[]).forEach(l => {
-      const u = users.find(u => String(u.id) === String(l.user));
-      totalHours += l.hours;
-      totalBilled += l.hours * (u?.chargeRate || 0);
-      totalCost += l.hours * (u?.costRate || 0);
+    const client  = (state.clients||[]).find(c => String(c.id) === String(proj.clientId));
+    const brand   = state.brand || {};
+    const users   = state.users || [];
+    const rs      = proj.runsheet || {};
+    const timeline    = rs.timeline || rs.rows || [];
+    const crew        = rs.crew || [];
+    const equipment   = rs.equipment || [];
+    const notes       = rs.notes || '';
+    const hs          = rs.healthSafety || rs.hs || '';
+    const shotList    = (proj.shotList||[]).filter(s => !s.isScene);
+    const allTasks    = (proj.stages||[]).flatMap(s => (s.tasks||[]).map(t => ({...t, stageName:s.name})));
+    const doneTasks   = allTasks.filter(t => t.done);
+
+    // Studio branding
+    const accent  = '#7c6fff';
+    const accentBg = 'rgba(124,111,255,0.12)';
+    const studioName = brand.appName || brand.name || 'BSMNT';
+    const logoHtml = brand.logoBase64
+      ? `<img src="${brand.logoBase64}" style="height:22px;max-width:120px;object-fit:contain;vertical-align:middle;"/>`
+      : `<span style="font-family:'DM Mono',monospace;font-size:10px;font-weight:500;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.5);">${studioName}</span>`;
+
+    // Group timeline by day
+    const days = [...new Set(timeline.map(r => r.day||'').filter(Boolean))];
+    const useDays = days.length > 0;
+    const scheduleGroups = useDays
+      ? days.map(d => ({ day: d, rows: timeline.filter(r => r.day === d) }))
+      : [{ day: '', rows: timeline }];
+
+    // Duration bar width as % of 12h workday
+    function barPct(time) {
+      if (!time) return 50;
+      const parts = String(time).match(/(\d+):(\d+)/);
+      if (!parts) return 50;
+      const mins = parseInt(parts[1])*60 + parseInt(parts[2]);
+      return Math.min(100, Math.max(8, Math.round((mins - 360) / 720 * 100)));
+    }
+
+    // Generate schedule rows HTML
+    function schedRows(rows) {
+      return rows.map((row, i) => {
+        const loc   = row.location || row.desc || row.item || '';
+        const notes = row.crew || row.notes || '';
+        const time  = row.time || row.startTime || '';
+        const pct   = barPct(time);
+        const isKey = row.isKey || i === 0 || String(loc).toLowerCase().includes('wrap') || String(loc).toLowerCase().includes('crew call');
+        return `<div style="display:flex;gap:7px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #ebebeb;">
+          <div style="font-family:'DM Mono',monospace;font-size:9px;color:#888;width:34px;flex-shrink:0;padding-top:1px;">${time}</div>
+          <div style="flex:1;">
+            <div style="font-size:11px;font-weight:600;color:#111;">${loc}</div>
+            ${notes ? `<div style="font-size:9px;color:#888;margin-top:1px;font-family:'DM Mono',monospace;">${notes}</div>` : ''}
+            <div style="height:2px;background:${isKey ? accent : '#ddd'};border-radius:1px;margin-top:4px;width:${pct}%;"></div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    // Schedule section (with day headers if multi-day)
+    const schedHtml = scheduleGroups.map(g => `
+      ${g.day ? `<div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:2px;text-transform:uppercase;color:#888;margin:8px 0 6px;padding-bottom:4px;border-bottom:1px solid #e8e8e8;">${g.day}</div>` : ''}
+      ${schedRows(g.rows)}
+    `).join('');
+
+    // Shot list
+    const shotsHtml = shotList.slice(0, 20).map((s, i) => `
+      <div style="display:flex;gap:7px;margin-bottom:7px;align-items:flex-start;">
+        <div style="font-family:'DM Mono',monospace;font-size:8px;color:${accent};width:22px;flex-shrink:0;margin-top:2px;">${String(i+1).padStart(2,'0')}</div>
+        <div>
+          <div style="font-size:11px;font-weight:500;color:#111;">${s.desc||''}</div>
+          <div style="font-family:'DM Mono',monospace;font-size:8px;color:#888;margin-top:1px;">${[s.type,s.angle,s.movement].filter(Boolean).join(' · ')}</div>
+        </div>
+      </div>`).join('');
+
+    // Crew cards
+    const crewHtml = crew.map(c => `
+      <div style="background:#fff;border-radius:5px;padding:8px 10px;border-left:2px solid ${accent};">
+        <div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1px;text-transform:uppercase;color:${accent};margin-bottom:3px;">${c.role||''}</div>
+        <div style="font-size:11px;font-weight:600;color:#111;">${c.name||''}</div>
+        <div style="font-family:'DM Mono',monospace;font-size:8px;color:#888;margin-top:2px;line-height:1.5;">
+          ${c.phone ? `${c.phone}<br/>` : ''}${c.company||''}${c.email ? `<br/>${c.email}` : ''}
+        </div>
+      </div>`).join('');
+
+    // Team members from BSMNT users (as fallback if no runsheet crew)
+    const teamHtml = users.slice(0,6).map(u => `
+      <div style="background:#fff;border-radius:5px;padding:8px 10px;border-left:2px solid ${accent};">
+        <div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1px;text-transform:uppercase;color:${accent};margin-bottom:3px;">${u.role||'Team'}</div>
+        <div style="font-size:11px;font-weight:600;color:#111;">${u.name||u.email||''}</div>
+        <div style="font-family:'DM Mono',monospace;font-size:8px;color:#888;margin-top:2px;">${u.email||''}</div>
+      </div>`).join('');
+
+    const crewSection = crew.length ? crewHtml : teamHtml;
+
+    // Equipment
+    const equipHtml = equipment.map(eq => `
+      <div style="display:flex;align-items:center;gap:6px;padding:5px 7px;background:#fff;border-radius:4px;">
+        <div style="width:10px;height:10px;border:1.5px solid ${eq.packed ? accent : '#ccc'};border-radius:2px;flex-shrink:0;background:${eq.packed ? accentBg : 'transparent'};"></div>
+        <span style="font-size:10px;color:#333;flex:1;">${eq.item||''}</span>
+        <span style="font-family:'DM Mono',monospace;font-size:7px;color:#aaa;">${eq.category||''}</span>
+      </div>`).join('');
+
+    // Shot scenes as section separators
+    const allShotItems = (proj.shotList||[]);
+    const sceneGroups = [];
+    let currentScene = { name: '', shots: [] };
+    allShotItems.forEach(s => {
+      if (s.isScene) {
+        if (currentScene.shots.length || currentScene.name) sceneGroups.push(currentScene);
+        currentScene = { name: s.desc || '', shots: [] };
+      } else {
+        currentScene.shots.push(s);
+      }
     });
-    const profit = totalBilled - totalCost;
-    const allTasks = (proj.stages||[]).flatMap(s => (s.tasks||[]).map(t => ({...t, stageName: s.name})));
-    const doneTasks = allTasks.filter(t => t.done);
-    const stageLabel = {wip:'WIP',v0:'Draft',v1:'V1 Review',v2:'V2 Review',final:'Final',done:'Completed'}[ws.stage||'v0']||ws.stage;
-    const accent = brand.accentColor || '#7c6fff';
-    const logoHtml = brand.logoBase64 ? `<img src="${brand.logoBase64}" style="height:36px;max-width:160px;object-fit:contain;" />` : `<span style="font-size:16px;font-weight:700;color:${accent};">${brand.appName||brand.name||'BSMNT'}</span>`;
-    const reportUrl = `${req.protocol}://${req.get('host')}/project-report/${agencyId}/${projectId}`;
-    const stagesHtml = (proj.stages||[]).map(s => {
-      const tasks = s.tasks||[];
-      const done = tasks.filter(t=>t.done).length;
-      const pct = tasks.length ? Math.round(done/tasks.length*100) : 0;
-      return `<tr><td style="padding:8px 0;font-weight:500;">${s.name}</td><td style="padding:8px;"><div style="height:5px;background:#eee;border-radius:3px;"><div style="width:${pct}%;height:100%;background:${accent};border-radius:3px;"></div></div></td><td style="padding:8px 0;text-align:right;font-size:12px;color:#888;">${done}/${tasks.length}</td></tr>`;
-    }).join('');
-    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${proj.name} — Report</title><style>*{box-sizing:border-box;margin:0;padding:0;}body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#f5f5f7;color:#111;font-size:14px;line-height:1.6;}a{color:${accent}}.wrap{max-width:680px;margin:0 auto;padding:40px 24px 80px;}.card{background:#fff;border-radius:12px;padding:20px 24px;margin-bottom:14px;border:1px solid #e8e8e8;}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}.stat{background:#fff;border-radius:10px;padding:14px;border:1px solid #e8e8e8;}.sn{font-size:20px;font-weight:700;letter-spacing:-.4px;}.sl{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;}.sec-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#888;margin-bottom:12px;}@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr);}.wrap{padding:20px 16px;}}@media print{body{background:#fff;}}</style></head><body><div class="wrap"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid #e0e0e0;">${logoHtml}<div style="text-align:right;font-size:11px;color:#888;">Generated ${new Date().toLocaleDateString('en-NZ',{day:'numeric',month:'long',year:'numeric'})}</div></div><div style="margin-bottom:20px;"><div style="font-size:24px;font-weight:700;letter-spacing:-.4px;margin-bottom:4px;">${proj.name}</div><div style="font-size:13px;color:#666;">${client?client.name+' · ':''}<span style="background:${accent}22;color:${accent};padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;">${stageLabel}</span></div>${proj.description?`<div style="margin-top:8px;font-size:13px;color:#555;">${proj.description}</div>`:''}</div><div class="stats" style="margin-bottom:14px;"><div class="stat"><div class="sn">${totalHours.toFixed(1)}h</div><div class="sl">Hours logged</div></div>${proj.budget?`<div class="stat"><div class="sn" style="color:${profit>=0?'#22c55e':'#ef4444'};">${profit>=0?'+':'-'}$${Math.round(Math.abs(profit)).toLocaleString()}</div><div class="sl">Profit/Loss</div></div><div class="stat"><div class="sn">$${Math.round(totalBilled).toLocaleString()}</div><div class="sl">Billed</div></div>`:''}<div class="stat"><div class="sn">${doneTasks.length}/${allTasks.length}</div><div class="sl">Tasks done</div></div></div>${stagesHtml?`<div class="card"><div class="sec-title">Production stages</div><table style="width:100%;border-collapse:collapse;">${stagesHtml}</table></div>`:''}<div style="text-align:center;margin-top:28px;"><a href="https://bsmnt.co.nz" style="display:inline-block;background:${accent};color:#fff;padding:10px 24px;border-radius:8px;font-weight:600;font-size:13px;">View live →</a><div style="margin-top:10px;font-size:11px;color:#aaa;">Shareable link: <a href="${reportUrl}">${reportUrl}</a></div></div><div style="text-align:center;margin-top:32px;font-size:11px;color:#bbb;">BSMNT &middot; bsmnt.co.nz</div></div></body></html>`;
-    res.setHeader('Content-Type','text/html');
+    if (currentScene.shots.length || !sceneGroups.length) sceneGroups.push(currentScene);
+
+    const date = new Date().toLocaleDateString('en-NZ', { day:'numeric', month:'long', year:'numeric' });
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${proj.name||'Runsheet'} — ${studioName}</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-size:11px;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+@media print{
+  body{background:#f9f9f6;}
+  .no-print{display:none!important;}
+  .page-break{page-break-before:always;}
+}
+.topbar{background:#111;padding:9px 22px;display:flex;align-items:center;justify-content:space-between;}
+.hero{padding:16px 22px;border-bottom:1px solid #e4e4e0;display:flex;align-items:flex-end;justify-content:space-between;}
+.body-grid{display:grid;grid-template-columns:1fr 36px 1fr;border-bottom:1px solid #e4e4e0;}
+.col{padding:14px 20px;}
+.divider-col{background:#f2f2ee;border-left:1px solid #e4e4e0;border-right:1px solid #e4e4e0;}
+.col-lbl{font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1.5px;text-transform:uppercase;color:#888;margin-bottom:10px;}
+.bottom-grid{border-bottom:1px solid #e4e4e0;display:grid;grid-template-columns:1fr 1fr;}
+.bottom-col{padding:14px 20px;}
+.bottom-col:first-child{border-right:1px solid #e4e4e0;}
+.crew-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;}
+.equip-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;}
+.notes-row{padding:12px 20px;border-bottom:1px solid #e4e4e0;display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.bottombar{background:#111;padding:7px 22px;display:flex;align-items:center;justify-content:space-between;}
+.print-btn{position:fixed;bottom:24px;right:24px;background:#111;color:#fff;border:none;border-radius:8px;padding:10px 20px;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,0.3);}
+.print-btn:hover{background:#333;}
+.tick{flex:1;width:1px;background:repeating-linear-gradient(to bottom,#bbb 0,#bbb 1px,transparent 1px,transparent 7px);margin:0 auto;}
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:14px;">
+    ${logoHtml}
+    <div style="width:1px;height:11px;background:rgba(255,255,255,0.15);"></div>
+    <span style="font-size:11px;font-weight:600;color:#fff;">${proj.name||''}</span>
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:8px;color:rgba(255,255,255,0.3);">RS-${String(projectId).slice(-4).toUpperCase()} · ${useDays ? days.length+' DAY'+( days.length>1?'S':'') : 'RUNSHEET'}</div>
+</div>
+
+<!-- HERO -->
+<div class="hero">
+  <div>
+    <div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:2px;text-transform:uppercase;color:${accent};margin-bottom:6px;">Production Runsheet</div>
+    <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;letter-spacing:-0.4px;line-height:1.1;margin-bottom:8px;">${proj.name||''}</div>
+    <div style="font-size:10px;color:#888;">${client ? client.name+' · ' : ''}${rs.location||''}</div>
+  </div>
+  <div style="text-align:right;font-family:'DM Mono',monospace;font-size:8px;color:#bbb;line-height:2;">
+    <div>${date}</div>
+    ${timeline.length ? `<div>Call: ${timeline[0].time||timeline[0].startTime||''}</div>` : ''}
+    <div>${crew.length || users.length} crew · ${shotList.length} shots</div>
+    <div style="color:${accent};margin-top:3px;">${client ? client.name : ''}</div>
+  </div>
+</div>
+
+<!-- SCHEDULE + SHOTS -->
+<div class="body-grid">
+  <div class="col">
+    <div class="col-lbl">Schedule</div>
+    ${schedHtml || '<div style="color:#aaa;font-size:11px;">No schedule added yet.</div>'}
+  </div>
+  <div class="divider-col" style="display:flex;flex-direction:column;align-items:center;padding:14px 0;">
+    <div class="tick"></div>
+  </div>
+  <div class="col">
+    <div class="col-lbl">Shot list</div>
+    ${shotsHtml || '<div style="color:#aaa;font-size:11px;">No shots added yet.</div>'}
+  </div>
+</div>
+
+<!-- CREW + EQUIPMENT -->
+${(crewSection || equipHtml) ? `
+<div class="bottom-grid">
+  ${crewSection ? `
+  <div class="bottom-col">
+    <div class="col-lbl">Crew manifest</div>
+    <div class="crew-grid">${crewSection}</div>
+  </div>` : '<div class="bottom-col"></div>'}
+  ${equipHtml ? `
+  <div class="bottom-col">
+    <div class="col-lbl">Equipment checklist</div>
+    <div class="equip-grid">${equipHtml}</div>
+  </div>` : '<div class="bottom-col"></div>'}
+</div>` : ''}
+
+<!-- NOTES + H&S -->
+${(notes || hs) ? `
+<div class="notes-row">
+  ${notes ? `<div>
+    <div class="col-lbl">Production notes</div>
+    <div style="font-size:10px;color:#555;line-height:1.7;">${notes}</div>
+  </div>` : '<div></div>'}
+  ${hs ? `<div>
+    <div class="col-lbl">Health &amp; Safety</div>
+    <div style="font-size:10px;color:#555;line-height:1.7;">${hs}</div>
+  </div>` : '<div></div>'}
+</div>` : ''}
+
+<!-- BOTTOM BAR -->
+<div class="bottombar">
+  <div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.2);">
+    <div style="width:5px;height:5px;border-radius:50%;background:${accent};display:inline-block;margin-right:5px;"></div>
+    ${studioName} · bsmnt.co.nz
+  </div>
+  <div style="font-family:'DM Mono',monospace;font-size:8px;color:rgba(255,255,255,0.3);">Page 1</div>
+</div>
+
+<button class="print-btn no-print" onclick="window.print()">⎙ Print / Save PDF</button>
+
+</body>
+</html>`;
+
+    res.setHeader('Content-Type', 'text/html');
     res.send(html);
-  } catch(e) { res.status(500).send('Error: '+e.message); }
+  } catch(e) {
+    res.status(500).send('Error: ' + e.message);
+  }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
