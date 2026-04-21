@@ -912,7 +912,7 @@ async function handleEditProjectShare(req, res) {
   try {
     const found = await findProjectByToken(token);
     if (!found) return res.status(404).json({ error: 'Link not found or expired' });
-    if (found.type !== 'edit') return res.status(403).json({ error: 'This link is read-only' });
+    if (found.type !== 'edit') return res.status(403).json({ error: 'This is a view-only link. Use the edit link to make changes.' });
 
     // Load full current state
     const { data: stateRow } = await supabaseAdmin
