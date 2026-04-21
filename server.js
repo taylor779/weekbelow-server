@@ -889,8 +889,29 @@ async function handleGetProjectShare(req, res) {
   try {
     const found = await findProjectByToken(token);
     if (!found) return res.status(404).json({ error: 'Link not found or expired' });
+
+    // Also fetch storyboard data from separate table
+    let sbData = null;
+    try {
+      const { data: sbRows } = await supabaseAdmin
+        .from('storyboards')
+        .select('panels,title,style,scene')
+        .eq('agency_id', found.agencyId)
+        .eq('project_id', String(found.project.id))
+        .order('updated_at', { ascending: false })
+        .limit(1);
+      if (sbRows && sbRows.length) sbData = sbRows[0];
+    } catch(e) { /* storyboard is optional */ }
+
+    const proj = sanitizeProject(found.project);
+    // Embed storyboard panels into the project for the share page
+    if (sbData && sbData.panels && sbData.panels.length) {
+      if (!proj.runsheet) proj.runsheet = {};
+      proj.runsheet.sbPanels = sbData.panels;
+    }
+
     res.json({
-      project: sanitizeProject(found.project),
+      project: proj,
       type: found.type,
       agencyId: found.agencyId,
       brand: {
