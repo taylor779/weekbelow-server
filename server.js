@@ -1357,7 +1357,7 @@ async function handleSaveUserPref(req, res) {
   const { userId, agencyId, key, value } = req.body || {};
   if (!userId || !agencyId || !key) return res.status(400).json({ error: 'userId, agencyId, key required' });
   // Whitelist allowed pref keys — never let clients write arbitrary fields
-  const ALLOWED = ['uiTheme', 'cardStyle', 'bgTheme', 'accentColor', 'navOrder', 'lightMode'];
+  const ALLOWED = ['uiTheme', 'cardStyle', 'bgTheme', 'accentColor', 'navOrder', 'lightMode', 'checklist'];
   if (!ALLOWED.includes(key)) return res.status(400).json({ error: 'Key not allowed: ' + key });
   try {
     // Fetch current preferences first
