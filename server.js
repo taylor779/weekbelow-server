@@ -1849,10 +1849,18 @@ function scheduleRetainerCheck() {
 async function handleProjectReport(req, res) {
   const { agencyId, projectId } = req.params;
   try {
-    const { data: state } = await supabaseAdmin.from('app_state')
-      .select('projects,clients,users,brand').eq('agency_id', agencyId).maybeSingle();
-    if (!state) return res.status(404).send('Studio not found');
-    const allProjects = state.projects || [];
+    const { data: state, error: stateErr } = await supabaseAdmin.from('app_state')
+      .select('projects,clients,brand').eq('agency_id', agencyId).maybeSingle();
+    if (stateErr) log('❌', `app_state query error: ${stateErr.message}`);
+    if (!state) return res.status(404).send(`Studio not found (err: ${stateErr?.message || 'no row'})`);
+    // Parse projects — sometimes JSONB comes back as string from service key
+    let rawProjects = state.projects;
+    if (typeof rawProjects === 'string') {
+      try { rawProjects = JSON.parse(rawProjects); } catch(e) { rawProjects = []; }
+    }
+    log('🔍', `state keys: ${Object.keys(state||{}).join(', ')}, projects type: ${typeof state?.projects}, isArray: ${Array.isArray(rawProjects)}, count: ${rawProjects?.length}`);
+
+    const allProjects = Array.isArray(rawProjects) ? rawProjects : [];
     const proj = allProjects.find(p => String(p.id) === String(projectId));
     if (!proj) {
       log('📄', `Project not found. Agency ${agencyId} has ${allProjects.length} projects: [${allProjects.slice(0,5).map(p=>p.id+':'+p.name?.slice(0,15)).join(', ')}]`);
@@ -1860,7 +1868,13 @@ async function handleProjectReport(req, res) {
     }
     const client  = (state.clients||[]).find(c => String(c.id) === String(proj.clientId));
     const brand   = state.brand || {};
-    const users   = state.users || [];
+    // Get team members from agency_members (users is not in app_state)
+    let users = [];
+    try {
+      const { data: members } = await supabaseAdmin.from('agency_members')
+        .select('id,name,email,role,initials,color').eq('agency_id', agencyId);
+      users = members || [];
+    } catch(e) { /* team members are optional */ }
     const rs      = proj.runsheet || {};
     const timeline    = rs.timeline || rs.rows || [];
     const crew        = rs.crew || [];
