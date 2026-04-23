@@ -1912,18 +1912,17 @@ async function handleProjectReport(req, res) {
     // Generate schedule rows HTML
     function schedRows(rows) {
       return rows.map((row, i) => {
-        const loc   = row.location || row.desc || row.item || '';
-        const notes = row.crew || row.notes || '';
         const time  = row.time || row.startTime || '';
-        const pct   = barPct(time);
+        const loc   = row.location || row.desc || row.item || '';
+        const notes = row.notes || '';
+        const crew  = row.crew || '';
         const isKey = row.isKey || i === 0 || String(loc).toLowerCase().includes('wrap') || String(loc).toLowerCase().includes('crew call');
-        return `<div style="display:flex;gap:7px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #ebebeb;">
-          <div style="font-family:'DM Mono',monospace;font-size:9px;color:#888;width:34px;flex-shrink:0;padding-top:1px;">${time}</div>
-          <div style="flex:1;">
-            <div style="font-size:11px;font-weight:600;color:#111;">${loc}</div>
-            ${notes ? `<div style="font-size:9px;color:#888;margin-top:1px;font-family:'DM Mono',monospace;">${notes}</div>` : ''}
-            <div style="height:2px;background:${isKey ? accent : '#ddd'};border-radius:1px;margin-top:4px;width:${pct}%;"></div>
-          </div>
+        // Build the slash-separated detail line: location / notes / crew
+        const parts = [loc, notes, crew].filter(Boolean);
+        const detail = parts.join(' <span style="color:#ccc;margin:0 3px;">/</span> ');
+        return `<div style="display:flex;align-items:baseline;gap:10px;padding:6px 0;border-bottom:1px solid #ebebeb;">
+          <div style="font-family:'DM Mono',monospace;font-size:9px;font-weight:500;color:${isKey ? accent : '#888'};width:38px;flex-shrink:0;white-space:nowrap;">${time}</div>
+          <div style="flex:1;font-size:10.5px;color:#333;line-height:1.5;">${detail}</div>
         </div>`;
       }).join('');
     }
@@ -1994,7 +1993,7 @@ async function handleProjectReport(req, res) {
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>${proj.name||'Runsheet'} — ${studioName}</title>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-size:11px;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
@@ -2028,23 +2027,28 @@ body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-s
   <div style="display:flex;align-items:center;gap:14px;">
     ${logoHtml}
     <div style="width:1px;height:11px;background:rgba(255,255,255,0.15);"></div>
-    <span style="font-size:11px;font-weight:600;color:#fff;">${proj.name||''}</span>
+    <span style="font-size:11px;font-weight:600;color:#fff;">${rs.title || proj.name || ''}</span>
   </div>
   <div style="font-family:'DM Mono',monospace;font-size:8px;color:rgba(255,255,255,0.3);">RS-${String(projectId).slice(-4).toUpperCase()} · ${useDays ? days.length+' DAY'+( days.length>1?'S':'') : 'RUNSHEET'}</div>
 </div>
 
 <!-- HERO -->
 <div class="hero">
-  <div>
+  <div style="flex:1;min-width:0;">
     <div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:2px;text-transform:uppercase;color:${accent};margin-bottom:6px;">Production Runsheet</div>
-    <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;letter-spacing:-0.4px;line-height:1.1;margin-bottom:8px;">${proj.name||''}</div>
-    <div style="font-size:10px;color:#888;">${client ? client.name+' · ' : ''}${rs.location||''}</div>
+    <div style="font-family:'Plus Jakarta Sans',sans-serif;font-size:24px;font-weight:700;letter-spacing:-0.3px;line-height:1.1;margin-bottom:6px;">${rs.title || proj.name || ''}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;font-family:'DM Mono',monospace;font-size:8px;color:#999;margin-bottom:${notes ? '10px' : '0'};">
+      ${client ? `<span>${client.name}</span>` : ''}
+      ${rs.location ? `<span style="color:#777;">📍 ${rs.location}</span>` : ''}
+      ${rs.date ? `<span>📅 ${rs.date}</span>` : ''}
+      ${rs.jobType ? `<span>· ${rs.jobType}</span>` : ''}
+    </div>
+    ${notes ? `<div style="font-size:10px;color:#555;line-height:1.7;max-width:520px;border-left:2px solid ${accent};padding-left:10px;">${notes}</div>` : ''}
   </div>
-  <div style="text-align:right;font-family:'DM Mono',monospace;font-size:8px;color:#bbb;line-height:2;">
+  <div style="text-align:right;font-family:'DM Mono',monospace;font-size:8px;color:#bbb;line-height:2;flex-shrink:0;margin-left:16px;">
     <div>${date}</div>
     ${timeline.length ? `<div>Call: ${timeline[0].time||timeline[0].startTime||''}</div>` : ''}
-    <div>${crew.length || users.length} crew · ${shotList.length} shots</div>
-    <div style="color:${accent};margin-top:3px;">${client ? client.name : ''}</div>
+    <div style="color:#aaa;">${crew.length ? crew.length+' crew' : ''} ${shotList.length ? '· '+shotList.length+' shots' : ''}</div>
   </div>
 </div>
 
