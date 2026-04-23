@@ -1852,8 +1852,12 @@ async function handleProjectReport(req, res) {
     const { data: state } = await supabaseAdmin.from('app_state')
       .select('projects,clients,users,brand').eq('agency_id', agencyId).maybeSingle();
     if (!state) return res.status(404).send('Studio not found');
-    const proj = (state.projects||[]).find(p => String(p.id) === String(projectId));
-    if (!proj) return res.status(404).send('Project not found');
+    const allProjects = state.projects || [];
+    const proj = allProjects.find(p => String(p.id) === String(projectId));
+    if (!proj) {
+      log('📄', `Project not found. Agency ${agencyId} has ${allProjects.length} projects: [${allProjects.slice(0,5).map(p=>p.id+':'+p.name?.slice(0,15)).join(', ')}]`);
+      return res.status(404).send(`Project not found (${allProjects.length} projects in DB, looking for ${projectId})`);
+    }
     const client  = (state.clients||[]).find(c => String(c.id) === String(proj.clientId));
     const brand   = state.brand || {};
     const users   = state.users || [];
