@@ -190,6 +190,8 @@ app.get('/customer-portal',       handleCustomerPortal);
 app.post('/cancel-subscription',  handleCancelSubscription);
 app.post('/generate-image',       handleGenerateImage);
 app.post('/briefing',             handleBriefing);
+app.get('/agency-brand/:agencyId', handleAgencyBrand);
+app.post('/submit-brief',          handleSubmitBrief);
 app.post('/ai-brainstorm',        handleAIBrainstorm);
 app.post('/send-project-invite',  handleSendProjectInvite);
 app.post('/invite-member',         handleInviteMember);
@@ -203,6 +205,7 @@ app.post('/link-preview',         handleLinkPreview);
 app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/send-recap',           handleSendRecapNow);
+app.post('/send-runsheet',         handleSendRunsheet);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 app.get('/project-share/:token',        handleGetProjectShare);
 app.post('/project-share/:token/edit',  handleEditProjectShare);
@@ -262,10 +265,12 @@ function _buildUserRecap(user, state) {
 function scheduleFridayRecaps() {
   setInterval(async function() {
     try {
-      const { data: states } = await supabaseAdmin.from('app_state').select('agency_id,users,brand');
-      if (!states) return;
+      const { data: states } = await supabaseAdmin.from('app_state').select('agency_id,brand');
+      if (!states || !Array.isArray(states)) return;
       for (const state of states) {
-        const users = state.users || [];
+        const { data: members } = await supabaseAdmin.from('agency_members')
+          .select('id,name,email,active,role').eq('agency_id', state.agency_id).eq('active', true);
+        const users = members || [];
         for (const user of users) {
           if (!user.email || !user.email.includes('@')) continue;
           if (user.active === false) continue;
@@ -724,6 +729,117 @@ async function handleGenerateImage(req, res) {
 
 
 // ── AI Briefing (text-only, for dashboard insight) ───────────────────────────
+
+// ── GET /agency-brand/:agencyId — public brand info for brief form ────────────
+async function handleAgencyBrand(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { agencyId } = req.params;
+  if (!agencyId) return res.status(400).json({ error: 'agencyId required' });
+  try {
+    const { data: state } = await supabaseAdmin.from('app_state')
+      .select('brand').eq('agency_id', agencyId).maybeSingle();
+    const b = state?.brand || {};
+    res.json({
+      name: b.appName || b.name || 'BSMNT',
+      accentColor: b.accentColor || '',
+      // Don't send logoBase64 publicly — too large
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ── POST /submit-brief — client brief form → email to studio admins ───────────
+async function handleSubmitBrief(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const { agencyId, client, project } = req.body || {};
+  if (!agencyId || !client?.email || !client?.name) {
+    return res.status(400).json({ error: 'agencyId, client name and email required' });
+  }
+  try {
+    // Get agency admin emails + brand
+    const [{ data: members }, { data: state }] = await Promise.all([
+      supabaseAdmin.from('agency_members').select('name,email,role').eq('agency_id', agencyId),
+      supabaseAdmin.from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle(),
+    ]);
+    const admins = (members || []).filter(m => ['admin','manager'].includes(m.role));
+    if (!admins.length) return res.status(404).json({ error: 'No admin found for this studio' });
+
+    const b = state?.brand || {};
+    const studioName = b.appName || b.name || 'BSMNT';
+    const accent = b.accentColor || '#7c6fff';
+
+    // Build email HTML
+    const row = (label, val) => val ? `<tr><td style="padding:5px 0;font-size:11px;font-family:monospace;letter-spacing:1px;text-transform:uppercase;color:#666;width:130px;vertical-align:top;">${label}</td><td style="padding:5px 0;font-size:13px;color:#111;">${val}</td></tr>` : '';
+    const moods = Array.isArray(project?.mood) ? project.mood.join(', ') : project?.mood || '';
+
+    const html = `
+      <div style="background:#f5f5f3;padding:32px 16px;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+        <div style="max-width:560px;margin:0 auto;">
+          <div style="background:#111;border-radius:10px 10px 0 0;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;">
+            <span style="font-family:monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.4);">${studioName}</span>
+            <span style="font-family:monospace;font-size:9px;color:rgba(255,255,255,0.3);">NEW CLIENT BRIEF</span>
+          </div>
+          <div style="background:#fff;border-radius:0 0 10px 10px;overflow:hidden;">
+            <div style="padding:24px;border-bottom:1px solid #eee;">
+              <div style="font-size:10px;font-family:monospace;letter-spacing:2px;text-transform:uppercase;color:${accent};margin-bottom:8px;">New Brief Received</div>
+              <div style="font-size:22px;font-weight:700;color:#111;letter-spacing:-0.3px;">${client.name}${client.company ? ' · '+client.company : ''}</div>
+              <div style="font-size:13px;color:#888;margin-top:4px;"><a href="mailto:${client.email}" style="color:${accent};">${client.email}</a>${client.phone ? ' · '+client.phone : ''}</div>
+            </div>
+            <div style="padding:24px;border-bottom:1px solid #eee;">
+              <div style="font-size:10px;font-family:monospace;letter-spacing:2px;text-transform:uppercase;color:#999;margin-bottom:14px;">Project Details</div>
+              <table style="width:100%;border-collapse:collapse;">
+                ${row('Project type', project?.type)}
+                ${row('Description', project?.desc)}
+                ${row('Success looks like', project?.success)}
+                ${row('Mood / tone', moods)}
+                ${row('References', project?.refs)}
+                ${row('Shoot date', project?.shootDate)}
+                ${row('Deadline', project?.deadline)}
+                ${row('Location', project?.location)}
+                ${row('Budget', project?.budget)}
+                ${row('Extra notes', project?.notes)}
+                ${row('Heard about us', project?.referral)}
+              </table>
+            </div>
+            <div style="padding:20px 24px;background:#fafafa;text-align:center;">
+              <a href="https://bsmnt.co.nz/app" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;">Open BSMNT →</a>
+            </div>
+          </div>
+          <div style="text-align:center;margin-top:16px;font-size:11px;color:#aaa;font-family:monospace;">Sent via BSMNT · bsmnt.co.nz</div>
+        </div>
+      </div>`;
+
+    // Send to all admins
+    const subject = `New brief from ${client.name}${client.company ? ' ('+client.company+')' : ''} — ${project?.type || 'Video Project'}`;
+    await Promise.all(admins.map(admin => sendEmail({ to: admin.email, subject, html })));
+
+    // Also send confirmation to client
+    const confirmHtml = `
+      <div style="background:#f5f5f3;padding:32px 16px;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+        <div style="max-width:480px;margin:0 auto;">
+          <div style="background:#111;border-radius:10px 10px 0 0;padding:18px 24px;">
+            <span style="font-family:monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.4);">${studioName}</span>
+          </div>
+          <div style="background:#fff;border-radius:0 0 10px 10px;padding:28px;">
+            <div style="font-size:10px;font-family:monospace;letter-spacing:2px;text-transform:uppercase;color:${accent};margin-bottom:12px;">Brief received</div>
+            <div style="font-size:20px;font-weight:700;color:#111;margin-bottom:12px;">Thanks, ${client.name.split(' ')[0]}!</div>
+            <p style="font-size:14px;color:#555;line-height:1.7;margin-bottom:16px;">We've received your brief for <strong>${project?.type || 'your video project'}</strong> and will be in touch within 1–2 business days to discuss next steps.</p>
+            <p style="font-size:13px;color:#888;line-height:1.7;">In the meantime, feel free to reply to this email if you have any questions or want to add anything.</p>
+          </div>
+          <div style="text-align:center;margin-top:16px;font-size:11px;color:#aaa;font-family:monospace;">Sent via BSMNT · bsmnt.co.nz</div>
+        </div>
+      </div>`;
+    await sendEmail({ to: client.email, subject: `Brief received — ${studioName}`, html: confirmHtml });
+
+    log('📋', `Brief submitted by ${client.name} (${client.email}) for agency ${agencyId}`);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('[submit-brief] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
 async function handleBriefing(req, res) {
   if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
   try {
@@ -731,7 +847,7 @@ async function handleBriefing(req, res) {
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
     const geminiRes = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + process.env.GEMINI_API_KEY,
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + process.env.GEMINI_API_KEY,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -760,7 +876,7 @@ async function handleBriefing(req, res) {
     log('💬', 'Briefing generated (' + text.length + ' chars)');
     res.json({ text: text.trim() });
   } catch (e) {
-    console.error('briefing error:', e.message);
+    console.error('[briefing] error:', e.message, e.stack?.split('\n')[1]);
     res.status(500).json({ error: e.message });
   }
 }
@@ -1102,7 +1218,26 @@ async function handleEditProjectShare(req, res) {
 
     if (writeErr) return res.status(500).json({ error: writeErr.message });
 
-    // The Supabase DB write above triggers postgres_changes on the studio side automatically
+    // Broadcast state_update via Supabase Realtime so owner's app picks up the change immediately
+    // (We removed postgres_changes listeners from the app, so we need to broadcast explicitly)
+    try {
+      const broadcastChannel = supabaseAdmin.channel('app-state-' + found.agencyId);
+      await broadcastChannel.send({
+        type: 'broadcast',
+        event: 'state_update',
+        payload: {
+          updated_by: 'share:' + guest,
+          agency_id: found.agencyId,
+          op: op,
+          ts: Date.now(),
+        }
+      });
+      // Clean up ephemeral channel
+      await supabaseAdmin.removeChannel(broadcastChannel);
+    } catch(broadcastErr) {
+      // Non-fatal — owner will pick it up via polling
+      console.warn('[share] Realtime broadcast failed:', broadcastErr.message);
+    }
 
     log('✏️', `Share edit [${op}] on project ${found.project.name} by ${guest}`);
     res.json({ ok: true, project: sanitizeProject(proj) });
@@ -1848,6 +1983,8 @@ function scheduleRetainerCheck() {
 
 async function handleProjectReport(req, res) {
   const { agencyId, projectId } = req.params;
+  const includeShots = req.query.shots !== '0';       // default: true
+  const includeSb    = req.query.sb    === '1';        // default: false
   try {
     const { data: state, error: stateErr } = await supabaseAdmin.from('app_state')
       .select('projects,clients,brand').eq('agency_id', agencyId).maybeSingle();
@@ -1882,6 +2019,10 @@ async function handleProjectReport(req, res) {
     const notes       = rs.notes || '';
     const hs          = rs.healthSafety || rs.hs || '';
     const shotList    = (proj.shotList||[]).filter(s => !s.isScene);
+    const allShotItems = proj.shotList || [];
+    // Storyboard panels — only needed if sb=1
+    const sbPanels    = includeSb ? (proj.panels||[]).filter(p => !p.isScene) : [];
+    const sbScenes    = includeSb ? (proj.panels||[]).filter(p => p.isScene)  : [];
     const allTasks    = (proj.stages||[]).flatMap(s => (s.tasks||[]).map(t => ({...t, stageName:s.name})));
     const doneTasks   = allTasks.filter(t => t.done);
 
@@ -1933,15 +2074,44 @@ async function handleProjectReport(req, res) {
       ${schedRows(g.rows)}
     `).join('');
 
-    // Shot list
-    const shotsHtml = shotList.slice(0, 20).map((s, i) => `
-      <div style="display:flex;gap:7px;margin-bottom:7px;align-items:flex-start;">
-        <div style="font-family:'DM Mono',monospace;font-size:8px;color:${accent};width:22px;flex-shrink:0;margin-top:2px;">${String(i+1).padStart(2,'0')}</div>
-        <div>
-          <div style="font-size:11px;font-weight:500;color:#111;">${s.desc||''}</div>
-          <div style="font-family:'DM Mono',monospace;font-size:8px;color:#888;margin-top:1px;">${[s.type,s.angle,s.movement].filter(Boolean).join(' · ')}</div>
-        </div>
-      </div>`).join('');
+    // Shot list — scene-grouped
+    let shotsHtml = '';
+    if (includeShots) {
+      let shotNum = 0;
+      shotsHtml = (proj.shotList||[]).map(s => {
+        if (s.isScene) {
+          return `<div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1.5px;text-transform:uppercase;color:#888;margin:10px 0 5px;padding-bottom:3px;border-bottom:1px solid #e8e8e8;">${s.desc||'Scene'}</div>`;
+        }
+        shotNum++;
+        return `<div style="display:flex;gap:7px;margin-bottom:6px;align-items:flex-start;">
+          <div style="font-family:'DM Mono',monospace;font-size:8px;color:${accent};width:18px;flex-shrink:0;margin-top:1px;">${String(shotNum).padStart(2,'0')}</div>
+          <div style="flex:1;">
+            <div style="font-size:10.5px;font-weight:500;color:#111;${s.done?'text-decoration:line-through;color:#aaa;':''}">${s.desc||''}</div>
+            ${[s.type,s.angle,s.movement].filter(Boolean).length ? `<div style="font-family:'DM Mono',monospace;font-size:7.5px;color:#aaa;margin-top:1px;">${[s.type,s.angle,s.movement].filter(Boolean).join(' · ')}</div>` : ''}
+          </div>
+          <div style="width:12px;height:12px;border:1.5px solid ${s.done?accent:'#ddd'};border-radius:3px;flex-shrink:0;margin-top:1px;background:${s.done?accentBg:'transparent'};"></div>
+        </div>`;
+      }).join('');
+    }
+
+    // Storyboard panels — only if sb=1
+    let storyboardHtml = '';
+    if (includeSb && sbPanels.length > 0) {
+      const panelCards = (proj.panels||[]).map(panel => {
+        if (panel.isScene) {
+          return `<div style="grid-column:1/-1;font-family:'DM Mono',monospace;font-size:7px;letter-spacing:2px;text-transform:uppercase;color:${accent};margin:12px 0 6px;padding-bottom:4px;border-bottom:1px solid #e8e8e8;">${panel.sceneLabel||panel.desc||'Scene'}</div>`;
+        }
+        return `<div style="border:1px solid #e8e8e8;border-radius:6px;overflow:hidden;break-inside:avoid;">
+          ${panel.imageUrl ? `<img src="${panel.imageUrl}" style="width:100%;aspect-ratio:16/9;object-fit:cover;display:block;"/>` : `<div style="width:100%;aspect-ratio:16/9;background:#f5f5f5;display:flex;align-items:center;justify-content:center;"><span style="font-size:10px;color:#ccc;">No image</span></div>`}
+          <div style="padding:6px 8px;">
+            ${panel.desc ? `<div style="font-size:9.5px;font-weight:500;color:#111;margin-bottom:2px;">${panel.desc}</div>` : ''}
+            ${[panel.shotType,panel.cameraMove,panel.lens].filter(Boolean).length ? `<div style="font-family:'DM Mono',monospace;font-size:7.5px;color:#aaa;">${[panel.shotType,panel.cameraMove,panel.lens].filter(Boolean).join(' · ')}</div>` : ''}
+          </div>
+        </div>`;
+      }).join('');
+      storyboardHtml = `<div style="margin:12px 0 8px;font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1.5px;text-transform:uppercase;color:#888;">Storyboard</div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">${panelCards}</div>`;
+    }
 
     // Crew cards
     const crewHtml = crew.map(c => `
@@ -2061,11 +2231,14 @@ body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-s
   <div class="divider-col" style="display:flex;flex-direction:column;align-items:center;padding:14px 0;">
     <div class="tick"></div>
   </div>
-  <div class="col">
+  ${includeShots ? `<div class="col">
     <div class="col-lbl">Shot list</div>
     ${shotsHtml || '<div style="color:#aaa;font-size:11px;">No shots added yet.</div>'}
-  </div>
+  </div>` : ''}
 </div>
+
+<!-- STORYBOARD -->
+${storyboardHtml ? `<div style="padding:12px 20px;border-bottom:1px solid #e4e4e0;">${storyboardHtml}</div>` : ''}
 
 <!-- CREW + EQUIPMENT -->
 ${(crewSection || equipHtml) ? `
