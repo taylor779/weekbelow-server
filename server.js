@@ -229,6 +229,72 @@ function sendSnapshot(socket) {
 
 
 
+// ── Send Runsheet to Crew ──────────────────────────────────────────────────────
+async function handleSendRunsheet(req, res) {
+  try {
+    const { agencyId, projectId, recipients, message, runsheetUrl } = req.body || {};
+    if (!agencyId || !recipients || !recipients.length) {
+      return res.status(400).json({ error: 'agencyId and recipients required' });
+    }
+
+    const { data: stateRow } = await supabaseAdmin
+      .from('app_state').select('projects,brand').eq('agency_id', agencyId).maybeSingle();
+    if (!stateRow) return res.status(404).json({ error: 'Agency not found' });
+
+    const projects = Array.isArray(stateRow.projects) ? stateRow.projects : [];
+    const proj = projects.find(p => String(p.id) === String(projectId));
+    const brand = stateRow.brand || {};
+    const studioName = brand.appName || brand.name || 'BSMNT';
+    const projectName = proj ? proj.name : 'Project';
+    const accent = brand.accentColor || '#7c6fff';
+
+    const emailBody = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"/></head>
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;">
+<div style="max-width:540px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+  <div style="background:${accent};padding:24px 28px;">
+    <div style="color:#fff;font-size:13px;font-weight:600;letter-spacing:1px;text-transform:uppercase;opacity:0.8;">${studioName}</div>
+    <div style="color:#fff;font-size:22px;font-weight:700;margin-top:6px;">Run Sheet: ${projectName}</div>
+  </div>
+  <div style="padding:24px 28px;">
+    ${message ? `<p style="color:#444;font-size:14px;line-height:1.6;margin:0 0 20px;">${message}</p>` : ''}
+    <p style="color:#666;font-size:14px;line-height:1.6;margin:0 0 20px;">
+      You've been sent the run sheet for <strong>${projectName}</strong>. Click below to view the full schedule.
+    </p>
+    ${runsheetUrl ? `
+    <a href="${runsheetUrl}" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600;">
+      View Run Sheet →
+    </a>` : ''}
+  </div>
+  <div style="padding:16px 28px;border-top:1px solid #f0f0f0;color:#aaa;font-size:11px;">
+    Sent via ${studioName}
+  </div>
+</div>
+</body>
+</html>`;
+
+    const results = await Promise.allSettled(recipients.map(async (r) => {
+      const email = typeof r === 'string' ? r : r.email;
+      const name  = typeof r === 'string' ? '' : (r.name || '');
+      if (!email || !email.includes('@')) return;
+      await sendEmail({
+        to: email,
+        subject: `Run Sheet: ${projectName}`,
+        html: emailBody,
+      });
+      log('📋', `Runsheet sent to ${email}`);
+    }));
+
+    const sent = results.filter(r => r.status === 'fulfilled').length;
+    res.json({ ok: true, sent });
+  } catch(e) {
+    console.error('handleSendRunsheet error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
 // ── Friday 3PM recap scheduler ────────────────────────────────────────
 const _sentThisWeek = new Set();
 
