@@ -1218,24 +1218,34 @@ async function handleEditProjectShare(req, res) {
 
     if (writeErr) return res.status(500).json({ error: writeErr.message });
 
-    // Broadcast state_update via Supabase Realtime so owner's app picks up the change immediately
-    // (We removed postgres_changes listeners from the app, so we need to broadcast explicitly)
+    // Notify owner via Supabase Realtime broadcast so their app picks up the change immediately
+    // Uses the REST broadcast API which works from server-side without a WebSocket connection
     try {
-      const broadcastChannel = supabaseAdmin.channel('app-state-' + found.agencyId);
-      await broadcastChannel.send({
-        type: 'broadcast',
-        event: 'state_update',
-        payload: {
-          updated_by: 'share:' + guest,
-          agency_id: found.agencyId,
-          op: op,
-          ts: Date.now(),
+      await fetch(
+        SUPA_URL + '/realtime/v1/api/broadcast',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + SUPA_KEY,
+            'apikey': SUPA_KEY,
+          },
+          body: JSON.stringify({
+            messages: [{
+              topic: 'realtime:app-state-' + found.agencyId,
+              event: 'state_update',
+              payload: {
+                updated_by: 'share:' + guest,
+                agency_id: found.agencyId,
+                op: op,
+                ts: Date.now(),
+              }
+            }]
+          })
         }
-      });
-      // Clean up ephemeral channel
-      await supabaseAdmin.removeChannel(broadcastChannel);
+      );
     } catch(broadcastErr) {
-      // Non-fatal — owner will pick it up via polling
+      // Non-fatal — owner will pick it up via 30s polling fallback
       console.warn('[share] Realtime broadcast failed:', broadcastErr.message);
     }
 
