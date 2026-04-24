@@ -2151,8 +2151,7 @@ async function handleProjectReport(req, res) {
         <span style="font-family:'DM Mono',monospace;font-size:7px;color:#aaa;">${eq.category||''}</span>
       </div>`).join('');
 
-    // Shot scenes as section separators
-    const allShotItems = (proj.shotList||[]);
+    // Shot scenes as section separators (allShotItems already declared above)
     const sceneGroups = [];
     let currentScene = { name: '', shots: [] };
     allShotItems.forEach(s => {
