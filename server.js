@@ -913,7 +913,7 @@ async function handleBriefing(req, res) {
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
     const geminiRes = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + process.env.GEMINI_API_KEY,
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + process.env.GEMINI_API_KEY,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1333,11 +1333,14 @@ async function handleInviteMember(req, res) {
   if (!agencyId || !email) return res.status(400).json({ error: 'agencyId and email required' });
   try {
     const expires = new Date(Date.now() + 7*24*60*60*1000).toISOString();
-    const { error } = await supabaseAdmin.from('invites').insert({
+    // Upsert on (agency_id, email) — prevents duplicate invite rows if admin sends twice
+    // Also resets expiry so a re-invite refreshes the 7-day window
+    const { error } = await supabaseAdmin.from('invites').upsert({
       agency_id: agencyId,
       email: email.toLowerCase().trim(),
       role: role || 'member',
       expires_at: expires,
+      accepted: false, // reset accepted state on re-invite
       member_name:       memberData?.name       || email.split('@')[0],
       member_initials:   memberData?.initials   || email.slice(0,2).toUpperCase(),
       member_color:      memberData?.color      || '#7c6fff',
@@ -1345,7 +1348,7 @@ async function handleInviteMember(req, res) {
       charge_rate:       memberData?.chargeRate || 0,
       can_access_reports: memberData?.canAccessReports || false,
       can_edit_budgets:   memberData?.canEditBudgets   || false,
-    });
+    }, { onConflict: 'agency_id,email', ignoreDuplicates: false });
     if (error) throw error;
     log('✉', `Member invite created: ${email} → agency ${agencyId}`);
     res.json({ ok: true });
