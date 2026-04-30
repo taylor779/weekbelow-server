@@ -24,6 +24,29 @@ const path  = require('path');
 // ── Stripe (token payments) ──────────────────────────────────────────────────
 const Stripe = require('stripe');
 
+// ── Push Notifications (APNs) ─────────────────────────────────────────────────
+const apn = require('@parse/node-apn');
+const cron = require('node-cron');
+
+const APN_OPTIONS = {
+  token: {
+    key: process.env.APN_KEY_PATH || './AuthKey.p8',
+    keyId: process.env.APN_KEY_ID,
+    teamId: process.env.APN_TEAM_ID,
+  },
+  production: process.env.APN_PRODUCTION === 'true',
+};
+const APN_BUNDLE_ID = process.env.APN_BUNDLE_ID || 'nz.co.belowstudios.bsmnt1';
+
+let apnProvider = null;
+function getAPN() {
+  if (!apnProvider && APN_OPTIONS.token.keyId && APN_OPTIONS.token.teamId) {
+    try { apnProvider = new apn.Provider(APN_OPTIONS); }
+    catch(e) { console.error('[push] APN init failed:', e.message); }
+  }
+  return apnProvider;
+}
+
 const stripe = process.env.STRIPE_SECRET_KEY
   ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
@@ -209,6 +232,13 @@ app.post('/send-runsheet',         handleSendRunsheet);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 app.get('/project-share/:token',        handleGetProjectShare);
 app.post('/project-share/:token/edit',  handleEditProjectShare);
+
+// Push notification routes
+app.post('/push/register-token',   handlePushRegisterToken);
+app.post('/push/unregister-token', handlePushUnregisterToken);
+app.post('/push/send',             handlePushSend);
+app.post('/push/send-bulk',        handlePushSendBulk);
+app.post('/push/prefs',            handlePushPrefs);
 
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 });
@@ -1653,6 +1683,240 @@ async function getAgencyLogoHtml(agencyId, height='36px') {
   } catch(e) {}
   return null;
 }
+
+// ══ PUSH NOTIFICATIONS ═══════════════════════════════════════════════════════
+
+async function sendPushToUser({ userId, kind, title, body, data = {} }) {
+  const provider = getAPN();
+  if (!provider) return { sent: 0, error: 'APN not configured' };
+
+  // Check user's notification prefs
+  const { data: prefs } = await supabaseAdmin.from('notification_prefs')
+    .select('*').eq('user_id', userId).maybeSingle();
+  if (prefs && prefs.enabled === false) return { sent: 0, error: 'user_disabled' };
+  if (prefs && prefs[kind] === false) return { sent: 0, error: 'kind_disabled' };
+
+  // Silence during focus mode (focusModeOn lives in agency_members.preferences)
+  try {
+    const { data: member } = await supabaseAdmin.from('agency_members')
+      .select('preferences').eq('id', userId).maybeSingle();
+    if (member?.preferences?.focusModeOn) return { sent: 0, error: 'focus_mode' };
+  } catch(e) {}
+
+  // Get device tokens for this user
+  const { data: tokens } = await supabaseAdmin.from('device_tokens')
+    .select('token').eq('user_id', userId);
+  if (!tokens || !tokens.length) return { sent: 0, error: 'no_devices' };
+
+  // Build APN notification
+  const notif = new apn.Notification();
+  notif.alert = { title, body };
+  notif.topic = APN_BUNDLE_ID;
+  notif.sound = 'default';
+  notif.badge = 1;
+  notif.payload = { kind, ...data };
+  notif.expiry = Math.floor(Date.now() / 1000) + 3600;
+
+  let sent = 0, lastError = null;
+  for (const { token } of tokens) {
+    try {
+      const result = await provider.send(notif, token);
+      if (result.sent && result.sent.length) sent++;
+      if (result.failed && result.failed.length) {
+        lastError = result.failed[0]?.response?.reason || 'unknown';
+        if (lastError === 'BadDeviceToken' || lastError === 'Unregistered') {
+          await supabaseAdmin.from('device_tokens').delete().eq('token', token);
+        }
+      }
+    } catch(e) { lastError = e.message; }
+  }
+
+  // Log it
+  await supabaseAdmin.from('notifications_sent').insert({
+    user_id: userId, kind, title, body, data, delivered: sent > 0, error: lastError,
+  });
+
+  if (sent) log('🔔', `Push to ${userId}: "${title}"`);
+  return { sent, error: lastError };
+}
+
+async function sendPushToUsers(userIds, payload) {
+  const results = await Promise.all(userIds.map(uid =>
+    sendPushToUser({ userId: uid, ...payload })
+  ));
+  return { totalSent: results.reduce((s, r) => s + (r.sent || 0), 0), results };
+}
+
+// ── Route handlers ────────────────────────────────────────────────────────────
+
+async function handlePushRegisterToken(req, res) {
+  try {
+    const { userId, agencyId, token, platform = 'ios', deviceName } = req.body;
+    if (!userId || !token) return res.status(400).json({ error: 'userId and token required' });
+    await supabaseAdmin.from('device_tokens').upsert({
+      user_id: userId, agency_id: agencyId, token, platform,
+      device_name: deviceName, last_seen_at: new Date().toISOString(),
+    }, { onConflict: 'token' });
+    res.json({ ok: true });
+  } catch(e) {
+    log('⚠', 'register-token: ' + e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+async function handlePushUnregisterToken(req, res) {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'token required' });
+    await supabaseAdmin.from('device_tokens').delete().eq('token', token);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+}
+
+async function handlePushSend(req, res) {
+  try {
+    const { userId, kind, title, body, data } = req.body;
+    if (!userId || !kind || !title || !body)
+      return res.status(400).json({ error: 'userId, kind, title, body required' });
+    const result = await sendPushToUser({ userId, kind, title, body, data });
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+}
+
+async function handlePushSendBulk(req, res) {
+  try {
+    const { userIds, kind, title, body, data } = req.body;
+    if (!userIds || !Array.isArray(userIds))
+      return res.status(400).json({ error: 'userIds array required' });
+    const result = await sendPushToUsers(userIds, { kind, title, body, data });
+    res.json({ ok: true, ...result });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+}
+
+async function handlePushPrefs(req, res) {
+  try {
+    const { userId, prefs } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    await supabaseAdmin.from('notification_prefs').upsert({
+      user_id: userId, ...prefs, updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id' });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+}
+
+// ── Cron jobs ─────────────────────────────────────────────────────────────────
+
+// Daily summary — 5pm Auckland time
+cron.schedule('0 17 * * *', async () => {
+  log('⏰', 'Running daily summary cron');
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: members } = await supabaseAdmin.from('agency_members')
+      .select('id,name,email,agency_id,active').eq('active', true);
+
+    for (const u of members || []) {
+      try {
+        const { data: state } = await supabaseAdmin.from('app_state')
+          .select('projects').eq('agency_id', u.agency_id).maybeSingle();
+        const projects = state?.projects || [];
+        let totalHours = 0;
+        const activeProjects = new Set();
+
+        for (const p of projects) {
+          for (const e of (p.timeLog || [])) {
+            if (String(e.user) === String(u.id) && e.date === today) {
+              totalHours += (e.hours || 0);
+              activeProjects.add(p.id);
+            }
+          }
+        }
+
+        if (totalHours > 0) {
+          await sendPushToUser({
+            userId: u.id, kind: 'daily_summary',
+            title: 'Daily summary',
+            body: `You tracked ${totalHours.toFixed(1)}h today across ${activeProjects.size} project${activeProjects.size === 1 ? '' : 's'}`,
+            data: { hours: totalHours, projects: activeProjects.size },
+          });
+        }
+      } catch(e) { log('⚠', `daily ${u.id}: ${e.message}`); }
+    }
+  } catch(e) { log('⚠', 'daily cron: ' + e.message); }
+}, { timezone: 'Pacific/Auckland' });
+
+// Weekly summary — Monday 9am Auckland
+cron.schedule('0 9 * * 1', async () => {
+  log('⏰', 'Running weekly summary cron');
+  try {
+    const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+    const { data: members } = await supabaseAdmin.from('agency_members')
+      .select('id,agency_id,active').eq('active', true);
+
+    for (const u of members || []) {
+      try {
+        const { data: state } = await supabaseAdmin.from('app_state')
+          .select('projects').eq('agency_id', u.agency_id).maybeSingle();
+        const projects = state?.projects || [];
+        let totalHours = 0;
+        const activeProjects = new Set();
+
+        for (const p of projects) {
+          for (const e of (p.timeLog || [])) {
+            if (String(e.user) === String(u.id) && e.date >= weekAgo) {
+              totalHours += (e.hours || 0);
+              activeProjects.add(p.id);
+            }
+          }
+        }
+
+        if (totalHours > 0) {
+          await sendPushToUser({
+            userId: u.id, kind: 'weekly_summary',
+            title: 'Weekly recap',
+            body: `${totalHours.toFixed(1)}h tracked last week across ${activeProjects.size} project${activeProjects.size === 1 ? '' : 's'}`,
+            data: { hours: totalHours },
+          });
+        }
+      } catch(e) { log('⚠', `weekly ${u.id}: ${e.message}`); }
+    }
+  } catch(e) { log('⚠', 'weekly cron: ' + e.message); }
+}, { timezone: 'Pacific/Auckland' });
+
+// Forgot to track — 11am weekdays only
+cron.schedule('0 11 * * 1-5', async () => {
+  log('⏰', 'Running forgot-to-track cron');
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: members } = await supabaseAdmin.from('agency_members')
+      .select('id,agency_id,active').eq('active', true);
+
+    for (const u of members || []) {
+      try {
+        const { data: state } = await supabaseAdmin.from('app_state')
+          .select('projects').eq('agency_id', u.agency_id).maybeSingle();
+        const projects = state?.projects || [];
+        let trackedToday = false;
+        outer: for (const p of projects) {
+          for (const e of (p.timeLog || [])) {
+            if (String(e.user) === String(u.id) && e.date === today) {
+              trackedToday = true; break outer;
+            }
+          }
+        }
+        if (!trackedToday) {
+          await sendPushToUser({
+            userId: u.id, kind: 'forgot_to_track',
+            title: 'Time tracker reminder',
+            body: "You haven't logged any time today — get tracking!",
+          });
+        }
+      } catch(e) { log('⚠', `forgot ${u.id}: ${e.message}`); }
+    }
+  } catch(e) { log('⚠', 'forgot cron: ' + e.message); }
+}, { timezone: 'Pacific/Auckland' });
+
+log('🔔', 'Push notification cron jobs scheduled');
+
 
 function sendEmail({ to, subject, html }) {
   if (!RESEND_KEY) { log('✉', `[no key] Would send to ${to}: ${subject}`); return Promise.resolve(); }
