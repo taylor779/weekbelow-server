@@ -205,6 +205,7 @@ app.post('/save-user-pref',       handleSaveUserPref);
 app.post('/link-preview',         handleLinkPreview);
 app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
+app.post('/notify-deliverable-comment', handleNotifyDeliverableComment);
 app.post('/send-recap',           handleSendRecapNow);
 app.post('/send-runsheet',         handleSendRunsheet);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
@@ -353,7 +354,7 @@ function scheduleFridayRecaps() {
             const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', state.agency_id).maybeSingle();
             if (agData) {
               const recapData = _buildUserRecap(user, agData);
-              await sendEmail(await weeklyEmail(user, {...recapData, agencyId: agency.agency_id}));
+              await sendEmail(await weeklyEmail(user, {...recapData, agencyId: state.agency_id}));
               log('📬', `Friday recap sent to ${user.email} (${tz})`);
             }
           }
@@ -571,7 +572,7 @@ async function handleSendRecapNow(req, res) {
     for (const user of users) {
       if (!user.email || !user.email.includes('@') || user.active === false) continue;
       const recapData = _buildUserRecap(user, agData);
-      await sendEmail(await weeklyEmail(user, {...recapData, agencyId: agency.agency_id}));
+      await sendEmail(await weeklyEmail(user, {...recapData, agencyId: agencyId}));
       sent++;
     }
     log('📬', `Manual recap sent to ${sent} users in agency ${agencyId}`);
@@ -1272,11 +1273,57 @@ async function handleEditProjectShare(req, res) {
         break;
       }
 
+      // Comments — extends the shot/rsRow/panel/deliverable comment system to share-edit guests
+      case 'comment_add': {
+        const cmt = payload.comment;
+        if (!cmt || !cmt.id || !cmt.text) {
+          return res.status(400).json({ error: 'comment must have id and text' });
+        }
+        // Tag with guest provenance regardless of what client sent (prevents impersonation)
+        cmt.isGuest = true;
+        cmt.userId = null;
+        cmt.userName = guest;
+        cmt.time = cmt.time || Date.now();
+
+        const tType = payload.targetType, tId = String(payload.targetId);
+        let attached = false, deliverableForNotify = null;
+        if (tType === 'deliverable' && Array.isArray(proj.deliverables)) {
+          const del = proj.deliverables.find(x => String(x.id) === tId);
+          if (del) {
+            if (!del.comments) del.comments = [];
+            del.comments.push(cmt);
+            attached = true;
+            deliverableForNotify = del; // fire push after the row is written
+          }
+        } else if (tType === 'shot' && Array.isArray(proj.shotList)) {
+          const sh = proj.shotList.find(x => String(x.id) === tId);
+          if (sh) { if (!sh.comments) sh.comments = []; sh.comments.push(cmt); attached = true; }
+        } else if (tType === 'rsRow' && proj.runsheet) {
+          const rsRows = proj.runsheet.rows || proj.runsheet.timeline || [];
+          const rr = rsRows.find(x => String(x.id) === tId);
+          if (rr) { if (!rr.comments) rr.comments = []; rr.comments.push(cmt); attached = true; }
+        } else if (tType === 'panel' && proj.runsheet) {
+          const pnls = proj.runsheet.sbPanels || proj.runsheet.panels || proj.panels || [];
+          const pn = pnls.find(x => String(x.id) === tId);
+          if (pn) { if (!pn.comments) pn.comments = []; pn.comments.push(cmt); attached = true; }
+        }
+        if (!attached) return res.status(404).json({ error: 'Target not found for comment' });
+        // Stash for post-write notify
+        proj._pendingCommentNotify = deliverableForNotify
+          ? { deliverable: deliverableForNotify, comment: cmt }
+          : null;
+        break;
+      }
+
       default:
         return res.status(400).json({ error: 'Unknown operation: ' + op });
     }
 
     // Write back to Supabase
+    // Stash + strip the temp pending-notify so it doesn't persist in Supabase
+    const _pending = proj._pendingCommentNotify || null;
+    if (_pending) delete proj._pendingCommentNotify;
+
     projects[projIdx] = proj;
     const { error: writeErr } = await supabaseAdmin
       .from('app_state')
@@ -1284,6 +1331,12 @@ async function handleEditProjectShare(req, res) {
       .eq('agency_id', found.agencyId);
 
     if (writeErr) return res.status(500).json({ error: writeErr.message });
+
+    // Fire push notifications for guest deliverable comments (best-effort, non-blocking)
+    if (_pending) {
+      _notifyDeliverableComment(found.agencyId, proj, _pending.deliverable, _pending.comment, null)
+        .catch(e => log('🔔', 'Push notify error: ' + e.message));
+    }
 
     // Notify owner via Supabase Realtime broadcast so their app picks up the change immediately
     // Uses the REST broadcast API which works from server-side without a WebSocket connection
@@ -1543,6 +1596,87 @@ async function handleAppendTimeLog(req, res) {
     log('⏱ append-time-log error:', e.message);
     res.status(500).json({ error: e.message });
   }
+}
+
+
+// ── POST /notify-deliverable-comment ─────────────────────────────────────────
+// Called by the client (or internally by the share-edit comment_add op) to
+// fan out push notifications to all assignees of a project when a comment
+// lands on one of its deliverables. Looks up assignees from app_state, skips
+// the comment author, and dispatches via /push/send (whatever your push
+// backend points at). Non-blocking — silently no-ops if push isn't deployed.
+async function handleNotifyDeliverableComment(req, res) {
+  try {
+    const b = req.body || {};
+    if (!b.agencyId || !b.projectId) {
+      return res.status(400).json({ error: 'agencyId and projectId required' });
+    }
+    const { data: stateRow } = await supabaseAdmin.from('app_state')
+      .select('projects').eq('agency_id', b.agencyId).maybeSingle();
+    if (!stateRow) return res.status(404).json({ error: 'Agency not found' });
+    const proj = (stateRow.projects || []).find(p => String(p.id) === String(b.projectId));
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+    let assignees = (Array.isArray(b.assigneeIds) && b.assigneeIds.length)
+      ? b.assigneeIds.map(String)
+      : (proj.assigned || []).map(String);
+    if (b.excludeUserId) {
+      assignees = assignees.filter(uid => String(uid) !== String(b.excludeUserId));
+    }
+    if (!assignees.length) return res.json({ ok: true, sent: 0 });
+
+    await _notifyDeliverableComment(
+      b.agencyId,
+      proj,
+      { id: b.deliverableId, name: b.deliverableName },
+      { userName: b.authorName, isGuest: b.authorIsGuest, timecode: b.timecode, text: b.text },
+      assignees
+    );
+    res.json({ ok: true, sent: assignees.length });
+  } catch(e) {
+    console.error('notify-deliverable-comment error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// Shared notify worker. Used by:
+//   1. The /notify-deliverable-comment endpoint (when a logged-in team member posts)
+//   2. The handleEditProjectShare 'comment_add' op (when a share-link guest posts)
+async function _notifyDeliverableComment(agencyId, proj, del, cmt, explicitAssignees) {
+  const assignees = (Array.isArray(explicitAssignees) && explicitAssignees.length)
+    ? explicitAssignees.map(String)
+    : (proj.assigned || []).map(String);
+  if (!assignees.length) return;
+
+  const title = (cmt.userName || 'Someone') + ' commented on ' + ((del && del.name) || 'a deliverable');
+  const bodyParts = [];
+  if (cmt.timecode) bodyParts.push('[' + cmt.timecode + ']');
+  if (cmt.text) bodyParts.push(cmt.text);
+  const body = bodyParts.join(' ').slice(0, 200);
+  const deeplink = 'https://bsmnt.co.nz/app.html#p=' + proj.id + '&t=deliverables';
+
+  // Fan out per-user. If your push delivery endpoint differs, change the path
+  // in the fetch URL below. If push lives in a separate service entirely,
+  // replace the fetch with that service's call.
+  const pushBase = 'http://localhost:' + PORT;
+  const fanOut = assignees.map(uid =>
+    fetch(pushBase + '/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: String(uid),
+        agencyId: agencyId,
+        title: title,
+        body: body,
+        deeplink: deeplink,
+        kind: 'deliverable_comment',
+        projectId: String(proj.id),
+        deliverableId: del && del.id ? String(del.id) : null,
+      }),
+    }).catch(() => { /* push backend not up — silent */ })
+  );
+  await Promise.all(fanOut);
+  log('🔔', 'Comment notify fanned to ' + assignees.length + ' assignee(s) on "' + (proj.name || '?') + '"');
 }
 
 
