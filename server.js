@@ -21,6 +21,14 @@ const http  = require('http');
 const fs    = require('fs');
 const path  = require('path');
 
+// ── APNs (push notifications) ────────────────────────────────────────────────
+// Uses @parse/node-apn (the maintained fork of node-apn). Speaks HTTP/2 to
+// Apple's APNs as required since the legacy binary protocol was retired.
+// Provider is lazy-initialized on first push so server can boot without APNs.
+let apn = null;
+try { apn = require('@parse/node-apn'); }
+catch(e) { /* package not installed — push will be a no-op until npm i @parse/node-apn */ }
+
 // ── Stripe (token payments) ──────────────────────────────────────────────────
 const Stripe = require('stripe');
 
@@ -206,6 +214,10 @@ app.post('/link-preview',         handleLinkPreview);
 app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/notify-deliverable-comment', handleNotifyDeliverableComment);
+app.post('/push/register-token',  handleRegisterPushToken);
+app.post('/push/send',            handlePushSend);
+app.post('/push/prefs',           handlePushPrefs);
+app.get('/push/prefs',            handlePushPrefs);
 app.post('/send-recap',           handleSendRecapNow);
 app.post('/send-runsheet',         handleSendRunsheet);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
@@ -1655,28 +1667,183 @@ async function _notifyDeliverableComment(agencyId, proj, del, cmt, explicitAssig
   const body = bodyParts.join(' ').slice(0, 200);
   const deeplink = 'https://bsmnt.co.nz/app.html#p=' + proj.id + '&t=deliverables';
 
-  // Fan out per-user. If your push delivery endpoint differs, change the path
-  // in the fetch URL below. If push lives in a separate service entirely,
-  // replace the fetch with that service's call.
-  const pushBase = 'http://localhost:' + PORT;
+  // Fan out per-user via the in-process APNs helper. No HTTP roundtrip — we're
+  // calling the same code path /push/send uses but skipping the network hop.
   const fanOut = assignees.map(uid =>
-    fetch(pushBase + '/push/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId: String(uid),
-        agencyId: agencyId,
-        title: title,
-        body: body,
-        deeplink: deeplink,
-        kind: 'deliverable_comment',
-        projectId: String(proj.id),
-        deliverableId: del && del.id ? String(del.id) : null,
-      }),
-    }).catch(() => { /* push backend not up — silent */ })
+    sendPushToUser(String(uid), title, body, {
+      deeplink: deeplink,
+      kind: 'deliverable_comment',
+      projectId: String(proj.id),
+      deliverableId: del && del.id ? String(del.id) : null,
+    }).catch(e => { log('⚠️', 'push to ' + uid + ' failed: ' + (e && e.message)); })
   );
   await Promise.all(fanOut);
   log('🔔', 'Comment notify fanned to ' + assignees.length + ' assignee(s) on "' + (proj.name || '?') + '"');
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PUSH NOTIFICATIONS — APNs delivery + token registration
+// ═════════════════════════════════════════════════════════════════════════════
+// Env vars required (set in Railway):
+//   APNS_KEY_ID      — 10-char Key ID from Apple Developer Portal → Keys
+//   APNS_TEAM_ID     — 10-char Team ID from Apple Developer Portal → Membership
+//   APNS_KEY_P8      — full contents of the .p8 auth key file, including the
+//                      "-----BEGIN PRIVATE KEY-----" / "-----END PRIVATE KEY-----"
+//                      lines. Newlines must be preserved.
+//   APNS_BUNDLE_ID   — defaults to 'nz.co.belowstudios.bsmnt1'
+//   APNS_PRODUCTION  — 'true' (default) or 'false'. TestFlight uses production
+//                      APNs, so even debug TestFlight builds need this true.
+//
+// Supabase needs a `device_tokens` table — see the SQL migration shipped
+// alongside this file.
+
+let _apnProvider = null;
+let _apnProviderError = null;
+
+function getApnProvider() {
+  if (_apnProvider || _apnProviderError) return _apnProvider;
+  if (!apn) {
+    _apnProviderError = 'package @parse/node-apn not installed';
+    return null;
+  }
+  const keyId  = process.env.APNS_KEY_ID;
+  const teamId = process.env.APNS_TEAM_ID;
+  const keyP8  = process.env.APNS_KEY_P8;
+  if (!keyId || !teamId || !keyP8) {
+    _apnProviderError = 'APNs env vars missing — need APNS_KEY_ID, APNS_TEAM_ID, APNS_KEY_P8';
+    return null;
+  }
+  try {
+    _apnProvider = new apn.Provider({
+      token: { key: keyP8, keyId: keyId, teamId: teamId },
+      production: process.env.APNS_PRODUCTION !== 'false',
+    });
+    log('🔔', 'APNs provider initialized (production=' + (process.env.APNS_PRODUCTION !== 'false') + ')');
+    return _apnProvider;
+  } catch(e) {
+    _apnProviderError = 'APNs provider init failed: ' + e.message;
+    log('❌', _apnProviderError);
+    return null;
+  }
+}
+
+// Send a push to specific iOS device tokens. Returns { sent, failed, error? }.
+// Cleans up invalid/expired tokens from the DB on APNs response codes
+// (BadDeviceToken, Unregistered) so we don't keep trying to push to dead phones.
+async function sendApnsPush(tokens, title, body, payload) {
+  const provider = getApnProvider();
+  if (!provider) return { sent: 0, failed: 0, error: _apnProviderError };
+  if (!Array.isArray(tokens)) tokens = [tokens];
+  tokens = tokens.filter(Boolean);
+  if (!tokens.length) return { sent: 0, failed: 0 };
+
+  const note = new apn.Notification();
+  note.expiry  = Math.floor(Date.now() / 1000) + 3600;
+  note.badge   = 1;
+  note.sound   = 'default';
+  note.alert   = { title: String(title || ''), body: String(body || '') };
+  note.topic   = process.env.APNS_BUNDLE_ID || 'nz.co.belowstudios.bsmnt1';
+  note.payload = payload || {};
+
+  let result;
+  try {
+    result = await provider.send(note, tokens);
+  } catch(e) {
+    log('❌', 'APNs send threw: ' + e.message);
+    return { sent: 0, failed: tokens.length, error: e.message };
+  }
+
+  if (result.failed && result.failed.length) {
+    const dead = result.failed
+      .filter(f => f.response && (
+        f.response.reason === 'BadDeviceToken' ||
+        f.response.reason === 'Unregistered' ||
+        f.response.reason === 'DeviceTokenNotForTopic'
+      ))
+      .map(f => f.device);
+    if (dead.length && supabaseAdmin) {
+      try {
+        await supabaseAdmin.from('device_tokens').delete().in('token', dead);
+        log('🗑️', 'Removed ' + dead.length + ' dead push token(s)');
+      } catch(e) { /* not critical */ }
+    }
+    const firstReason = result.failed[0] && result.failed[0].response && result.failed[0].response.reason;
+    if (firstReason) log('⚠️', 'APNs failure reason: ' + firstReason);
+  }
+  return { sent: result.sent.length, failed: result.failed.length };
+}
+
+// Look up all tokens for a user, send to each device.
+async function sendPushToUser(userId, title, body, payload) {
+  if (!supabaseAdmin) return { sent: 0, failed: 0, error: 'supabase not configured' };
+  const { data: rows, error } = await supabaseAdmin.from('device_tokens')
+    .select('token,platform').eq('user_id', String(userId));
+  if (error) return { sent: 0, failed: 0, error: error.message || String(error) };
+  if (!rows || !rows.length) return { sent: 0, failed: 0, reason: 'no tokens for user' };
+  const iosTokens = rows.filter(r => (r.platform || 'ios') === 'ios').map(r => r.token);
+  return sendApnsPush(iosTokens, title, body, payload);
+}
+
+// ── POST /push/register-token ────────────────────────────────────────────────
+// Called by the iOS client on first launch + on each app open. Upserts the
+// (user_id, token) pair so a single user with multiple devices gets all of them.
+async function handleRegisterPushToken(req, res) {
+  try {
+    const b = req.body || {};
+    if (!b.userId || !b.token) {
+      return res.status(400).json({ error: 'userId and token required' });
+    }
+    if (!supabaseAdmin) return res.status(500).json({ error: 'supabase not configured' });
+    const { error } = await supabaseAdmin.from('device_tokens').upsert({
+      user_id:      String(b.userId),
+      agency_id:    b.agencyId ? String(b.agencyId) : null,
+      token:        String(b.token),
+      platform:     b.platform || 'ios',
+      device_name:  b.deviceName || null,
+      last_seen_at: new Date().toISOString(),
+    }, { onConflict: 'user_id,token' });
+    if (error) {
+      log('❌', 'register-token error: ' + (error.message || error));
+      return res.status(500).json({ error: error.message || String(error) });
+    }
+    log('🔔', 'Push token registered for user ' + String(b.userId).slice(0, 8) + '…');
+    res.json({ ok: true });
+  } catch(e) {
+    log('❌', 'register-token threw: ' + e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ── POST /push/send ──────────────────────────────────────────────────────────
+// Send a push to all of a user's registered devices. Used by the diagnostic
+// panel's "send test" button and by the internal notify worker (which calls
+// sendPushToUser directly to avoid the HTTP hop).
+async function handlePushSend(req, res) {
+  try {
+    const b = req.body || {};
+    if (!b.userId || !b.title) {
+      return res.status(400).json({ error: 'userId and title required' });
+    }
+    const result = await sendPushToUser(String(b.userId), b.title, b.body || '', {
+      deeplink:      b.deeplink,
+      kind:          b.kind,
+      projectId:     b.projectId,
+      deliverableId: b.deliverableId,
+    });
+    res.json({ ok: true, ...result });
+  } catch(e) {
+    log('❌', 'push/send threw: ' + e.message);
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ── /push/prefs ──────────────────────────────────────────────────────────────
+// Minimal stub — accepts and returns OK. Wire to real preferences when needed
+// (e.g. per-user opt-out for specific notification kinds). Client currently
+// doesn't fail if this returns OK with no data.
+async function handlePushPrefs(req, res) {
+  res.json({ ok: true, prefs: {} });
 }
 
 
@@ -2537,7 +2704,16 @@ httpServer.listen(PORT, () => {
   console.log(`State seeded: ${appState.seeded}`);
   console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}`);
   console.log(`Stripe: ${stripe ? 'configured ✓' : 'not configured — add STRIPE_SECRET_KEY'}`);
-  console.log(`Supabase: ${supabaseAdmin ? 'configured ✓' : 'not configured — add SUPABASE_URL + SUPABASE_SERVICE_KEY'}\n`);
+  console.log(`Supabase: ${supabaseAdmin ? 'configured ✓' : 'not configured — add SUPABASE_URL + SUPABASE_SERVICE_KEY'}`);
+  // APNs status — print on boot so misconfig is obvious in Railway logs.
+  // Touch the provider once to flip its status flags.
+  getApnProvider();
+  if (_apnProvider) {
+    console.log(`APNs: configured ✓ (bundle=${process.env.APNS_BUNDLE_ID || 'nz.co.belowstudios.bsmnt1'}, production=${process.env.APNS_PRODUCTION !== 'false'})`);
+  } else {
+    console.log(`APNs: ${_apnProviderError || 'not configured'}`);
+  }
+  console.log('');
 });
 
 scheduleWeeklyRecap();
