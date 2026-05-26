@@ -218,6 +218,7 @@ app.post('/push/register-token',  handleRegisterPushToken);
 app.post('/push/send',            handlePushSend);
 app.post('/push/prefs',           handlePushPrefs);
 app.get('/push/prefs',            handlePushPrefs);
+app.get('/push/status',           handlePushStatus);
 app.post('/send-recap',           handleSendRecapNow);
 app.post('/send-runsheet',         handleSendRunsheet);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
@@ -1685,18 +1686,32 @@ async function _notifyDeliverableComment(agencyId, proj, del, cmt, explicitAssig
 // ═════════════════════════════════════════════════════════════════════════════
 // PUSH NOTIFICATIONS — APNs delivery + token registration
 // ═════════════════════════════════════════════════════════════════════════════
-// Env vars required (set in Railway):
-//   APNS_KEY_ID      — 10-char Key ID from Apple Developer Portal → Keys
-//   APNS_TEAM_ID     — 10-char Team ID from Apple Developer Portal → Membership
-//   APNS_KEY_P8      — full contents of the .p8 auth key file, including the
-//                      "-----BEGIN PRIVATE KEY-----" / "-----END PRIVATE KEY-----"
-//                      lines. Newlines must be preserved.
-//   APNS_BUNDLE_ID   — defaults to 'nz.co.belowstudios.bsmnt1'
-//   APNS_PRODUCTION  — 'true' (default) or 'false'. TestFlight uses production
-//                      APNs, so even debug TestFlight builds need this true.
+// Env vars required (set in Railway). Both APN_ and APNS_ prefixes are accepted
+// for each var since both naming conventions are common:
+//   APN_KEY_ID / APNS_KEY_ID         — 10-char Key ID from Apple Developer
+//                                       Portal → Keys
+//   APN_TEAM_ID / APNS_TEAM_ID       — 10-char Team ID from Apple Developer
+//                                       Portal → Membership
+//   APN_KEY_PATH / APNS_KEY_PATH     — relative path to the .p8 file on disk
+//                                       (e.g. './AuthKey.p8') — preferred
+//     OR
+//   APN_KEY_P8 / APNS_KEY_P8         — full .p8 contents inline, including
+//                                       the BEGIN/END lines. Used if no path.
+//   APN_BUNDLE_ID / APNS_BUNDLE_ID   — defaults to 'nz.co.belowstudios.bsmnt1'
+//   APN_PRODUCTION / APNS_PRODUCTION — 'true' (default) or 'false'.
+//                                       *** TestFlight + App Store use the
+//                                       PRODUCTION APNs endpoint. Only set
+//                                       false if running a dev build from
+//                                       Xcode to a phone with the dev
+//                                       provisioning profile. ***
 //
 // Supabase needs a `device_tokens` table — see the SQL migration shipped
 // alongside this file.
+
+// Helper: read env var under either APN_ or APNS_ prefix.
+function _apnEnv(name) {
+  return process.env['APN_' + name] || process.env['APNS_' + name] || '';
+}
 
 let _apnProvider = null;
 let _apnProviderError = null;
@@ -1707,19 +1722,51 @@ function getApnProvider() {
     _apnProviderError = 'package @parse/node-apn not installed';
     return null;
   }
-  const keyId  = process.env.APNS_KEY_ID;
-  const teamId = process.env.APNS_TEAM_ID;
-  const keyP8  = process.env.APNS_KEY_P8;
-  if (!keyId || !teamId || !keyP8) {
-    _apnProviderError = 'APNs env vars missing — need APNS_KEY_ID, APNS_TEAM_ID, APNS_KEY_P8';
+  const keyId  = _apnEnv('KEY_ID');
+  const teamId = _apnEnv('TEAM_ID');
+
+  // Two ways to provide the .p8 key:
+  //   1. APN_KEY_PATH — relative path to the .p8 file on disk (your setup)
+  //   2. APN_KEY_P8   — full .p8 contents pasted into an env var
+  let keyContents = null;
+  const keyPath = _apnEnv('KEY_PATH');
+  const keyInline = _apnEnv('KEY_P8');
+  if (keyPath) {
+    try {
+      keyContents = fs.readFileSync(keyPath, 'utf8');
+    } catch(e) {
+      _apnProviderError = 'APNs key file at ' + keyPath + ' could not be read: ' + e.message;
+      log('❌', _apnProviderError);
+      return null;
+    }
+  } else if (keyInline) {
+    keyContents = keyInline;
+  }
+
+  if (!keyId || !teamId || !keyContents) {
+    const missing = [];
+    if (!keyId) missing.push('KEY_ID');
+    if (!teamId) missing.push('TEAM_ID');
+    if (!keyContents) missing.push('KEY_PATH or KEY_P8');
+    _apnProviderError = 'APNs env vars missing: ' + missing.join(', ') + ' (with APN_ or APNS_ prefix)';
     return null;
   }
+
+  const prodFlag = _apnEnv('PRODUCTION');
+  // Default to TRUE. TestFlight + App Store use production APNs. Sending a
+  // production token via the sandbox endpoint (or vice versa) gets a
+  // BadDeviceToken rejection from Apple — the #1 cause of silent push fails.
+  const isProduction = prodFlag === '' ? true : prodFlag !== 'false';
+
   try {
     _apnProvider = new apn.Provider({
-      token: { key: keyP8, keyId: keyId, teamId: teamId },
-      production: process.env.APNS_PRODUCTION !== 'false',
+      token: { key: keyContents, keyId: keyId, teamId: teamId },
+      production: isProduction,
     });
-    log('🔔', 'APNs provider initialized (production=' + (process.env.APNS_PRODUCTION !== 'false') + ')');
+    log('🔔', 'APNs provider initialized (production=' + isProduction + ', keyId=' + keyId + ')');
+    if (!isProduction) {
+      log('⚠️ ', 'APN_PRODUCTION=false — sandbox APNs only. TestFlight tokens will be rejected as BadDeviceToken. Set to true for TestFlight/App Store.');
+    }
     return _apnProvider;
   } catch(e) {
     _apnProviderError = 'APNs provider init failed: ' + e.message;
@@ -1743,7 +1790,7 @@ async function sendApnsPush(tokens, title, body, payload) {
   note.badge   = 1;
   note.sound   = 'default';
   note.alert   = { title: String(title || ''), body: String(body || '') };
-  note.topic   = process.env.APNS_BUNDLE_ID || 'nz.co.belowstudios.bsmnt1';
+  note.topic   = _apnEnv('BUNDLE_ID') || 'nz.co.belowstudios.bsmnt1';
   note.payload = payload || {};
 
   let result;
@@ -1844,6 +1891,81 @@ async function handlePushSend(req, res) {
 // doesn't fail if this returns OK with no data.
 async function handlePushPrefs(req, res) {
   res.json({ ok: true, prefs: {} });
+}
+
+// ── GET /push/status ─────────────────────────────────────────────────────────
+// Diagnostic endpoint — returns the current push notification config state so
+// we can verify Supabase, the device_tokens table, and APNs without needing
+// access to Railway logs. Safe to expose: no secrets are returned, only
+// presence-of-config and key IDs (which are not secret).
+async function handlePushStatus(req, res) {
+  var status = {
+    serverTime: new Date().toISOString(),
+    supabase: { configured: !!supabaseAdmin },
+    deviceTokensTable: { status: 'unchecked' },
+    apns: { configured: false, error: null, production: null, bundleId: null, keyId: null, teamId: null },
+  };
+
+  // 1. Verify device_tokens table exists by trying a tiny select
+  if (supabaseAdmin) {
+    try {
+      var result = await supabaseAdmin.from('device_tokens').select('id').limit(1);
+      // The custom REST wrapper doesn't check HTTP status. If the table doesn't
+      // exist Supabase returns an error JSON, which the wrapper passes through
+      // as `data` (not `error`). So inspect the data shape.
+      if (result.error) {
+        status.deviceTokensTable.status = 'error';
+        status.deviceTokensTable.error = result.error.message || String(result.error);
+      } else if (Array.isArray(result.data)) {
+        status.deviceTokensTable.status = 'exists';
+        status.deviceTokensTable.firstRowsCount = result.data.length;
+      } else if (result.data && result.data.code) {
+        // Supabase REST error object: { code, message, hint, details }
+        status.deviceTokensTable.status = 'supabase-error';
+        status.deviceTokensTable.code = result.data.code;
+        status.deviceTokensTable.message = result.data.message;
+        status.deviceTokensTable.hint = result.data.hint;
+      } else {
+        status.deviceTokensTable.status = 'unknown-response';
+        status.deviceTokensTable.rawResponse = result.data;
+      }
+    } catch(e) {
+      status.deviceTokensTable.status = 'exception';
+      status.deviceTokensTable.error = e.message;
+    }
+  }
+
+  // 2. APNs provider status — touch the provider once to init/check
+  try {
+    var prov = getApnProvider();
+    if (prov) {
+      var prodFlag = _apnEnv('PRODUCTION');
+      var isProduction = prodFlag === '' ? true : prodFlag !== 'false';
+      status.apns.configured = true;
+      status.apns.production = isProduction;
+      status.apns.bundleId = _apnEnv('BUNDLE_ID') || 'nz.co.belowstudios.bsmnt1';
+      status.apns.keyId = _apnEnv('KEY_ID') || null;
+      status.apns.teamId = _apnEnv('TEAM_ID') || null;
+      status.apns.usingPrefix = process.env.APN_KEY_ID ? 'APN_' : (process.env.APNS_KEY_ID ? 'APNS_' : 'NONE');
+      status.apns.keySource = _apnEnv('KEY_PATH') ? 'file:' + _apnEnv('KEY_PATH') : (_apnEnv('KEY_P8') ? 'inline-env-var' : 'NONE');
+    } else {
+      status.apns.error = _apnProviderError;
+    }
+  } catch(e) {
+    status.apns.error = 'getApnProvider threw: ' + e.message;
+  }
+
+  // 3. Count of registered device tokens (across all users)
+  if (supabaseAdmin && status.deviceTokensTable.status === 'exists') {
+    try {
+      var all = await supabaseAdmin.from('device_tokens').select('id');
+      if (Array.isArray(all.data)) {
+        status.deviceTokensTable.totalTokens = all.data.length;
+      }
+    } catch(e) { /* ignore */ }
+  }
+
+  res.json(status);
 }
 
 
@@ -2709,7 +2831,9 @@ httpServer.listen(PORT, () => {
   // Touch the provider once to flip its status flags.
   getApnProvider();
   if (_apnProvider) {
-    console.log(`APNs: configured ✓ (bundle=${process.env.APNS_BUNDLE_ID || 'nz.co.belowstudios.bsmnt1'}, production=${process.env.APNS_PRODUCTION !== 'false'})`);
+    const prodFlag = _apnEnv('PRODUCTION');
+    const isProduction = prodFlag === '' ? true : prodFlag !== 'false';
+    console.log(`APNs: configured ✓ (bundle=${_apnEnv('BUNDLE_ID') || 'nz.co.belowstudios.bsmnt1'}, production=${isProduction})`);
   } else {
     console.log(`APNs: ${_apnProviderError || 'not configured'}`);
   }
