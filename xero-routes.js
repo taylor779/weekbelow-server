@@ -37,7 +37,9 @@ const SUPABASE_URL       = process.env.SUPABASE_URL;
 // Reuse the server's existing Supabase service key (it's named SUPABASE_SERVICE_KEY here).
 const SUPABASE_KEY       = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const SCOPES = 'openid profile email offline_access accounting.transactions accounting.contacts';
+// Granular scopes (required for Xero apps created on/after 2 Mar 2026):
+// accounting.invoices replaces the old broad accounting.transactions for writing invoices.
+const SCOPES = 'openid profile email offline_access accounting.contacts accounting.invoices';
 
 // NOTE: this router relies on the host app's existing global middleware:
 //   app.use(express.json(...))   — so req.body is already parsed
