@@ -22,9 +22,8 @@
 //   XERO_CLIENT_SECRET        from your Xero app
 //   XERO_REDIRECT_URI         https://weekbelow-server-production.up.railway.app/xero/callback
 //   XERO_APP_RETURN_URL       https://bsmnt.co.nz/app           (where to send the user after connect)
-//   XERO_APP_ORIGIN           https://bsmnt.co.nz               (CORS allow-origin for the app)
-//   SUPABASE_URL              (you almost certainly already have this)
-//   SUPABASE_SERVICE_ROLE_KEY (you almost certainly already have this)
+//   SUPABASE_URL              (already set on your server)
+//   SUPABASE_SERVICE_KEY      (already set on your server)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
@@ -34,21 +33,16 @@ const XERO_CLIENT_ID     = process.env.XERO_CLIENT_ID;
 const XERO_CLIENT_SECRET = process.env.XERO_CLIENT_SECRET;
 const XERO_REDIRECT_URI  = process.env.XERO_REDIRECT_URI;
 const APP_RETURN_URL     = process.env.XERO_APP_RETURN_URL || 'https://bsmnt.co.nz/app';
-const APP_ORIGIN         = process.env.XERO_APP_ORIGIN     || 'https://bsmnt.co.nz';
 const SUPABASE_URL       = process.env.SUPABASE_URL;
-const SUPABASE_KEY       = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Reuse the server's existing Supabase service key (it's named SUPABASE_SERVICE_KEY here).
+const SUPABASE_KEY       = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const SCOPES = 'offline_access accounting.transactions accounting.contacts';
 
-// ── tiny CORS so the browser app can call /status and /invoice ───────────────
-router.use('/xero', (req, res, next) => {
-  res.set('Access-Control-Allow-Origin', APP_ORIGIN);
-  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-router.use('/xero/invoice', express.json({ limit: '1mb' }));
+// NOTE: this router relies on the host app's existing global middleware:
+//   app.use(express.json(...))   — so req.body is already parsed
+//   the global CORS middleware   — so browser calls to /status and /invoice are allowed
+// Mount it AFTER those (it is, if you add it with your other route registrations).
 
 // ── Supabase token store (REST, service key) ─────────────────────────────────
 function _sbHeaders() {
@@ -77,7 +71,7 @@ async function saveConnection(agency, data) {
     updated_at: new Date().toISOString()
   };
   // upsert (agency_id is the primary key)
-  const r = await fetch(SUPABASE_URL + '/rest/v1/xero_connections', {
+  const r = await fetch(SUPABASE_URL + '/rest/v1/xero_connections?on_conflict=agency_id', {
     method: 'POST',
     headers: Object.assign(_sbHeaders(), { 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
     body: JSON.stringify(row)
