@@ -225,6 +225,12 @@ app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 app.get('/project-share/:token',        handleGetProjectShare);
 app.post('/project-share/:token/edit',  handleEditProjectShare);
 
+// ── BSMNT Xero integration (one-click "Send to Xero") ──
+// Adds /xero/connect, /xero/callback, /xero/status, /xero/invoice.
+// Relies on the global express.json() + CORS registered above.
+const xeroRoutes = require('./xero-routes');
+app.use(xeroRoutes);
+
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 });
 
