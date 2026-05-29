@@ -146,6 +146,17 @@ router.get('/xero/connect', (req, res) => {
     + '&redirect_uri=' + encodeURIComponent(XERO_REDIRECT_URI)
     + '&scope=' + encodeURIComponent(SCOPES)
     + '&state=' + encodeURIComponent(agency);
+  // Add &debug=1 to see exactly what this server builds (no redirect).
+  if (req.query.debug) {
+    return res.type('text/plain').send(
+      'AUTHORIZE URL the server is sending:\n\n' + url +
+      '\n\n--- config sanity check ---' +
+      '\nSCOPES        = ' + SCOPES +
+      '\nCLIENT_ID set = ' + (XERO_CLIENT_ID ? 'yes (' + String(XERO_CLIENT_ID).slice(0,6) + '\u2026, len ' + String(XERO_CLIENT_ID).length + ')' : 'NO  <-- missing env var') +
+      '\nREDIRECT_URI  = ' + (XERO_REDIRECT_URI || 'NOT SET') +
+      '\nSECRET set    = ' + (XERO_CLIENT_SECRET ? 'yes' : 'NO  <-- missing env var')
+    );
+  }
   res.redirect(url);
 });
 
