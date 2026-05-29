@@ -201,6 +201,63 @@ router.get('/xero/status', async (req, res) => {
   }
 });
 
+// Map a friendly NZ/AU tax name to the Xero API tax CODE. Pass through real codes.
+// Empty/unknown -> '' (caller omits it, so Xero uses the account default).
+function mapTaxType(v) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  if (/^[A-Z0-9]+$/.test(s)) return s;            // already a code (e.g. OUTPUT2)
+  const map = {
+    'gst on income': 'OUTPUT2',                   // NZ 15% GST on income
+    'gst on expenses': 'INPUT2',
+    'no gst': 'NONE',
+    'gst free': 'NONE',
+    'zero rated': 'ZERORATED',
+    'gst on imports': 'GSTONIMPORTS'
+  };
+  return map[s.toLowerCase()] || '';
+}
+
+// Find an existing contact's ID so we don't create duplicates. Tries (1) exact email,
+// (2) exact name, (3) name search with case-insensitive match. Needs accounting.contacts.
+async function findContactId(auth, name, email) {
+  const headers = {
+    'Authorization': 'Bearer ' + auth.access_token,
+    'Xero-tenant-id': auth.tenant_id,
+    'Accept': 'application/json'
+  };
+  const byWhere = async (where) => {
+    try {
+      const url = 'https://api.xero.com/api.xro/2.0/Contacts?where=' + encodeURIComponent(where);
+      const r = await fetch(url, { headers });
+      if (!r.ok) return null;
+      const d = await r.json().catch(() => ({}));
+      const c = d && d.Contacts && d.Contacts[0];
+      return (c && c.ContactID) ? c.ContactID : null;
+    } catch (_) { return null; }
+  };
+  if (email && email.indexOf('@') > 0) {
+    const id = await byWhere('EmailAddress=="' + String(email).replace(/"/g, '') + '"');
+    if (id) return id;
+  }
+  if (name) {
+    const id = await byWhere('Name=="' + String(name).replace(/"/g, '') + '"');
+    if (id) return id;
+    // Fallback: fuzzy search, then match name case-insensitively.
+    try {
+      const url = 'https://api.xero.com/api.xro/2.0/Contacts?searchTerm=' + encodeURIComponent(name);
+      const r = await fetch(url, { headers });
+      if (r.ok) {
+        const d = await r.json().catch(() => ({}));
+        const want = String(name).trim().toLowerCase();
+        const hit = (d && d.Contacts || []).find(c => String(c.Name || '').trim().toLowerCase() === want);
+        if (hit && hit.ContactID) return hit.ContactID;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 // ── 4) Create draft invoice ──────────────────────────────────────────────────
 router.post('/xero/invoice', async (req, res) => {
   try {
@@ -211,23 +268,33 @@ router.post('/xero/invoice', async (req, res) => {
     if (!auth) return res.status(401).json({ error: 'not_connected' });
 
     const lineItems = (invoice.lineItems || []).map(li => {
-      // Xero's API wants a TaxType CODE (e.g. OUTPUT2), not a friendly name ("GST on Income").
-      // A value with spaces/lowercase is a friendly name -> omit it so Xero applies the
-      // account's own default tax rate (which is what we want anyway).
-      const tt = String(li.taxType || '').trim();
-      const isCode = tt && /^[A-Z0-9]+$/.test(tt);   // codes are all-caps/digits, no spaces
+      // Stage header rows: description-only line (no amount/account) -> Xero shows it as a sub-heading.
+      if (li.header) {
+        return { Description: (String(li.description || '').slice(0, 3900) || ' ') };
+      }
       return {
         Description: String(li.description || '').slice(0, 3900) || '.',
         Quantity: Number(li.quantity) || 0,
         UnitAmount: Number(li.unitAmount) || 0,
-        AccountCode: String(li.accountCode || '200'),
-        ...(isCode ? { TaxType: tt } : {})           // omit -> Xero uses the account default
+        AccountCode: String(li.accountCode || '180'),
+        ...(mapTaxType(li.taxType) ? { TaxType: mapTaxType(li.taxType) } : {})
       };
     });
 
+    // Match an existing Xero contact (by email, then exact name, then case-insensitive
+    // name search) so we reuse "Andrew Simms" instead of creating a duplicate.
+    let contact;
+    const existingId = await findContactId(auth, invoice.contactName, invoice.contactEmail);
+    if (existingId) {
+      contact = { ContactID: existingId };
+    } else {
+      contact = { Name: invoice.contactName };
+      if (invoice.contactEmail) contact.EmailAddress = invoice.contactEmail;
+    }
+
     const payload = { Invoices: [{
       Type: 'ACCREC',
-      Contact: { Name: invoice.contactName },
+      Contact: contact,
       Date: invoice.date || undefined,
       DueDate: invoice.dueDate || undefined,
       Reference: invoice.reference || undefined,
