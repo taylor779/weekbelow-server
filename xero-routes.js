@@ -140,11 +140,13 @@ async function validAccessToken(agency) {
 router.get('/xero/connect', (req, res) => {
   const agency = String(req.query.agency || '');
   if (!agency) return res.status(400).send('Missing agency');
+  // Optional ?scope=... override for diagnosing invalid_scope (e.g. ?scope=openid).
+  const scope = req.query.scope ? String(req.query.scope) : SCOPES;
   const url = 'https://login.xero.com/identity/connect/authorize'
     + '?response_type=code'
     + '&client_id=' + encodeURIComponent(XERO_CLIENT_ID)
     + '&redirect_uri=' + encodeURIComponent(XERO_REDIRECT_URI)
-    + '&scope=' + encodeURIComponent(SCOPES)
+    + '&scope=' + encodeURIComponent(scope)
     + '&state=' + encodeURIComponent(agency);
   // Add &debug=1 to see exactly what this server builds (no redirect).
   if (req.query.debug) {
