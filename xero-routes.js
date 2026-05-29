@@ -210,13 +210,20 @@ router.post('/xero/invoice', async (req, res) => {
     const auth = await validAccessToken(agency);
     if (!auth) return res.status(401).json({ error: 'not_connected' });
 
-    const lineItems = (invoice.lineItems || []).map(li => ({
-      Description: String(li.description || '').slice(0, 3900) || '.',
-      Quantity: Number(li.quantity) || 0,
-      UnitAmount: Number(li.unitAmount) || 0,
-      AccountCode: String(li.accountCode || '200'),
-      TaxType: li.taxType || undefined            // omit -> Xero uses the account default
-    }));
+    const lineItems = (invoice.lineItems || []).map(li => {
+      // Xero's API wants a TaxType CODE (e.g. OUTPUT2), not a friendly name ("GST on Income").
+      // A value with spaces/lowercase is a friendly name -> omit it so Xero applies the
+      // account's own default tax rate (which is what we want anyway).
+      const tt = String(li.taxType || '').trim();
+      const isCode = tt && /^[A-Z0-9]+$/.test(tt);   // codes are all-caps/digits, no spaces
+      return {
+        Description: String(li.description || '').slice(0, 3900) || '.',
+        Quantity: Number(li.quantity) || 0,
+        UnitAmount: Number(li.unitAmount) || 0,
+        AccountCode: String(li.accountCode || '200'),
+        ...(isCode ? { TaxType: tt } : {})           // omit -> Xero uses the account default
+      };
+    });
 
     const payload = { Invoices: [{
       Type: 'ACCREC',
@@ -241,10 +248,15 @@ router.post('/xero/invoice', async (req, res) => {
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) {
-      const msg = (data && (data.Detail || data.Message)) ||
-                  (data && data.Elements && data.Elements[0] && data.Elements[0].ValidationErrors &&
-                   data.Elements[0].ValidationErrors.map(v => v.Message).join('; ')) ||
-                  ('Xero HTTP ' + r.status);
+      // Xero nests the useful detail in Elements[].ValidationErrors; the top-level
+      // Message is just "A validation exception occurred". Surface the specifics first.
+      let msg = '';
+      try {
+        const ve = data && data.Elements && data.Elements[0] && data.Elements[0].ValidationErrors;
+        if (Array.isArray(ve) && ve.length) msg = ve.map(v => v.Message).join('; ');
+      } catch (_) {}
+      if (!msg) msg = (data && (data.Detail || data.Message)) || ('Xero HTTP ' + r.status);
+      console.error('[xero/invoice] validation', JSON.stringify(data));
       return res.status(400).json({ error: 'xero', message: msg });
     }
     const inv = (data.Invoices && data.Invoices[0]) || {};
