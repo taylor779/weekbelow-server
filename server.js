@@ -64,8 +64,23 @@ function supaRest(method, table, params, body, extraHeaders) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        try { resolve(data ? JSON.parse(data) : null); }
-        catch { resolve(data); }
+        let parsed = null;
+        try { parsed = data ? JSON.parse(data) : null; } catch { parsed = data; }
+        // Surface PostgREST/HTTP errors instead of resolving them as data.
+        // Previously any non-2xx (RLS violation, missing on-conflict constraint,
+        // unknown column) was resolved as the response body with error=null, so
+        // callers like handleRegisterPushToken saw a silent success and wrote
+        // nothing. Now a non-2xx rejects, so the fluent .then() reports a real error.
+        if (res.statusCode && res.statusCode >= 300) {
+          const msg = (parsed && (parsed.message || parsed.error || parsed.msg)) || ('HTTP ' + res.statusCode);
+          const err = new Error(msg);
+          err.status = res.statusCode;
+          if (parsed && parsed.code) err.code = parsed.code;
+          if (parsed && parsed.details) err.details = parsed.details;
+          err.body = parsed;
+          return reject(err);
+        }
+        resolve(parsed);
       });
     });
     req.on('error', reject);
