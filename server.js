@@ -229,6 +229,8 @@ app.post('/link-preview',         handleLinkPreview);
 app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/notify-deliverable-comment', handleNotifyDeliverableComment);
+app.post('/notify/project-created',  handleNotifyProjectCreated);
+app.post('/notify/project-assigned', handleNotifyProjectAssigned);
 app.post('/push/register-token',  handleRegisterPushToken);
 app.post('/push/send',            handlePushSend);
 app.post('/push/prefs',           handlePushPrefs);
@@ -398,6 +400,73 @@ function scheduleFridayRecaps() {
   }, 5 * 60 * 1000);
 }
 scheduleFridayRecaps();
+
+// ── 2-hour "timer still running?" check (in-memory activeTimers) ──────────────
+const _longTimerReminded = new Set();
+function scheduleLongTimerCheck() {
+  setInterval(async function() {
+    try {
+      if (!supabaseAdmin) return;
+      const now = Date.now();
+      const TWO_H = 2 * 60 * 60 * 1000;
+      for (const uid of Object.keys(activeTimers)) {
+        const t = activeTimers[uid];
+        if (!t || !t.startedAt) continue;
+        const elapsed = now - new Date(t.startedAt).getTime();
+        if (elapsed < TWO_H) continue;
+        const key = uid + '|' + t.startedAt;
+        if (_longTimerReminded.has(key)) continue;
+        _longTimerReminded.add(key);
+        const { data: m } = await supabaseAdmin.from('agency_members')
+          .select('user_id,active,preferences').eq('id', String(uid)).maybeSingle();
+        if (!m || m.active === false || !m.user_id) continue;
+        if (!_pushPrefOn(m, 'pushTimerLongRunning')) continue;
+        const hrs = Math.floor(elapsed / 3600000);
+        await sendPushToUser(String(m.user_id), 'Timer still running',
+          'Your timer on ' + (t.projectName || 'a project') + ' has been going ' + hrs + 'h+. Still on it, or left running?',
+          { kind: 'timer_long_running' }).catch(function(){});
+        log('🔔', 'long-timer nudge -> ' + String(m.user_id).slice(0, 8));
+      }
+      for (const key of Array.from(_longTimerReminded)) {
+        const uid = key.split('|')[0];
+        const t = activeTimers[uid];
+        if (!t || (uid + '|' + t.startedAt) !== key) _longTimerReminded.delete(key);
+      }
+    } catch(e) { log('⚠', 'long-timer check: ' + e.message); }
+  }, 5 * 60 * 1000);
+}
+scheduleLongTimerCheck();
+
+// ── 8:45am daily "track your time" reminder (per agency timezone) ─────────────
+const _morningReminded = new Set();
+function scheduleMorningTrackReminder() {
+  setInterval(async function() {
+    try {
+      if (!supabaseAdmin) return;
+      const { data: states } = await supabaseAdmin.from('app_state').select('agency_id,brand');
+      if (!states || !Array.isArray(states)) return;
+      for (const state of states) {
+        const tz = (state.brand && state.brand.timezone) || 'Pacific/Auckland';
+        const userNow = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+        const hour = userNow.getHours(), minute = userNow.getMinutes();
+        if (!(hour === 8 && minute >= 45 && minute < 50)) continue;
+        const dateStr = userNow.getFullYear() + '-' + (userNow.getMonth() + 1) + '-' + userNow.getDate();
+        const members = await _agencyActiveMembers(state.agency_id);
+        for (const m of members) {
+          const key = state.agency_id + '|' + m.id + '|' + dateStr;
+          if (_morningReminded.has(key)) continue;
+          _morningReminded.add(key);
+          if (!m.user_id) continue;
+          if (!_pushPrefOn(m, 'pushForgotToTrack')) continue;
+          await sendPushToUser(String(m.user_id), 'Track your time',
+            'Morning! Start your timer so today\'s hours land on the right project.',
+            { kind: 'morning_reminder' }).catch(function(){});
+        }
+      }
+    } catch(e) { log('⚠', 'morning reminder: ' + e.message); }
+  }, 5 * 60 * 1000);
+}
+scheduleMorningTrackReminder();
 
 async function handleGiftTokensEmail(req, res) {
   const { agencyId, tokens, message } = req.body || {};
@@ -1691,15 +1760,12 @@ async function _notifyDeliverableComment(agencyId, proj, del, cmt, explicitAssig
 
   // Fan out per-user via the in-process APNs helper. No HTTP roundtrip — we're
   // calling the same code path /push/send uses but skipping the network hop.
-  const fanOut = assignees.map(uid =>
-    sendPushToUser(String(uid), title, body, {
-      deeplink: deeplink,
-      kind: 'deliverable_comment',
-      projectId: String(proj.id),
-      deliverableId: del && del.id ? String(del.id) : null,
-    }).catch(e => { log('⚠️', 'push to ' + uid + ' failed: ' + (e && e.message)); })
-  );
-  await Promise.all(fanOut);
+  await pushToMemberIds(agencyId, assignees, 'pushCommentOnCard', title, body, {
+    deeplink: deeplink,
+    kind: 'deliverable_comment',
+    projectId: String(proj.id),
+    deliverableId: del && del.id ? String(del.id) : null,
+  });
   log('🔔', 'Comment notify fanned to ' + assignees.length + ' assignee(s) on "' + (proj.name || '?') + '"');
 }
 
@@ -1851,6 +1917,88 @@ async function sendPushToUser(userId, title, body, payload) {
   if (!rows || !rows.length) return { sent: 0, failed: 0, reason: 'no tokens for user' };
   const iosTokens = rows.filter(r => (r.platform || 'ios') === 'ios').map(r => r.token);
   return sendApnsPush(iosTokens, title, body, payload);
+}
+
+// ── Notification fan-out helpers ──────────────────────────────────────────────
+// Resolve agency_members.id (the app id used in proj.assigned, timeLog, timer
+// events) -> user_id (= the Supabase auth id that device_tokens are keyed by),
+// gate on the recipient's own saved preferences, then push.
+async function _agencyActiveMembers(agencyId) {
+  if (!supabaseAdmin || !agencyId) return [];
+  const { data, error } = await supabaseAdmin.from('agency_members')
+    .select('id,user_id,role,active,name,preferences')
+    .eq('agency_id', String(agencyId)).eq('active', true);
+  if (error) { log('⚠', 'members lookup: ' + error.message); return []; }
+  return data || [];
+}
+function _pushPrefOn(member, prefKey) {
+  const p = (member && member.preferences) || {};
+  if (p.pushEnabled === false) return false;   // master off
+  if (!prefKey) return true;
+  return p[prefKey] !== false;                 // default-on
+}
+async function _pushMember(member, prefKey, title, body, payload) {
+  try {
+    if (!member || !member.user_id) return;
+    if (!_pushPrefOn(member, prefKey)) return;
+    await sendPushToUser(String(member.user_id), title, body, payload || {});
+  } catch(e) { log('⚠', 'push member: ' + (e && e.message)); }
+}
+// Notify every active admin of an agency, excluding the actor's member id.
+async function pushToAdmins(agencyId, prefKey, title, body, payload, excludeMemberId) {
+  const members = await _agencyActiveMembers(agencyId);
+  const admins = members.filter(m => m.role === 'admin' && String(m.id) !== String(excludeMemberId || ''));
+  await Promise.all(admins.map(m => _pushMember(m, prefKey, title, body, payload)));
+  return admins.length;
+}
+// Notify specific members by agency_members.id (e.g. project assignees).
+async function pushToMemberIds(agencyId, memberIds, prefKey, title, body, payload, excludeMemberId) {
+  const members = await _agencyActiveMembers(agencyId);
+  const want = new Set((memberIds || []).map(String));
+  const targets = members.filter(m => want.has(String(m.id)) && String(m.id) !== String(excludeMemberId || ''));
+  await Promise.all(targets.map(m => _pushMember(m, prefKey, title, body, payload)));
+  return targets.length;
+}
+// Timer start/stop -> notify the agency's other admins. Fired server-side off
+// the websocket so it works no matter which device/platform started the timer.
+async function _notifyTimerEvent(kind, timerUserId, userName, projectName) {
+  try {
+    if (!supabaseAdmin || !timerUserId) return;
+    const { data: actor } = await supabaseAdmin.from('agency_members')
+      .select('agency_id,name').eq('id', String(timerUserId)).maybeSingle();
+    if (!actor || !actor.agency_id) return;
+    const who = userName || actor.name || 'Someone';
+    const title = who + (kind === 'start' ? ' started tracking time' : ' stopped tracking time');
+    const body = projectName ? ('on ' + projectName) : '';
+    await pushToAdmins(actor.agency_id, 'pushAdminTimeTracking', title, body,
+      { kind: 'admin_time_' + kind }, String(timerUserId));
+  } catch(e) { log('⚠', 'timer notify: ' + (e && e.message)); }
+}
+// POST /notify/project-created -> tell admins a new project landed.
+async function handleNotifyProjectCreated(req, res) {
+  try {
+    const b = req.body || {};
+    if (!b.agencyId || !b.projectName) return res.status(400).json({ error: 'agencyId and projectName required' });
+    const by = b.byName || 'Someone';
+    const n = await pushToAdmins(b.agencyId, 'pushAdminNewProject',
+      'New project: ' + b.projectName, by + ' added it to the studio',
+      { kind: 'admin_new_project', projectId: b.projectId ? String(b.projectId) : null },
+      b.byId);
+    res.json({ ok: true, notified: n });
+  } catch(e) { console.error('notify-project-created:', e.message); res.status(500).json({ error: e.message }); }
+}
+// POST /notify/project-assigned -> tell each assignee they are on a project.
+async function handleNotifyProjectAssigned(req, res) {
+  try {
+    const b = req.body || {};
+    if (!b.agencyId || !Array.isArray(b.assigneeIds)) return res.status(400).json({ error: 'agencyId and assigneeIds required' });
+    const by = b.byName || 'Someone';
+    const n = await pushToMemberIds(b.agencyId, b.assigneeIds, 'pushProjectAssigned',
+      'You\'re on ' + (b.projectName || 'a project'), by + ' assigned you',
+      { kind: 'project_assigned', projectId: b.projectId ? String(b.projectId) : null },
+      b.byId);
+    res.json({ ok: true, notified: n });
+  } catch(e) { console.error('notify-project-assigned:', e.message); res.status(500).json({ error: e.message }); }
 }
 
 // ── POST /push/register-token ────────────────────────────────────────────────
@@ -2328,6 +2476,7 @@ wss.on('connection', socket => {
         if (!userId) return;
         activeTimers[String(userId)] = { userId, userName, userColor, userInitials, projectId, projectName, taskId, phase, startedAt: new Date().toISOString() };
         broadcast({ type:'timer_start', timer:activeTimers[String(userId)] }, socket);
+        _notifyTimerEvent('start', userId, userName, projectName);
         log('▶', `${userName} started timer on "${projectName}"`);
         break;
       }
@@ -2338,6 +2487,7 @@ wss.on('connection', socket => {
         const timer = activeTimers[String(userId)];
         delete activeTimers[String(userId)];
         broadcast({ type:'timer_stop', userId, timer }, socket);
+        if (timer) _notifyTimerEvent('stop', userId, timer.userName, timer.projectName);
         if (timer) log('■', `${timer.userName} stopped timer`);
         break;
       }
