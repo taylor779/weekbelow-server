@@ -180,6 +180,7 @@ function defaultAppState() {
 }
 
 const activeTimers = {};
+const _runningTimers = {}; // memberId -> {agencyId, projectName, startedAt(ms)} - fed by /notify/timer-event (client routes timers over Supabase Realtime, not this ws, so activeTimers stays empty); used by the 2h idle check
 let appState = loadState();
 const clients = new Set();
 
@@ -231,6 +232,7 @@ app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/notify-deliverable-comment', handleNotifyDeliverableComment);
 app.post('/notify/project-created',  handleNotifyProjectCreated);
 app.post('/notify/project-assigned', handleNotifyProjectAssigned);
+app.post('/notify/timer-event',     handleNotifyTimerEvent);
 app.post('/push/register-token',  handleRegisterPushToken);
 app.post('/push/send',            handlePushSend);
 app.post('/push/prefs',           handlePushPrefs);
@@ -409,10 +411,10 @@ function scheduleLongTimerCheck() {
       if (!supabaseAdmin) return;
       const now = Date.now();
       const TWO_H = 2 * 60 * 60 * 1000;
-      for (const uid of Object.keys(activeTimers)) {
-        const t = activeTimers[uid];
+      for (const uid of Object.keys(_runningTimers)) {
+        const t = _runningTimers[uid];
         if (!t || !t.startedAt) continue;
-        const elapsed = now - new Date(t.startedAt).getTime();
+        const elapsed = now - t.startedAt;
         if (elapsed < TWO_H) continue;
         const key = uid + '|' + t.startedAt;
         if (_longTimerReminded.has(key)) continue;
@@ -429,7 +431,7 @@ function scheduleLongTimerCheck() {
       }
       for (const key of Array.from(_longTimerReminded)) {
         const uid = key.split('|')[0];
-        const t = activeTimers[uid];
+        const t = _runningTimers[uid];
         if (!t || (uid + '|' + t.startedAt) !== key) _longTimerReminded.delete(key);
       }
     } catch(e) { log('⚠', 'long-timer check: ' + e.message); }
@@ -1999,6 +2001,27 @@ async function handleNotifyProjectAssigned(req, res) {
       b.byId);
     res.json({ ok: true, notified: n });
   } catch(e) { console.error('notify-project-assigned:', e.message); res.status(500).json({ error: e.message }); }
+}
+
+// POST /notify/timer-event -> a teammate started/stopped a timer. Notify the
+// other admins, and maintain _runningTimers so the 2h idle check has state
+// (the Railway-ws activeTimers map is never fed by the current client).
+async function handleNotifyTimerEvent(req, res) {
+  try {
+    const b = req.body || {};
+    if (!b.agencyId || !b.byId || !b.kind) return res.status(400).json({ error: 'agencyId, byId, kind required' });
+    if (b.kind === 'start') {
+      _runningTimers[String(b.byId)] = { agencyId: String(b.agencyId), projectName: b.projectName || '', startedAt: Date.now() };
+    } else if (b.kind === 'stop') {
+      delete _runningTimers[String(b.byId)];
+    }
+    const who = b.byName || 'Someone';
+    const verb = b.kind === 'start' ? ' started tracking time' : ' stopped tracking time';
+    const n = await pushToAdmins(b.agencyId, 'pushAdminTimeTracking', who + verb,
+      b.projectName ? ('on ' + b.projectName) : '',
+      { kind: 'admin_time_' + b.kind }, b.byId);
+    res.json({ ok: true, notified: n });
+  } catch(e) { console.error('notify-timer-event:', e.message); res.status(500).json({ error: e.message }); }
 }
 
 // ── POST /push/register-token ────────────────────────────────────────────────
