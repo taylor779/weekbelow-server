@@ -2941,7 +2941,7 @@ body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-s
   <div style="text-align:right;font-family:'DM Mono',monospace;font-size:8px;color:#bbb;line-height:2;flex-shrink:0;margin-left:16px;">
     <div>${date}</div>
     ${timeline.length ? `<div>Call: ${timeline[0].time||timeline[0].startTime||''}</div>` : ''}
-    <div style="color:#aaa;">${crew.length ? crew.length+' crew' : ''} ${shotList.length ? '· '+shotList.length+' shots' : ''}</div>
+    <div style="color:#aaa;">${crew.length ? crew.length+' crew' : ''} ${(includeShots && shotList.length) ? '· '+shotList.length+' shots' : ''}</div>
   </div>
 </div>
 
