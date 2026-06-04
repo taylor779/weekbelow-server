@@ -2804,7 +2804,7 @@ async function handleProjectReport(req, res) {
       let shotNum = 0;
       shotsHtml = (proj.shotList||[]).map(s => {
         if (s.isScene) {
-          return `<div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1.5px;text-transform:uppercase;color:#888;margin:10px 0 5px;padding-bottom:3px;border-bottom:1px solid #e8e8e8;">${s.desc||'Scene'}</div>`;
+          return `<div class="shot-scene-hdr" style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1.5px;text-transform:uppercase;color:#888;margin:10px 0 5px;padding-bottom:3px;border-bottom:1px solid #e8e8e8;">${s.desc||'Scene'}</div>`;
         }
         shotNum++;
         return `<div style="display:flex;gap:7px;margin-bottom:6px;align-items:flex-start;">
@@ -2893,7 +2893,7 @@ body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-s
 @media print{
   body{background:#f9f9f6;}
   .no-print{display:none!important;}
-  .page-break{page-break-before:always;}
+  .page-break,.sec-page{page-break-before:always;}
 }
 .topbar{background:#111;padding:9px 22px;display:flex;align-items:center;justify-content:space-between;}
 .hero{padding:16px 22px;border-bottom:1px solid #e4e4e0;display:flex;align-items:flex-end;justify-content:space-between;}
@@ -2911,6 +2911,10 @@ body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-s
 .print-btn{position:fixed;bottom:24px;right:24px;background:#111;color:#fff;border:none;border-radius:8px;padding:10px 20px;font-family:'DM Mono',monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;cursor:pointer;box-shadow:0 4px 20px rgba(0,0,0,0.3);}
 .print-btn:hover{background:#333;}
 .tick{flex:1;width:1px;background:repeating-linear-gradient(to bottom,#bbb 0,#bbb 1px,transparent 1px,transparent 7px);margin:0 auto;}
+.section{padding:14px 22px;border-bottom:1px solid #e4e4e0;}
+.crew-grid>div,.equip-grid>div{break-inside:avoid;}
+.shots-wrap>div{break-inside:avoid;}
+.shot-scene-hdr{break-after:avoid;}
 </style>
 </head>
 <body>
@@ -2945,59 +2949,45 @@ body{font-family:'Space Grotesk',sans-serif;background:#f9f9f6;color:#111;font-s
   </div>
 </div>
 
-<!-- SCHEDULE + SHOTS -->
-<div class="body-grid">
-  <div class="col">
-    <div class="col-lbl">Schedule</div>
-    ${schedHtml || '<div style="color:#aaa;font-size:11px;">No schedule added yet.</div>'}
-  </div>
-  <div class="divider-col" style="display:flex;flex-direction:column;align-items:center;padding:14px 0;">
-    <div class="tick"></div>
-  </div>
-  ${includeShots ? `<div class="col">
-    <div class="col-lbl">Shot list</div>
-    ${shotsHtml || '<div style="color:#aaa;font-size:11px;">No shots added yet.</div>'}
-  </div>` : ''}
+<!-- CREW (first) -->
+${crewSection ? `<div class="section">
+  <div class="col-lbl">Crew${crew.length ? ' &middot; ' + crew.length + ' member' + (crew.length>1?'s':'') : ''}</div>
+  <div class="crew-grid">${crewSection}</div>
+</div>` : ''}
+
+<!-- SCHEDULE -->
+<div class="section">
+  <div class="col-lbl">Schedule${useDays ? ' &middot; ' + days.length + ' day' + (days.length>1?'s':'') : ''}</div>
+  ${schedHtml || '<div style="color:#aaa;font-size:11px;">No schedule added yet.</div>'}
 </div>
 
-<!-- STORYBOARD -->
-${storyboardHtml ? `<div style="padding:12px 20px;border-bottom:1px solid #e4e4e0;">${storyboardHtml}</div>` : ''}
-
-<!-- CREW + EQUIPMENT -->
-${(crewSection || equipHtml) ? `
-<div class="bottom-grid">
-  ${crewSection ? `
-  <div class="bottom-col">
-    <div class="col-lbl">Crew manifest</div>
-    <div class="crew-grid">${crewSection}</div>
-  </div>` : '<div class="bottom-col"></div>'}
-  ${equipHtml ? `
-  <div class="bottom-col">
-    <div class="col-lbl">Equipment checklist</div>
-    <div class="equip-grid">${equipHtml}</div>
-  </div>` : '<div class="bottom-col"></div>'}
+<!-- EQUIPMENT -->
+${equipHtml ? `<div class="section">
+  <div class="col-lbl">Equipment checklist</div>
+  <div class="equip-grid">${equipHtml}</div>
 </div>` : ''}
 
-<!-- NOTES + H&S -->
-${(notes || hs) ? `
-<div class="notes-row">
-  ${notes ? `<div>
-    <div class="col-lbl">Production notes</div>
-    <div style="font-size:10px;color:#555;line-height:1.7;">${notes}</div>
-  </div>` : '<div></div>'}
-  ${hs ? `<div>
-    <div class="col-lbl">Health &amp; Safety</div>
-    <div style="font-size:10px;color:#555;line-height:1.7;">${hs}</div>
-  </div>` : '<div></div>'}
+<!-- HEALTH & SAFETY -->
+${hs ? `<div class="section">
+  <div class="col-lbl">Health &amp; Safety</div>
+  <div style="font-size:10.5px;color:#555;line-height:1.7;max-width:640px;">${hs}</div>
 </div>` : ''}
 
+<!-- SHOT LIST (own page) -->
+${(includeShots && shotList.length) ? `<div class="section sec-page">
+  <div class="col-lbl">Shot list &middot; ${shotList.length} shot${shotList.length!==1?'s':''}</div>
+  <div class="shots-wrap">${shotsHtml}</div>
+</div>` : ''}
+
+<!-- STORYBOARD (own page) -->
+${storyboardHtml ? `<div class="section sec-page">${storyboardHtml}</div>` : ''}
 <!-- BOTTOM BAR -->
 <div class="bottombar">
   <div style="font-family:'DM Mono',monospace;font-size:7px;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.2);">
     <div style="width:5px;height:5px;border-radius:50%;background:${accent};display:inline-block;margin-right:5px;"></div>
     ${studioName} · bsmnt.co.nz
   </div>
-  <div style="font-family:'DM Mono',monospace;font-size:8px;color:rgba(255,255,255,0.3);">Page 1</div>
+  <div style="font-family:'DM Mono',monospace;font-size:8px;color:rgba(255,255,255,0.3);"></div>
 </div>
 
 <button class="print-btn no-print" onclick="window.print()">⎙ Print / Save PDF</button>
