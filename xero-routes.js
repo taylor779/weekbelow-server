@@ -117,25 +117,55 @@ async function getTenant(access_token) {
   const conns = await r.json();
   return (conns && conns[0]) || null; // { tenantId, tenantName, ... }
 }
-// Return a valid access token for the agency, refreshing if it's within 60s of expiry.
-async function validAccessToken(agency) {
+// Return a valid access token for the agency. Refreshes when the stored token is
+// within 60s of expiry, or unconditionally when opts.forceRefresh is set (used to
+// recover when Xero rejects a token we believed was still valid). If the refresh
+// itself fails (e.g. the refresh token expired after 60 days of inactivity or was
+// revoked) it returns { needsReconnect:true } instead of throwing, so the caller
+// can cleanly ask the client to reconnect rather than surfacing a 500.
+async function validAccessToken(agency, opts) {
+  opts = opts || {};
   const c = await getConnection(agency);
   if (!c) return null;
   const now = Date.now();
-  if (c.expires_at && now < (Number(c.expires_at) - 60000)) {
-    return { access_token: c.access_token, tenant_id: c.tenant_id, org_name: c.org_name };
+  // Robust expiry parse: numeric ms, numeric string, or ISO timestamp.
+  let exp = Number(c.expires_at);
+  if (!isFinite(exp) || exp <= 0) { const p = Date.parse(c.expires_at); exp = isFinite(p) ? p : 0; }
+
+  let access_token = c.access_token;
+  let refresh_token = c.refresh_token;
+  let tenant_id = c.tenant_id;
+  let expires_at = exp;
+
+  if (opts.forceRefresh || !exp || now >= (exp - 60000)) {
+    let t;
+    try {
+      t = await refreshTokens(c.refresh_token);
+    } catch (e) {
+      console.error('[xero] token refresh failed:', e.message);
+      return { needsReconnect: true };
+    }
+    access_token = t.access_token;
+    refresh_token = t.refresh_token || c.refresh_token;
+    expires_at = Date.now() + (t.expires_in * 1000);
+    try {
+      await saveConnection(agency, { access_token, refresh_token, expires_at, tenant_id, org_name: c.org_name });
+    } catch (e) { console.error('[xero] save after refresh failed:', e.message); }
   }
-  // refresh
-  const t = await refreshTokens(c.refresh_token);
-  const expires_at = Date.now() + (t.expires_in * 1000);
-  await saveConnection(agency, {
-    access_token: t.access_token,
-    refresh_token: t.refresh_token || c.refresh_token,
-    expires_at,
-    tenant_id: c.tenant_id,
-    org_name: c.org_name
-  });
-  return { access_token: t.access_token, tenant_id: c.tenant_id, org_name: c.org_name };
+
+  // Backfill a missing tenant id (older/partial connections) so requests don't
+  // fail with AuthenticationUnsuccessful for lack of a Xero-tenant-id header.
+  if (!tenant_id) {
+    try {
+      const tn = await getTenant(access_token);
+      if (tn && tn.tenantId) {
+        tenant_id = tn.tenantId;
+        try { await saveConnection(agency, { access_token, refresh_token, expires_at: expires_at || (Date.now() + 1500000), tenant_id, org_name: c.org_name }); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  return { access_token, tenant_id, org_name: c.org_name };
 }
 
 // ── 1) Start OAuth ───────────────────────────────────────────────────────────
@@ -258,14 +288,40 @@ async function findContactId(auth, name, email) {
   return null;
 }
 
+// True when Xero rejected the request for an authentication reason (so we should
+// refresh the token and retry, or tell the client to reconnect) rather than a
+// data/validation problem.
+function _isXeroAuthError(status, data) {
+  if (status === 401 || status === 403) return true;
+  try {
+    const s = JSON.stringify(data || {}).toLowerCase();
+    return /authenticationunsuccessful|unauthor|tokenexpired|invalid[_ ]?token|not[_ ]?authoris|not[_ ]?authoriz/.test(s);
+  } catch (_) { return false; }
+}
+async function _postXeroInvoice(auth, payload) {
+  const r = await fetch('https://api.xero.com/api.xro/2.0/Invoices', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + auth.access_token,
+      'Xero-tenant-id': auth.tenant_id,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+  const data = await r.json().catch(() => ({}));
+  return { r, data };
+}
+
 // ── 4) Create draft invoice ──────────────────────────────────────────────────
 router.post('/xero/invoice', async (req, res) => {
   try {
     const { agency, invoice } = req.body || {};
     if (!agency || !invoice) return res.status(400).json({ error: 'bad_request' });
 
-    const auth = await validAccessToken(agency);
+    let auth = await validAccessToken(agency);
     if (!auth) return res.status(401).json({ error: 'not_connected' });
+    if (auth.needsReconnect) return res.status(401).json({ error: 'not_connected', message: 'Your Xero connection has expired. Please reconnect.' });
 
     const lineItems = (invoice.lineItems || []).map(li => {
       // Stage header rows: description-only line (no amount/account) -> Xero shows it as a sub-heading.
@@ -303,18 +359,20 @@ router.post('/xero/invoice', async (req, res) => {
       LineItems: lineItems
     }]};
 
-    const r = await fetch('https://api.xero.com/api.xro/2.0/Invoices', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + auth.access_token,
-        'Xero-tenant-id': auth.tenant_id,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-    const data = await r.json().catch(() => ({}));
+    let { r, data } = await _postXeroInvoice(auth, payload);
+    // The stored access token can be rejected even when we believed it valid
+    // (revoked, rotated out by a prior refresh, or clock skew). On an auth
+    // failure, force a fresh token and retry once before giving up.
+    if (!r.ok && _isXeroAuthError(r.status, data)) {
+      auth = await validAccessToken(agency, { forceRefresh: true });
+      if (!auth || auth.needsReconnect) return res.status(401).json({ error: 'not_connected', message: 'Your Xero connection has expired. Please reconnect.' });
+      ({ r, data } = await _postXeroInvoice(auth, payload));
+    }
     if (!r.ok) {
+      if (_isXeroAuthError(r.status, data)) {
+        console.error('[xero/invoice] auth failed after refresh', JSON.stringify(data));
+        return res.status(401).json({ error: 'not_connected', message: 'Xero authentication failed. Please reconnect BSMNT to Xero.' });
+      }
       // Xero nests the useful detail in Elements[].ValidationErrors; the top-level
       // Message is just "A validation exception occurred". Surface the specifics first.
       let msg = '';
