@@ -243,6 +243,158 @@ app.post('/send-runsheet',         handleSendRunsheet);
 app.get('/project-report/:agencyId/:projectId', handleProjectReport);
 app.get('/project-share/:token',        handleGetProjectShare);
 app.post('/project-share/:token/edit',  handleEditProjectShare);
+app.get('/quote/:token',          handleGetQuote);
+app.post('/quote/:token/accept',  handleAcceptQuote);
+app.post('/send-quote',           handleSendQuote);
+
+// ── BSMNT public quote / e-sign page ──────────────────────────────────────────
+// The client opens a share link (?quote=<token>) with no auth and no agency id,
+// so we locate the quote by token across every agency's app_state.brand._quotes
+// (quotes live in brand._quotes, like the equipment library). Mirrors the
+// findProjectByToken / project-share pattern.
+function _quoteEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+async function findQuoteByToken(token) {
+  if (!token || String(token).length < 6) return null;
+  try {
+    const { data: rows, error } = await supabaseAdmin.from('app_state').select('agency_id,brand');
+    if (error || !rows || !rows.length) return null;
+    for (const row of rows) {
+      let brand = row.brand;
+      if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { continue; } }
+      if (!brand || !Array.isArray(brand._quotes)) continue;
+      const quote = brand._quotes.find(q => q && q.acceptToken === token);
+      if (quote) return { quote, agencyId: row.agency_id, brand };
+    }
+  } catch(e) { console.error('[quote] findQuoteByToken error:', e.message); }
+  return null;
+}
+
+// Build the exact client-view shape _renderQuotePage expects. Studio branding
+// mirrors the in-app _quoteStudio() (quoteDetails.fromName, brand.logo, accent).
+function buildQuoteClientView(q, brand) {
+  brand = brand || {};
+  const qd = brand.quoteDetails || {};
+  const gstRate = (typeof q.gstRate === 'number') ? q.gstRate : (parseFloat(q.gstRate) || 0);
+  let subtotal = 0;
+  const stages = (q.stages || []).map(st => ({
+    name: st.name || '',
+    lines: (st.lines || []).map(l => {
+      const qty = parseFloat(l.qty) || 0;
+      const unitPrice = parseFloat(l.unitPrice) || 0;
+      const lineTotal = qty * unitPrice;
+      subtotal += lineTotal;
+      return { desc: l.desc || '', qty: qty, unitPrice: unitPrice, lineTotal: lineTotal };
+    })
+  }));
+  const gst = subtotal * gstRate;
+  return {
+    number: q.number || '', title: q.title || '', date: q.date || '', validUntil: q.validUntil || '',
+    status: q.status || 'sent',
+    client: q.client ? { name: q.client.name || '', company: q.client.company || '' } : {},
+    brand: {
+      name: qd.fromName || brand.appName || 'Studio',
+      logo: brand.logo || '',
+      accent: brand.accentColor || '#7c6fff'
+    },
+    stages: stages,
+    subtotal: subtotal, gst: gst, gstRate: gstRate, total: subtotal + gst,
+    deliverables: Array.isArray(q.deliverables) ? q.deliverables.map(d => ({ name: (d && d.name) || String(d || '') })) : [],
+    deposit: q.deposit || '', paymentTerms: q.paymentTerms || '', terms: q.terms || '', notes: q.notes || '',
+    acceptance: q.acceptance || null
+  };
+}
+
+// GET /quote/:token — public quote view payload.
+async function handleGetQuote(req, res) {
+  try {
+    const found = await findQuoteByToken(req.params.token);
+    if (!found) return res.status(404).json({ error: 'Quote not found' });
+    res.json(buildQuoteClientView(found.quote, found.brand));
+  } catch(e) {
+    console.error('[quote] GET error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+}
+
+// POST /quote/:token/accept — record the client's signature on the quote.
+async function handleAcceptQuote(req, res) {
+  const { name, agree } = req.body || {};
+  try {
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Please type your full name.' });
+    if (!agree) return res.status(400).json({ error: 'Please tick the box to accept.' });
+    const found = await findQuoteByToken(req.params.token);
+    if (!found) return res.status(404).json({ error: 'Quote not found' });
+    // Re-read the current brand fresh, modify only the matching quote, write back
+    // (same read-modify-write the project-share edit endpoint uses).
+    const { data: row } = await supabaseAdmin.from('app_state').select('brand').eq('agency_id', found.agencyId).maybeSingle();
+    let brand = row && row.brand;
+    if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { brand = null; } }
+    if (!brand || !Array.isArray(brand._quotes)) return res.status(404).json({ error: 'Quote not found' });
+    const idx = brand._quotes.findIndex(q => q && q.acceptToken === req.params.token);
+    if (idx === -1) return res.status(404).json({ error: 'Quote not found' });
+    if (brand._quotes[idx].status === 'accepted' && brand._quotes[idx].acceptance) {
+      return res.json({ ok: true, status: 'accepted', acceptance: brand._quotes[idx].acceptance });
+    }
+    const acceptance = {
+      name: String(name).trim(),
+      acceptedAt: new Date().toISOString(),
+      ip: ((req.headers['x-forwarded-for'] || '').split(',')[0] || '').trim() || null
+    };
+    brand._quotes[idx].status = 'accepted';
+    brand._quotes[idx].acceptance = acceptance;
+    const { error: upErr } = await supabaseAdmin.from('app_state').update({ brand }).eq('agency_id', found.agencyId);
+    if (upErr) { console.error('[quote] accept save error:', upErr.message || upErr); return res.status(500).json({ error: 'Could not save your acceptance. Please try again.' }); }
+    // Best-effort: notify the studio.
+    try {
+      const q = brand._quotes[idx];
+      const studioEmail = (brand.quoteDetails && brand.quoteDetails.email) || '';
+      if (studioEmail && RESEND_KEY) {
+        sendEmail({ to: studioEmail,
+          subject: 'Quote ' + (q.number || '') + ' accepted by ' + acceptance.name,
+          html: '<p><strong>' + _quoteEsc(acceptance.name) + '</strong> has approved and signed quote <strong>' + _quoteEsc(q.number || '') + '</strong>' + (q.title ? (' (' + _quoteEsc(q.title) + ')') : '') + '.</p><p style="color:#666;font-size:13px;">Signed ' + new Date(acceptance.acceptedAt).toLocaleString() + '.</p>' });
+      }
+    } catch(e) {}
+    res.json({ ok: true, status: 'accepted', acceptance });
+  } catch(e) {
+    console.error('[quote] accept error:', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+}
+
+// POST /send-quote — email the share link to the client on the quote.
+async function handleSendQuote(req, res) {
+  const { token, link } = req.body || {};
+  try {
+    if (!token || !link) return res.status(400).json({ error: 'token and link required' });
+    const found = await findQuoteByToken(token);
+    if (!found) return res.status(404).json({ error: 'Quote not found' });
+    const q = found.quote;
+    const email = ((q.client && q.client.email) || '').trim();
+    if (!email || email.indexOf('@') < 0) return res.status(400).json({ error: 'No client email on this quote.' });
+    if (!RESEND_KEY) return res.status(200).json({ ok: false, error: 'Email not configured on the server.' });
+    const qd = found.brand.quoteDetails || {};
+    const studio = qd.fromName || found.brand.appName || 'Your studio';
+    const accent = found.brand.accentColor || '#7c6fff';
+    const clientName = (q.client && (q.client.name || q.client.company)) || 'there';
+    const safeLink = _quoteEsc(link);
+    const html = '<!DOCTYPE html><html><head><meta charset="UTF-8"/></head>'
+      + '<body style="margin:0;padding:0;background:#f4f4f6;font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;">'
+      + '<div style="max-width:540px;margin:32px auto;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 2px 14px rgba(0,0,0,0.08);">'
+      + '<div style="background:' + accent + ';padding:22px 28px;color:#fff;font-size:13px;font-weight:600;letter-spacing:1px;text-transform:uppercase;">' + _quoteEsc(studio) + '</div>'
+      + '<div style="padding:28px;">'
+      + '<p style="font-size:15px;color:#222;margin:0 0 14px;">Hi ' + _quoteEsc(clientName) + ',</p>'
+      + '<p style="font-size:15px;color:#444;line-height:1.6;margin:0 0 22px;">' + _quoteEsc(studio) + ' has sent you a quote' + (q.number ? (' (<strong>' + _quoteEsc(q.number) + '</strong>)') : '') + ' to review and approve.</p>'
+      + '<a href="' + safeLink + '" style="display:inline-block;background:' + accent + ';color:#fff;text-decoration:none;font-size:15px;font-weight:700;padding:13px 26px;border-radius:9px;">View &amp; approve quote</a>'
+      + '<p style="font-size:12px;color:#999;line-height:1.6;margin:22px 0 0;">Or paste this link into your browser:<br/>' + safeLink + '</p>'
+      + '</div></div></body></html>';
+    await sendEmail({ to: email, subject: studio + ' sent you a quote' + (q.number ? (' (' + q.number + ')') : ''), html });
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('[quote] send error:', e.message);
+    res.status(500).json({ error: 'Could not send the email.' });
+  }
+}
 
 // ── BSMNT Xero integration (one-click "Send to Xero") ──
 // Adds /xero/connect, /xero/callback, /xero/status, /xero/invoice.
