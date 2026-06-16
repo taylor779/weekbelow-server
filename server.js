@@ -388,7 +388,11 @@ async function handleSendQuote(req, res) {
       + '<a href="' + safeLink + '" style="display:inline-block;background:' + accent + ';color:#fff;text-decoration:none;font-size:15px;font-weight:700;padding:13px 26px;border-radius:9px;">View &amp; approve quote</a>'
       + '<p style="font-size:12px;color:#999;line-height:1.6;margin:22px 0 0;">Or paste this link into your browser:<br/>' + safeLink + '</p>'
       + '</div></div></body></html>';
-    await sendEmail({ to: email, subject: studio + ' sent you a quote' + (q.number ? (' (' + q.number + ')') : ''), html });
+    const sent = await sendEmail({ to: email, subject: studio + ' sent you a quote' + (q.number ? (' (' + q.number + ')') : ''), html });
+    if (sent && sent.ok === false) {
+      const detail = sent.detail ? (' · ' + String(sent.detail).replace(/\s+/g, ' ').slice(0, 200)) : '';
+      return res.status(200).json({ ok: false, error: 'Resend rejected the email (' + (sent.error || 'unknown') + ')' + detail });
+    }
     res.json({ ok: true });
   } catch(e) {
     console.error('[quote] send error:', e.message);
@@ -489,6 +493,25 @@ async function handleSendRunsheet(req, res) {
 
 // ── Friday 3PM recap scheduler ────────────────────────────────────────
 const _sentThisWeek = new Set();
+// Persist recap-sent markers so a restart/redeploy doesn't re-send or skip a week.
+// (Survives restarts when a Railway volume is mounted at RAILWAY_VOLUME_MOUNT_PATH.)
+const RECAP_LOG_FILE = path.join(DATA_DIR, 'recap-sent.json');
+try {
+  if (fs.existsSync(RECAP_LOG_FILE)) {
+    const arr = JSON.parse(fs.readFileSync(RECAP_LOG_FILE, 'utf8'));
+    if (Array.isArray(arr)) arr.forEach(k => _sentThisWeek.add(k));
+    log('💾', `Loaded ${_sentThisWeek.size} recap marker(s)`);
+  }
+} catch (e) { console.error('recap log load failed:', e.message); }
+function _markRecapSent(key) {
+  _sentThisWeek.add(key);
+  try {
+    let keys = Array.from(_sentThisWeek);
+    if (keys.length > 200) { keys = keys.slice(-200); _sentThisWeek.clear(); keys.forEach(k => _sentThisWeek.add(k)); }
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(RECAP_LOG_FILE, JSON.stringify(keys));
+  } catch (e) { console.error('recap log save failed:', e.message); }
+}
 
 function _getWeekKey() {
   const now = new Date();
@@ -536,16 +559,17 @@ function scheduleFridayRecaps() {
           const userNow = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
           const dayOfWeek = userNow.getDay();
           const hour = userNow.getHours();
-          const minute = userNow.getMinutes();
-          if (dayOfWeek === 5 && hour === 15 && minute < 5) {
+          // Fire any time from 3PM Friday onward, so a restart/redeploy near 3PM
+          // still catches the week. The persisted marker prevents a re-send.
+          if (dayOfWeek === 5 && hour >= 15) {
             const weekKey = 'recap_' + state.agency_id + '_' + user.id + '_' + _getWeekKey();
             if (_sentThisWeek.has(weekKey)) continue;
-            _sentThisWeek.add(weekKey);
             const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', state.agency_id).maybeSingle();
             if (agData) {
               const recapData = _buildUserRecap(user, agData);
-              await sendEmail(await weeklyEmail(user, {...recapData, agencyId: state.agency_id}));
-              log('📬', `Friday recap sent to ${user.email} (${tz})`);
+              const r = await sendEmail(await weeklyEmail(user, {...recapData, agencyId: state.agency_id}));
+              _markRecapSent(weekKey);
+              log('📬', `Friday recap → ${user.email} (${tz})${r && r.ok === false ? ' [FAILED: ' + (r.error || '') + ']' : ''}`);
             }
           }
         }
@@ -2550,7 +2574,9 @@ function assignmentEmail(user, project, byName, logoHtml) {
   };
 }
 
-// ── Weekly recap ──────────────────────────────────────────────────────────────
+// ── Weekly recap (DEPRECATED · single-tenant) ───────────────────────────────────
+// Superseded by scheduleFridayRecaps() (multi-tenant, above). No longer scheduled
+// or triggered anywhere — kept for reference only and safe to delete.
 
 function msUntilNextMondayNZT() {
   const NZT = 12 * 3600000;
@@ -2725,10 +2751,25 @@ wss.on('connection', socket => {
       }
 
       case 'send_recap_now': {
-        log('✉', `Manual recap by ${msg.userName||'?'}`);
-        const withEmail=(appState.users||[]).filter(u=>u.active!==false&&u.email&&u.email.includes('@'));
-        try { sendWeeklyRecaps(); socket.send(JSON.stringify({type:'recap_result',ok:true,count:withEmail.length})); }
-        catch(e) { socket.send(JSON.stringify({type:'recap_result',ok:false,error:e.message})); }
+        log('✉', `Manual recap by ${msg.userName||'?'} (agency ${msg.agencyId})`);
+        (async () => {
+          try {
+            if (!supabaseAdmin) throw new Error('Supabase not configured on the server.');
+            const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', msg.agencyId).maybeSingle();
+            const users = (agData && agData.users) || [];
+            let sent = 0, fails = 0;
+            for (const user of users) {
+              if (!user.email || !user.email.includes('@') || user.active === false) continue;
+              const recapData = _buildUserRecap(user, agData);
+              const r = await sendEmail(await weeklyEmail(user, {...recapData, agencyId: msg.agencyId}));
+              if (r && r.ok === false) fails++; else sent++;
+            }
+            socket.send(JSON.stringify({ type:'recap_result', ok: fails === 0, count: sent, sent, fails,
+              error: fails ? (sent + ' sent, ' + fails + ' failed · check the bsmnt.co.nz domain in Resend') : null }));
+          } catch(e) {
+            socket.send(JSON.stringify({ type:'recap_result', ok:false, error:e.message }));
+          }
+        })();
         break;
       }
 
@@ -3176,4 +3217,7 @@ httpServer.listen(PORT, () => {
   console.log('');
 });
 
-scheduleWeeklyRecap();
+// Daily retainer-spawn check. Bootstrapped directly here — it used to be nested
+// inside the (now-retired) Monday recap timer, which delayed it until the first
+// Monday after boot. Weekly recaps run via scheduleFridayRecaps() (multi-tenant).
+scheduleRetainerCheck();
