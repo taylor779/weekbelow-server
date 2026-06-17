@@ -345,9 +345,22 @@ async function handleAcceptQuote(req, res) {
     brand._quotes[idx].acceptance = acceptance;
     const { error: upErr } = await supabaseAdmin.from('app_state').update({ brand }).eq('agency_id', found.agencyId);
     if (upErr) { console.error('[quote] accept save error:', upErr.message || upErr); return res.status(500).json({ error: 'Could not save your acceptance. Please try again.' }); }
-    // Best-effort: notify the studio.
+    const q = brand._quotes[idx];
+    // 1) Live-update any open studio app (broadcast is global, so tag the agency
+    //    and let each client filter on agencyId).
     try {
-      const q = brand._quotes[idx];
+      broadcast({ type: 'quote_accepted', agencyId: found.agencyId, quoteId: q.id,
+        acceptToken: req.params.token, number: q.number || '', title: q.title || '',
+        clientName: acceptance.name, acceptedAt: acceptance.acceptedAt });
+    } catch(e) {}
+    // 2) Push the studio's admins (app notification).
+    try {
+      pushToAdmins(found.agencyId, 'pushQuoteAccepted', 'Quote accepted \u2713',
+        acceptance.name + ' approved quote ' + (q.number || ''),
+        { kind: 'quote_accepted', quoteId: q.id }).catch(function(){});
+    } catch(e) {}
+    // 3) Email the studio (best-effort).
+    try {
       const studioEmail = (brand.quoteDetails && brand.quoteDetails.email) || '';
       if (studioEmail && RESEND_KEY) {
         sendEmail({ to: studioEmail,
