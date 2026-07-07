@@ -231,6 +231,7 @@ app.post('/set-member-active',    handleSetMemberActive);
 app.post('/append-time-log',      handleAppendTimeLog);
 app.post('/notify-deliverable-comment', handleNotifyDeliverableComment);
 app.post('/notify/project-created',  handleNotifyProjectCreated);
+app.post('/notify/new-brief',        handleNotifyNewBrief);
 app.post('/notify/project-assigned', handleNotifyProjectAssigned);
 app.post('/notify/timer-event',     handleNotifyTimerEvent);
 app.post('/push/register-token',  handleRegisterPushToken);
@@ -1199,6 +1200,86 @@ async function handleSubmitBrief(req, res) {
   } catch(e) {
     console.error('[submit-brief] error:', e.message);
     res.status(500).json({ error: e.message });
+  }
+}
+
+// ── Notify studio of a new client brief ───────────────────────────────────────
+// Called by the rebuilt brief.html AFTER it has already inserted the brief into
+// client_briefs. This endpoint only sends the internal heads-up email to the
+// studio's admins + managers; the brief is already saved, so any failure here is
+// logged and swallowed (always returns 200 so the client never sees an error and
+// the success screen isn't blocked). Payload is the flat summary that brief.html
+// POSTs: { agency_id, name, company, email, phone, project_type, budget,
+//          description, submitted_at }.
+async function handleNotifyNewBrief(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const b = req.body || {};
+  const agencyId = b.agency_id;
+  if (!agencyId) return res.status(400).json({ ok: false, error: 'agency_id required' });
+
+  try {
+    // Recipients: admins + managers of this studio. Brand for studio name/accent.
+    const [{ data: members }, { data: state }] = await Promise.all([
+      supabaseAdmin.from('agency_members').select('name,email,role').eq('agency_id', agencyId),
+      supabaseAdmin.from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle(),
+    ]);
+    const admins = (members || []).filter(m => ['admin','manager'].includes(m.role) && m.email && m.email.includes('@'));
+    if (!admins.length) {
+      log('📋', `[new-brief] no admin/manager recipients for agency ${agencyId}`);
+      return res.json({ ok: true, sent: 0, note: 'no recipients' });
+    }
+
+    const brand = state?.brand || {};
+    const studioName = brand.appName || brand.name || 'BSMNT';
+    const accent = brand.accentColor || '#7c6fff';
+
+    const esc = (s) => String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const row = (label, val) => val
+      ? `<tr><td style="padding:5px 0;font-size:11px;font-family:monospace;letter-spacing:1px;text-transform:uppercase;color:#666;width:130px;vertical-align:top;">${label}</td><td style="padding:5px 0;font-size:13px;color:#111;white-space:pre-wrap;">${esc(val)}</td></tr>`
+      : '';
+
+    const clientName = b.name || 'A client';
+    const contact = `${b.email ? `<a href="mailto:${esc(b.email)}" style="color:${accent};">${esc(b.email)}</a>` : ''}${b.phone ? ' · ' + esc(b.phone) : ''}`;
+
+    const html = `
+      <div style="background:#f5f5f3;padding:32px 16px;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+        <div style="max-width:560px;margin:0 auto;">
+          <div style="background:#111;border-radius:10px 10px 0 0;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;">
+            <span style="font-family:monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.4);">${esc(studioName)}</span>
+            <span style="font-family:monospace;font-size:9px;color:rgba(255,255,255,0.3);">NEW CLIENT BRIEF</span>
+          </div>
+          <div style="background:#fff;border-radius:0 0 10px 10px;overflow:hidden;">
+            <div style="padding:24px;border-bottom:1px solid #eee;">
+              <div style="font-size:10px;font-family:monospace;letter-spacing:2px;text-transform:uppercase;color:${accent};margin-bottom:8px;">New Brief Received</div>
+              <div style="font-size:22px;font-weight:700;color:#111;letter-spacing:-0.3px;">${esc(clientName)}${b.company ? ' · ' + esc(b.company) : ''}</div>
+              ${contact ? `<div style="font-size:13px;color:#888;margin-top:4px;">${contact}</div>` : ''}
+            </div>
+            <div style="padding:24px;border-bottom:1px solid #eee;">
+              <div style="font-size:10px;font-family:monospace;letter-spacing:2px;text-transform:uppercase;color:#999;margin-bottom:14px;">Project Details</div>
+              <table style="width:100%;border-collapse:collapse;">
+                ${row('Project type', b.project_type)}
+                ${row('Budget', b.budget)}
+                ${row('The brief', b.description)}
+              </table>
+            </div>
+            <div style="padding:20px 24px;background:#fafafa;text-align:center;">
+              <a href="https://bsmnt.co.nz/app" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;">Open the full brief in BSMNT →</a>
+            </div>
+          </div>
+          <div style="text-align:center;margin-top:16px;font-size:11px;color:#aaa;font-family:monospace;">Sent via BSMNT · bsmnt.co.nz</div>
+        </div>
+      </div>`;
+
+    const subject = `New brief from ${clientName}${b.company ? ' (' + b.company + ')' : ''} — ${b.project_type || 'Video Project'}`;
+    const results = await Promise.all(admins.map(a => sendEmail({ to: a.email, subject, html })));
+    const sent = results.filter(r => !r || r.ok !== false).length;
+
+    log('📋', `[new-brief] emailed ${sent}/${admins.length} admin(s) for agency ${agencyId} · ${clientName}`);
+    res.json({ ok: true, sent });
+  } catch(e) {
+    console.error('[new-brief] error:', e.message);
+    res.json({ ok: false, error: 'send failed' }); // 200 — never break the client submit flow
   }
 }
 
