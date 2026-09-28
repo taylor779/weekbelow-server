@@ -106,7 +106,9 @@ function supaRest(method, table, params, body, extraHeaders) {
 function _makeSupaQuery(table) {
   const s = { table, filters: [], cols: '*', limitN: null, orderBy: null, body: null, method: 'GET', upsertConflict: null };
   const q = {
-    select(cols) { s.cols = cols || '*'; s.method = 'GET'; return q; },
+    // After insert/update/upsert, .select() (supabase-js style) must keep the
+    // write: rows come back via Prefer return=representation.
+    select(cols) { s.cols = cols || '*'; if (s.body == null && s.method !== 'DELETE') s.method = 'GET'; return q; },
     eq(col, val) { s.filters.push(`${col}=eq.${encodeURIComponent(val)}`); return q; },
     in(col, vals) { s.filters.push(`${col}=in.(${vals.map(v => encodeURIComponent(v)).join(',')})`); return q; },
     order(col, opts) { s.orderBy = `${col}.${(opts && opts.ascending === false) ? 'desc' : 'asc'}`; return q; },
@@ -390,6 +392,19 @@ async function handleAccountDelete(req, res) {
     log('❌', `account/delete failed for ${uidLog}: ${e && (e.code || e.status || '')} ${e && e.message ? e.message.slice(0, 120) : ''}`);
     res.status(500).json({ error: 'Account deletion failed. Please try again or email support@below.co.nz.' });
   }
+}
+
+// ── Overnight prospect hunter (opt-in) ───────────────────────────────────────
+// Off unless PROSPECT_HUNTER=on, so a deploy never starts paid Claude calls by
+// surprise. Uses this server's service-key REST client (no supabase-js dep).
+if (String(process.env.PROSPECT_HUNTER || '').toLowerCase() === 'on') {
+  if (!supabaseAdmin) log('⚠', 'PROSPECT_HUNTER=on but Supabase is not configured; hunter not started');
+  else {
+    try { require('./prospect-hunter').start({ db: supabaseAdmin }); }
+    catch (e) { log('⚠', 'prospect hunter failed to start: ' + e.message); }
+  }
+} else {
+  log('🔎', 'Prospect hunter off (set PROSPECT_HUNTER=on to enable)');
 }
 
 // ── BSMNT public quote / e-sign page ──────────────────────────────────────────

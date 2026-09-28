@@ -13,16 +13,15 @@
 // THE SERVER NEVER WRITES TO app_state. Reading brand (settings/exclusions)
 // is safe; writing would race the client's whole-column brand saves.
 //
-// WIRE-UP · add ONE line near the bottom of server.js:
-//     require('./prospect-hunter').start();
-// Uses the same env vars the rest of the server uses:
-//     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-// (If your service key env var has a different name, pass it in:
-//     require('./prospect-hunter').start({ serviceRoleKey: process.env.YOUR_VAR });)
-// Node 18+ (global fetch). Requires @supabase/supabase-js (already a dep).
+// WIRE-UP · server.js starts it only when env PROSPECT_HUNTER=on, passing its
+// own service-key REST client so no extra dependency is needed:
+//     require('./prospect-hunter').start({ db: supabaseAdmin });
+// Without opts.db it falls back to @supabase/supabase-js (NOT in package.json,
+// loaded lazily so requiring this file never crashes the server) with
+//     SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SERVICE_KEY)
+// Node 18+ (global fetch).
 // ═══════════════════════════════════════════════════════════════════════════
 
-const { createClient } = require('@supabase/supabase-js');
 
 const CHECK_EVERY_MS = 30 * 60 * 1000;      // look for due hunts every 30 min
 const RESEARCH_GAP_MS = 2500;               // politeness gap between research calls
@@ -35,12 +34,21 @@ const SECTOR_NAMES = {
   sport: 'Sport & Fitness', events: 'Events & Live', nonprofit: 'Purpose & NGO'
 };
 
+let _started = false;
 function start(opts) {
   opts = opts || {};
-  const url = opts.supabaseUrl || process.env.SUPABASE_URL;
-  const key = opts.serviceRoleKey || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) { console.error('[hunter] missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY \u00b7 hunter disabled'); return; }
-  const db = createClient(url, key, { auth: { persistSession: false } });
+  if (_started) return;
+  let db = opts.db || null;
+  if (!db) {
+    const url = opts.supabaseUrl || process.env.SUPABASE_URL;
+    const key = opts.serviceRoleKey || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) { console.error('[hunter] missing SUPABASE_URL / service key \u00b7 hunter disabled'); return; }
+    let createClient;
+    try { createClient = require('@supabase/supabase-js').createClient; }
+    catch (e) { console.error('[hunter] no db passed and @supabase/supabase-js not installed \u00b7 hunter disabled'); return; }
+    db = createClient(url, key, { auth: { persistSession: false } });
+  }
+  _started = true;
   console.log('[hunter] prospect hunter armed \u00b7 checking every ' + (CHECK_EVERY_MS / 60000) + ' min');
   setTimeout(function () { tick(db).catch(function (e) { console.error('[hunter] tick:', e.message); }); }, 60 * 1000);
   setInterval(function () { tick(db).catch(function (e) { console.error('[hunter] tick:', e.message); }); }, CHECK_EVERY_MS);

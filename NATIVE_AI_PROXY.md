@@ -328,3 +328,38 @@ preference-gated and still sends.
 member, then trigger `/notify/project-assigned` for them. No push arrives, and `sendPushToUser` is
 never reached for them. Set `focusModeUntil` in the past and repeat. The push arrives.
 
+### 5. Prospect hunter wired in, behind `PROSPECT_HUNTER=on`
+
+**What was wrong:** `server.js` never called `require('./prospect-hunter').start()`.
+`prospect-hunter.js` also did a top-level `require('@supabase/supabase-js')`. That package is **not**
+in `package.json`, so wiring it in as its header said would have crashed the server on boot. It also
+read `SUPABASE_SERVICE_ROLE_KEY`, while this server uses `SUPABASE_SERVICE_KEY`.
+
+**Fix:**
+- `server.js` calls `require('./prospect-hunter').start({ db: supabaseAdmin })` **only when
+  `PROSPECT_HUNTER=on`**. It reuses the server's own service-key REST client. Otherwise it logs
+  "Prospect hunter off" at boot.
+- `prospect-hunter.js` accepts `opts.db`. It loads supabase-js lazily, only when no db is passed and
+  only if the package is installed, and it also accepts `SUPABASE_SERVICE_KEY`. It is guarded
+  against starting twice.
+- The REST shim's `.select()` no longer turns a pending `insert`/`update`/`upsert` into a GET. The
+  hunter uses the supabase-js `insert(...).select('id')` pattern to claim runs. No existing server
+  code chained `.select()` after a write.
+
+**Behaviour when on:**
+- Every 30 minutes the hunter checks agencies that have
+  `brand._prospectMeta.settings.serverHunt` switched on.
+- It calls Claude with the **agency's own** `agency_settings.anthropic_key`, and skips the agency if
+  there is none.
+- It writes results to `prospect_staging`.
+
+| Env var | Values |
+|---|---|
+| `PROSPECT_HUNTER` | `on` starts the hunter. Anything else, or unset, leaves it off. The default is off. |
+
+**Verify:**
+1. With the var unset, the boot log shows `Prospect hunter off`.
+2. With `PROSPECT_HUNTER=on`, the boot log shows `[hunter] prospect hunter armed · checking every 30 min`.
+3. About 60 s later, an agency that is due and has `serverHunt` and a key gets a `kind='run'` row in
+   `prospect_staging`.
+
