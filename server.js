@@ -677,28 +677,77 @@ function _getWeekKey() {
   return now.getFullYear() + '_w' + Math.ceil(((now - jan1) / 86400000 + jan1.getDay() + 1) / 7);
 }
 
-function _buildUserRecap(user, state) {
-  const projects = state.projects || [];
+// Weekly-recap recipients for an agency, read from agency_members (app_state has
+// no `users` column; the old code read app_state.users and sent nothing).
+// Active members with an email whose weekly-email preference is on. Preference
+// precedence matches the web: preferences.emailWeekly, then the legacy
+// email_weekly column, default on.
+async function _recapRecipients(agencyId) {
+  if (!supabaseAdmin || !agencyId) return [];
+  const { data, error } = await supabaseAdmin.from('agency_members')
+    .select('*').eq('agency_id', String(agencyId));
+  if (error) { log('⚠', 'recap recipients: ' + error.message); return []; }
+  return (data || []).filter(m => {
+    if (!m || m.active === false) return false;
+    if (!m.email || !String(m.email).includes('@')) return false;
+    const p = m.preferences || {};
+    const weekly = (p.emailWeekly !== undefined && p.emailWeekly !== null) ? p.emailWeekly
+                 : (m.email_weekly !== undefined && m.email_weekly !== null) ? m.email_weekly : true;
+    return weekly !== false;
+  });
+}
+
+function _buildUserRecap(user, state, members) {
+  const projects = Array.isArray(state.projects) ? state.projects : [];
+  const clients = Array.isArray(state.clients) ? state.clients : [];
+  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
   const now = new Date();
   const weekAgo = new Date(now - 7 * 86400000);
-  const myProjects = projects.filter(p => {
+  const nextWeek = new Date(now.getTime() + 7 * 86400000);
+  const uid = String(user.id);
+  const rateOf = (id) => {
+    const m = (members || []).find(x => String(x.id) === String(id));
+    return m ? (Number(m.charge_rate != null ? m.charge_rate : m.chargeRate) || 0) : 0;
+  };
+  const budgetPct = (p) => {
+    const entries = (p.budgetEntries || []).reduce((s, e) => s + (e.amount || 0), 0);
+    const billed = (p.timeLog || []).reduce((s, l) => s + (l.hours || 0) * rateOf(l.user), 0);
+    const total = billed + (p.hardCosts || 0) + entries;
+    return p.budget > 0 ? Math.round(total / p.budget * 100) : 0;
+  };
+  const mine = projects.filter(p => {
+    if (p.status === 'done') return false;
+    if ((p.assigned || []).map(String).includes(uid)) return true;
     const ws = (state.wbState || {})[p.id] || {};
-    return String(ws.userId) === String(user.id) || (ws.split || []).map(String).includes(String(user.id));
+    return String(ws.userId) === uid || (ws.split || []).map(String).includes(uid);
   });
-  const completedThisWeek = projects.filter(p => p.status === 'done' && p.endDate && new Date(p.endDate) >= weekAgo);
-  const hoursLastWeek = (state.projects || []).flatMap(p => p.timeLog || [])
-    .filter(l => String(l.user) === String(user.id) && new Date(l.date) >= weekAgo)
-    .reduce((s, l) => s + l.hours, 0);
-  const dueItems = myProjects.filter(p => {
-    if (!p.endDate || p.status === 'done') return false;
+  const myProjects = mine.map(p => {
+    const cl = clients.find(c => String(c.id) === String(p.clientId));
+    return { name: p.name, client: cl ? cl.name : (p.client || ''), endDate: p.endDate, budgetPct: budgetPct(p) };
+  });
+  const completedThisWeek = tasks.filter(t => t.done && t.completedAt && new Date(t.completedAt) >= weekAgo).length;
+  const hoursLastWeek = projects.flatMap(p => p.timeLog || [])
+    .filter(l => String(l.user) === uid && new Date(l.date) >= weekAgo)
+    .reduce((s, l) => s + (l.hours || 0), 0);
+  const dueItems = [], overdueItems = [];
+  mine.forEach(p => {
+    if (!p.endDate) return;
     const d = new Date(p.endDate + 'T23:59:59');
-    return d >= now && d <= new Date(now.getTime() + 7 * 86400000);
-  });
-  const overdueItems = myProjects.filter(p => {
-    if (!p.endDate || p.status === 'done') return false;
-    return new Date(p.endDate + 'T23:59:59') < now;
+    if (d < now) overdueItems.push({ name: p.name, type: 'project', overdue: true, dueLabel: p.endDate });
+    else if (d <= nextWeek) {
+      const diff = Math.ceil((d - now) / 86400000);
+      dueItems.push({ name: p.name, type: 'project', overdue: false, dueLabel: diff === 0 ? 'today' : diff === 1 ? 'tomorrow' : `in ${diff} days` });
+    }
   });
   return { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems };
+}
+
+// Build + send one member's recap. weeklyEmail() returns { subject, html } only,
+// so the recipient must be added here (it was missing, so nothing was sent).
+async function _sendMemberRecap(user, agData, members, agencyId) {
+  const recap = _buildUserRecap(user, agData, members);
+  const mail = await weeklyEmail(user, { ...recap, agencyId });
+  return sendEmail({ ...mail, to: user.email });
 }
 
 function scheduleFridayRecaps() {
@@ -707,12 +756,8 @@ function scheduleFridayRecaps() {
       const { data: states } = await supabaseAdmin.from('app_state').select('agency_id,brand');
       if (!states || !Array.isArray(states)) return;
       for (const state of states) {
-        const { data: members } = await supabaseAdmin.from('agency_members')
-          .select('id,name,email,active,role').eq('agency_id', state.agency_id).eq('active', true);
-        const users = members || [];
+        const users = await _recapRecipients(state.agency_id);
         for (const user of users) {
-          if (!user.email || !user.email.includes('@')) continue;
-          if (user.active === false) continue;
           const tz = state.brand?.timezone || 'Pacific/Auckland';
           const userNow = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
           const dayOfWeek = userNow.getDay();
@@ -724,10 +769,9 @@ function scheduleFridayRecaps() {
             if (_sentThisWeek.has(weekKey)) continue;
             const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', state.agency_id).maybeSingle();
             if (agData) {
-              const recapData = _buildUserRecap(user, agData);
-              const r = await sendEmail(await weeklyEmail(user, {...recapData, agencyId: state.agency_id}));
+              const r = await _sendMemberRecap(user, agData, users, state.agency_id);
               _markRecapSent(weekKey);
-              log('📬', `Friday recap → ${user.email} (${tz})${r && r.ok === false ? ' [FAILED: ' + (r.error || '') + ']' : ''}`);
+              log('📬', `Friday recap → member ${String(user.id).slice(0, 8)} (${tz})${r && r.ok === false ? ' [FAILED: ' + (r.error || '') + ']' : ''}`);
             }
           }
         }
@@ -1006,13 +1050,11 @@ async function handleSendRecapNow(req, res) {
       .from('app_state').select('*').eq('agency_id', agencyId).maybeSingle();
     if (!agData) return res.status(404).json({ error: 'Agency not found' });
 
-    const users = agData.users || [];
+    const users = await _recapRecipients(agencyId);
     let sent = 0;
     for (const user of users) {
-      if (!user.email || !user.email.includes('@') || user.active === false) continue;
-      const recapData = _buildUserRecap(user, agData);
-      await sendEmail(await weeklyEmail(user, {...recapData, agencyId: agencyId}));
-      sent++;
+      const r = await _sendMemberRecap(user, agData, users, agencyId);
+      if (!(r && r.ok === false)) sent++;
     }
     log('📬', `Manual recap sent to ${sent} users in agency ${agencyId}`);
     res.json({ ok: true, sent });
@@ -2802,12 +2844,13 @@ function wrap(body, logoHtml) {
 async function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek, dueItems, overdueItems, agencyId }) {
   const _wLogo = agencyId ? await getAgencyLogoHtml(agencyId) : null;
   const dateLabel = new Date().toLocaleDateString('en-NZ', { day:'numeric', month:'long', year:'numeric' });
-  const firstName = user.name.split(' ')[0];
+  const firstName = String(user.name || 'there').split(' ')[0];
+  if (Array.isArray(completedThisWeek)) completedThisWeek = completedThisWeek.length;
   const projRows = myProjects.map(p => {
     const cls = p.budgetPct < 70 ? 'ok' : p.budgetPct < 100 ? 'warn' : 'over';
     const label = p.budgetPct < 70 ? 'On track' : p.budgetPct < 100 ? 'Watch budget' : 'Over budget';
     const dueFmt = p.endDate ? new Date(p.endDate+'T12:00:00').toLocaleDateString('en-NZ',{day:'numeric',month:'short'}) : null;
-    return `<div class="prow"><div><div class="pname">${p.name}</div><div class="pmeta">${p.client}${dueFmt?' · Due '+dueFmt:''}</div></div><span class="badge ${cls}">${label}</span></div>`;
+    return `<div class="prow"><div><div class="pname">${p.name}</div><div class="pmeta">${p.client || ''}${dueFmt?' · Due '+dueFmt:''}</div></div><span class="badge ${cls}">${label}</span></div>`;
   }).join('') || '<p style="font-size:13px;color:#55556a;padding:8px 0;">No active projects assigned to you.</p>';
   const allDue = [...overdueItems, ...dueItems];
   const dueRows = allDue.map(d => {
@@ -3024,12 +3067,11 @@ wss.on('connection', socket => {
           try {
             if (!supabaseAdmin) throw new Error('Supabase not configured on the server.');
             const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', msg.agencyId).maybeSingle();
-            const users = (agData && agData.users) || [];
+            if (!agData) throw new Error('Agency not found.');
+            const users = await _recapRecipients(msg.agencyId);
             let sent = 0, fails = 0;
             for (const user of users) {
-              if (!user.email || !user.email.includes('@') || user.active === false) continue;
-              const recapData = _buildUserRecap(user, agData);
-              const r = await sendEmail(await weeklyEmail(user, {...recapData, agencyId: msg.agencyId}));
+              const r = await _sendMemberRecap(user, agData, users, msg.agencyId);
               if (r && r.ok === false) fails++; else sent++;
             }
             socket.send(JSON.stringify({ type:'recap_result', ok: fails === 0, count: sent, sent, fails,

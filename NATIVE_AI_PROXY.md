@@ -273,3 +273,41 @@ id in the body.
    `active = false`.
 3. As the sole admin of a studio that has another active member, expect `409`.
 
+### 3. Weekly recap recipients now come from `agency_members`
+
+**Bug:**
+- `POST /send-recap` and the websocket `send_recap_now` message, the manual recaps, read
+  `app_state.users`. That column does not exist, so they always sent 0 emails.
+- The Friday 3pm recap cron already read `agency_members`, but it ignored the `emailWeekly` opt-out.
+- It also never passed `to` to `sendEmail`, because `weeklyEmail()` returns only `{subject, html}`,
+  so no recap was ever delivered.
+- `_buildUserRecap` returned shapes the template could not render: an array for "tasks done",
+  projects without `client` or `budgetPct`, and due items without labels.
+
+**Fix:**
+- `_recapRecipients(agencyId)` selects `agency_members` for the agency and keeps rows that are
+  active, have an email, and have the weekly email switched on. The weekly check uses
+  `preferences.emailWeekly`, then the legacy `email_weekly` column, and defaults to on, which is the
+  same order the web uses.
+- The Friday cron, `/send-recap` and `send_recap_now` all use it, and they send through
+  `_sendMemberRecap`, which sets `to`.
+- `_buildUserRecap` now matches projects by `assigned` (member ids) as well as the legacy `wbState`.
+  It computes the budget % from member `charge_rate` and returns template-ready rows.
+- Cron logs now carry a member id prefix, not the email.
+
+**Other crons checked:**
+- The 8:45am "track your time" push (`pushForgotToTrack`) and the 2h long-timer push already read
+  `agency_members`, so they are fine.
+- There is **no server-side "daily summary at 5pm" cron**. The web shows a `pushDailySummary`
+  toggle, but nothing sends it.
+- The Monday `sendWeeklyRecaps`/`scheduleWeeklyRecap` still reads the in-memory legacy `appState.users`.
+  It is dead code: `scheduleWeeklyRecap()` is never called. It was left alone.
+
+**Verify:**
+1. Call `/send-recap` as the admin:
+   ```sh
+   curl -s -X POST $RAILWAY_URL/send-recap -H 'Content-Type: application/json' -d '{"agencyId":"<id>","adminEmail":"<ADMIN_EMAIL>"}'
+   ```
+   Expect `{"ok":true,"sent":N}` with N > 0, and the email arrives.
+2. Set `preferences.emailWeekly=false` on one member, call it again, and expect N to drop by one.
+
