@@ -7,8 +7,9 @@
  *
  * Railway env vars:
  *   RESEND_API_KEY        — Resend API key
- *   STRIPE_SECRET_KEY     — Stripe secret key
- *   STRIPE_WEBHOOK_SECRET — Stripe webhook signing secret
+ *   BILLING_ENABLED       — 'true' re-enables the archived Stripe billing routes (default off)
+ *   STRIPE_SECRET_KEY     — Stripe secret key (only used when BILLING_ENABLED=true)
+ *   STRIPE_WEBHOOK_SECRET — Stripe webhook signing secret (only used when BILLING_ENABLED=true)
  *   GEMINI_API_KEY        — Platform Gemini key (never sent to client)
  *   ANTHROPIC_API_KEY     — Platform Anthropic key for /ai/claude (never sent to client)
  *   SUPABASE_URL          — https://fdjnzzrrodrjkngqzewy.supabase.co
@@ -30,11 +31,37 @@ let apn = null;
 try { apn = require('@parse/node-apn'); }
 catch(e) { /* package not installed — push will be a no-op until npm i @parse/node-apn */ }
 
-// ── Stripe (token payments) ──────────────────────────────────────────────────
+// ── Stripe (token payments) — ARCHIVED ───────────────────────────────────────
+// Billing (Stripe checkout, subscriptions, token purchases, plan tiers) is
+// archived: the product is no longer subscription-gated. Every billing route
+// is still registered and all the code below is intact, but while
+// BILLING_ENABLED is not 'true' the routes answer 410 { error: 'Billing is archived' }
+// (the Stripe webhook answers 200 and does nothing, so Stripe stops retrying).
+//
+// To re-enable billing:
+//   1. Set BILLING_ENABLED=true plus STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET and
+//      STRIPE_PRICE_SOLO / _STUDIO / _AGENCY in Railway.
+//   2. Re-enable the webhook endpoint in the Stripe dashboard.
+//   3. Token/plan gating on /generate-image and /ai/claude was removed separately
+//      (see git history for the commit that archived billing) and would need
+//      restoring if tokens should be charged again.
+const BILLING_ENABLED = process.env.BILLING_ENABLED === 'true';
 const Stripe = require('stripe');
 
-const stripe = process.env.STRIPE_SECRET_KEY
+const stripe = BILLING_ENABLED && process.env.STRIPE_SECRET_KEY
   ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+// Gate for archived billing routes.
+function billingGate(req, res, next) {
+  if (BILLING_ENABLED) return next();
+  return res.status(410).json({ error: 'Billing is archived' });
+}
+// Webhook variant: acknowledge with 200 so Stripe doesn't retry for days and
+// then flag the endpoint as failing. Nothing is verified or processed.
+function billingWebhookGate(req, res, next) {
+  if (BILLING_ENABLED) return next();
+  return res.status(200).json({ received: true, archived: true });
+}
 
 // ── Supabase REST helper (no SDK — works on any Node version) ─────────────────
 const SUPA_URL = process.env.SUPABASE_URL || '';
@@ -245,7 +272,7 @@ const express = require('express');
 const app = express();
 
 // Stripe webhook MUST use raw body — register BEFORE express.json()
-app.post('/stripe-webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+app.post('/stripe-webhook', billingWebhookGate, express.raw({ type: 'application/json' }), handleStripeWebhook);
 
 app.use(express.json({ limit: '20mb' }));
 
@@ -261,10 +288,11 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => res.send('BSMNT OK'));
-app.post('/create-checkout',      handleCreateCheckout);
-app.post('/create-subscription',  handleCreateSubscription);
-app.get('/customer-portal',       handleCustomerPortal);
-app.post('/cancel-subscription',  handleCancelSubscription);
+// Billing routes are archived (410 unless BILLING_ENABLED=true) — see top of file.
+app.post('/create-checkout',      billingGate, handleCreateCheckout);
+app.post('/create-subscription',  billingGate, handleCreateSubscription);
+app.get('/customer-portal',       billingGate, handleCustomerPortal);
+app.post('/cancel-subscription',  billingGate, handleCancelSubscription);
 app.post('/generate-image',       softAuth, handleGenerateImage);
 app.post('/briefing',             handleBriefing);
 app.get('/agency-brand/:agencyId', handleAgencyBrand);
@@ -276,7 +304,7 @@ app.post('/accept-project-invite',handleAcceptProjectInvite);
 app.get('/project-invites/:email', handleGetProjectInvites);
 app.get('/project-invites/id/:inviteId', handleGetInviteById);
 app.get('/check-member-invite/:email', handleCheckMemberInvite);
-app.post('/gift-tokens-email',    handleGiftTokensEmail);
+app.post('/gift-tokens-email',    billingGate, handleGiftTokensEmail); // archived with billing (token economy)
 app.post('/bulk-email',           handleBulkEmail);
 app.post('/save-user-pref',       handleSaveUserPref);
 app.post('/link-preview',         handleLinkPreview);
@@ -1249,9 +1277,9 @@ async function handleGenerateImage(req, res) {
   try {
     const { prompt, agencyId, refImages, refImageData } = req.body;
     if (!prompt || !agencyId) return res.status(400).json({ error: 'prompt and agencyId required' });
-    // Authenticated callers (native app, and web once it sends tokens) must be
-    // an active member of the agency they are spending tokens for. Calls with no
-    // valid token keep today's behaviour until the web app sends auth headers.
+    // Authenticated callers (native app, and web once it sends bearer tokens)
+    // must be an active member of the agency. With billing archived they are
+    // never charged studio tokens and never refused for plan/balance reasons.
     if (req.authUser) {
       const member = await requireMember(req.authUser.id, agencyId);
       if (!member) return res.status(403).json({ error: 'Not a member of this agency' });
@@ -1260,16 +1288,25 @@ async function handleGenerateImage(req, res) {
     const imageRefs = refImages ? (Array.isArray(refImages) ? refImages : [refImages])
                      : refImageData ? [refImageData] : [];
 
-    // Read token balance — handle missing row gracefully
-    const settingsResult = await supabaseAdmin.from('agency_settings')
-      .select('token_balance').eq('agency_id', agencyId).maybeSingle();
-    const settings = settingsResult?.data;
-    const balance = (settings && typeof settings.token_balance === 'number') ? settings.token_balance : 0;
-    if (balance <= 0) return res.status(402).json({ error: 'No tokens remaining. Purchase more in the app.' });
+    // Legacy unauthenticated calls (the web app doesn't send a bearer token
+    // yet) still spend 1 studio token: with no identity, the balance is the
+    // only thing stopping this from being an open, free Gemini proxy for
+    // anyone who knows an agency id. Remove this once the web sends auth and
+    // the route moves to requireAuth.
+    const chargeTokens = !req.authUser;
+    let balance = null, newBalance = null;
+    if (chargeTokens) {
+      // Read token balance — handle missing row gracefully
+      const settingsResult = await supabaseAdmin.from('agency_settings')
+        .select('token_balance').eq('agency_id', agencyId).maybeSingle();
+      const settings = settingsResult?.data;
+      balance = (settings && typeof settings.token_balance === 'number') ? settings.token_balance : 0;
+      if (balance <= 0) return res.status(402).json({ error: 'No tokens remaining. Purchase more in the app.' });
 
-    const newBalance = balance - 1;
-    // Upsert so it works even if the row doesn't exist yet
-    await _setAgencyTokenBalance(agencyId, newBalance);
+      newBalance = balance - 1;
+      // Upsert so it works even if the row doesn't exist yet
+      await _setAgencyTokenBalance(agencyId, newBalance);
+    }
 
     const geminiRes = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=' + process.env.GEMINI_API_KEY,
@@ -1292,7 +1329,7 @@ async function handleGenerateImage(req, res) {
       const errBody = await geminiRes.text();
       console.error('Gemini API error', geminiRes.status, errBody.slice(0, 400));
       // Refund the token since generation failed
-      await _setAgencyTokenBalance(agencyId, balance);
+      if (chargeTokens) await _setAgencyTokenBalance(agencyId, balance);
       // Handle rate limiting specifically
       if (geminiRes.status === 429) {
         return res.status(429).json({ error: 'Rate limit hit — please wait a few seconds and try again.' });
@@ -1308,13 +1345,15 @@ async function handleGenerateImage(req, res) {
       // Log full response to understand why no image was returned
       console.error('No image part in Gemini response:', JSON.stringify(geminiData).slice(0, 400));
       // Refund the token
-      await _setAgencyTokenBalance(agencyId, balance);
+      if (chargeTokens) await _setAgencyTokenBalance(agencyId, balance);
       const reason = geminiData?.candidates?.[0]?.finishReason || 'unknown';
       return res.status(500).json({ error: 'No image returned from Gemini (finish reason: ' + reason + ')' });
     }
 
-    log('🎬', `Generated image for ${agencyId} — ${newBalance} tokens remaining`);
-    res.json({ imageUrl: 'data:' + imgPart.inlineData.mimeType + ';base64,' + imgPart.inlineData.data, tokenBalance: newBalance });
+    log('🎬', `Generated image for ${agencyId}` + (chargeTokens ? ` — ${newBalance} tokens remaining (legacy unauthenticated call)` : ''));
+    const out = { imageUrl: 'data:' + imgPart.inlineData.mimeType + ';base64,' + imgPart.inlineData.data };
+    if (chargeTokens) out.tokenBalance = newBalance;
+    res.json(out);
   } catch (e) {
     console.error('generate-image error:', e.message);
     res.status(500).json({ error: e.message });
@@ -3572,7 +3611,7 @@ httpServer.listen(PORT, () => {
   console.log(`Persistence: ${DATA_FILE}`);
   console.log(`State seeded: ${appState.seeded}`);
   console.log(`Resend: ${RESEND_KEY ? 'configured ✓' : 'NO API KEY — emails disabled'}`);
-  console.log(`Stripe: ${stripe ? 'configured ✓' : 'not configured — add STRIPE_SECRET_KEY'}`);
+  console.log(`Billing: ${BILLING_ENABLED ? (stripe ? 'enabled, Stripe configured ✓' : 'enabled but STRIPE_SECRET_KEY missing') : 'archived (BILLING_ENABLED != true)'}`);
   console.log(`Supabase: ${supabaseAdmin ? 'configured ✓' : 'not configured — add SUPABASE_URL + SUPABASE_SERVICE_KEY'}`);
   // APNs status — print on boot so misconfig is obvious in Railway logs.
   // Touch the provider once to flip its status flags.

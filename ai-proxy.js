@@ -7,18 +7,14 @@
  *
  * Key selection:
  *   agency_settings.use_own_key === true AND anthropic_key set
- *        -> agency's own key, used server-side only, no studio tokens charged
+ *        -> agency's own key, used server-side only
  *   otherwise
- *        -> platform key (env ANTHROPIC_API_KEY), studio tokens charged from
- *           agency_settings.token_balance
+ *        -> platform key (env ANTHROPIC_API_KEY)
  *
- * Studio token cost (platform key only):
- *   tokens = max(1, ceil(estimated_usd_cost / STUDIO_TOKEN_USD))
- *   STUDIO_TOKEN_USD = $0.10 (the cheapest a studio token is ever sold for:
- *   400 tokens / $40), so a call is never billed below Anthropic cost.
- *   1 token is reserved up-front (402 if balance < 1) and refunded if the
- *   upstream call fails; any extra is deducted after the response, clamped at 0.
- *   In practice nearly every call costs 1 token (the same as one image).
+ * No studio tokens are charged and there is no plan/balance check: billing is
+ * archived (see server.js). Access = authenticated + active member of the
+ * agency, plus the per-user rate limits below. An estimated USD cost is logged
+ * per call for monitoring only.
  */
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
@@ -30,9 +26,6 @@ const MAX_TOKENS_DEFAULT = 4096;
 const MAX_MESSAGES = 200;
 const MAX_TOOLS = 20;
 const WEB_SEARCH_MAX_USES_CAP = 5;
-
-const STUDIO_TOKEN_USD = 0.10;
-const MIN_CHARGE = 1;
 
 // USD per million tokens. Unknown newer ids fall back to their family price.
 const PRICING = {
@@ -128,31 +121,6 @@ module.exports = function makeAiProxy({ supabaseAdmin, requireMember, log }) {
     for (const [k, arr] of hits) if (!arr.length || now - arr[arr.length - 1] > 60 * 60 * 1000) hits.delete(k);
   }, 10 * 60 * 1000).unref();
 
-  // Atomically add `delta` (negative = charge) to token_balance using an
-  // optimistic compare-and-set on the previous value. Clamps at 0 when
-  // `clamp` is set. Returns the new balance, or null if the row is missing
-  // or contention persisted.
-  async function adjustBalance(agencyId, delta, { clamp = false, requireFunds = false } = {}) {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const { data: row, error } = await supabaseAdmin.from('agency_settings')
-        .select('token_balance').eq('agency_id', agencyId).maybeSingle();
-      if (error) throw new Error('balance read failed: ' + error.message);
-      if (!row) return null;
-      const cur = typeof row.token_balance === 'number' ? row.token_balance : 0;
-      if (requireFunds && cur + delta < 0) return { insufficient: true, balance: cur };
-      let next = cur + delta;
-      if (clamp && next < 0) next = 0;
-      if (next === cur) return { balance: cur };
-      const { data: upd, error: uerr } = await supabaseAdmin.from('agency_settings')
-        .update({ token_balance: next })
-        .eq('agency_id', agencyId).eq('token_balance', cur);
-      if (uerr) throw new Error('balance update failed: ' + uerr.message);
-      if (Array.isArray(upd) && upd.length) return { balance: next };
-      // Lost the race to a concurrent charge; re-read and retry.
-    }
-    throw new Error('balance update contention');
-  }
-
   async function handleClaude(req, res) {
     const started = Date.now();
     const user = req.authUser;
@@ -201,25 +169,6 @@ module.exports = function makeAiProxy({ supabaseAdmin, requireMember, log }) {
     const apiKey = ownKey || process.env.ANTHROPIC_API_KEY || '';
     if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set on server' });
 
-    // ── reserve 1 studio token (platform key only) ──────────────────────────
-    let reserved = 0;
-    let balance = null;
-    if (!ownKey) {
-      let r;
-      try { r = await adjustBalance(agencyId, -MIN_CHARGE, { requireFunds: true }); }
-      catch (e) { return res.status(500).json({ error: 'Could not charge studio tokens' }); }
-      if (!r || r.insufficient) {
-        return res.status(402).json({ error: 'No studio tokens remaining. Purchase more tokens in the app, or add your own Anthropic key in Settings.', tokenBalance: r ? r.balance : 0 });
-      }
-      reserved = MIN_CHARGE;
-      balance = r.balance;
-    }
-    const refund = async () => {
-      if (!reserved) return;
-      try { await adjustBalance(agencyId, reserved); } catch (e) { log('⚠', '[ai] refund failed for ' + agencyId + ': ' + e.message); }
-      reserved = 0;
-    };
-
     // ── upstream call ───────────────────────────────────────────────────────
     const payload = { model: b.model, max_tokens: maxTokens, messages: b.messages };
     if (b.system != null) payload.system = b.system;
@@ -236,14 +185,12 @@ module.exports = function makeAiProxy({ supabaseAdmin, requireMember, log }) {
       const text = await upstream.text();
       try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
     } catch (e) {
-      await refund();
       const timeout = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
       log('⚠', `[ai] upstream ${timeout ? 'timeout' : 'network error'} user=${String(user.id).slice(0, 8)} agency=${agencyId} model=${b.model}`);
       return res.status(timeout ? 504 : 502).json({ error: timeout ? 'AI request timed out' : 'Could not reach AI provider' });
     }
 
     if (!upstream.ok) {
-      await refund();
       const upMsg = (data && data.error && data.error.message) || ('HTTP ' + upstream.status);
       log('⚠', `[ai] upstream ${upstream.status} user=${String(user.id).slice(0, 8)} agency=${agencyId} model=${b.model} key=${keySource}`);
       let status = 502, msg = 'AI provider error: ' + upMsg;
@@ -257,28 +204,11 @@ module.exports = function makeAiProxy({ supabaseAdmin, requireMember, log }) {
     }
 
     if (!data || typeof data !== 'object') {
-      await refund();
       return res.status(502).json({ error: 'AI provider returned an unreadable response' });
     }
 
-    // ── settle the charge ───────────────────────────────────────────────────
-    let charged = 0;
     const usage = (data && data.usage) || {};
-    if (!ownKey) {
-      const usd = estimateUsd(modelInfo.family, usage);
-      const total = Math.max(MIN_CHARGE, Math.ceil(usd / STUDIO_TOKEN_USD - 1e-9));
-      charged = total;
-      const extra = total - reserved;
-      if (extra > 0) {
-        try {
-          const r = await adjustBalance(agencyId, -extra, { clamp: true });
-          if (r && typeof r.balance === 'number') balance = r.balance;
-        } catch (e) { log('⚠', '[ai] extra charge failed for ' + agencyId + ': ' + e.message); }
-      }
-      reserved = 0;
-      res.set('X-Studio-Tokens-Charged', String(charged));
-      if (balance != null) res.set('X-Studio-Token-Balance', String(balance));
-    }
+    const estUsd = estimateUsd(modelInfo.family, usage);
     res.set('X-AI-Key-Source', keySource);
 
     // Usage log — never includes prompt or completion content.
@@ -286,7 +216,7 @@ module.exports = function makeAiProxy({ supabaseAdmin, requireMember, log }) {
     log('🤖', `[ai] user=${String(user.id).slice(0, 8)} agency=${agencyId} model=${b.model} key=${keySource} ` +
       `in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} ` +
       `cache_r=${usage.cache_read_input_tokens || 0} cache_w=${usage.cache_creation_input_tokens || 0} ` +
-      `search=${searches} charged=${charged}${balance != null ? ' bal=' + balance : ''} ms=${Date.now() - started}`);
+      `search=${searches} est_usd=${estUsd.toFixed(4)} ms=${Date.now() - started}`);
 
     return res.status(200).json(data);
   }

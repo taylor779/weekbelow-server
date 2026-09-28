@@ -1,5 +1,15 @@
 # Native + server fixes: AI proxy, request auth and server bug fixes
 
+> ## Billing is archived (no studio tokens, no plans)
+>
+> Stripe billing and membership tiers are archived. All billing routes (`/stripe-webhook`,
+> `/create-checkout`, `/create-subscription`, `/customer-portal`, `/cancel-subscription`,
+> `/gift-tokens-email`) are gated by env `BILLING_ENABLED` (default off): they return
+> `410 { "error": "Billing is archived" }`, and the webhook returns `200` without doing anything.
+> `/ai/claude` and authenticated `/generate-image` calls no longer check or deduct
+> `token_balance` and never return 402. Sections below that describe studio-token charging are
+> kept for history and are marked as such.
+
 > ## ⚠️ Security: `AuthKey_8JSPR5Q2XB.p8` is committed to this public repo
 >
 > The APNs signing key `AuthKey_8JSPR5Q2XB.p8` is checked into git in a **public**
@@ -37,8 +47,10 @@
 
 - **Valid bearer token present:** the caller must be an active member of `body.agencyId`, otherwise
   the endpoint returns 403.
-- **No token, or an invalid token:** behaviour is unchanged. This keeps the web app working until
-  it sends tokens.
+  Authenticated calls are **not** charged studio tokens and never get 402.
+- **No token, or an invalid token:** behaviour is unchanged (1 studio token charged, 402 when the
+  balance is 0). This is the only thing capping cost on an otherwise unauthenticated Gemini proxy,
+  so it stays until the web sends bearer tokens and the route moves to `requireAuth`.
 
 ## `POST /ai/claude` contract
 
@@ -73,8 +85,7 @@ search again. The client continues it.
 
 Response headers:
 - `X-AI-Key-Source: own | platform`
-- `X-Studio-Tokens-Charged: <n>` (platform key only)
-- `X-Studio-Token-Balance: <n>` (platform key only)
+- (`X-Studio-Tokens-Charged` / `X-Studio-Token-Balance` are no longer sent: billing is archived.)
 
 **Errors:** every error has the body `{ "error": "message" }`.
 
@@ -82,7 +93,6 @@ Response headers:
 |---|---|
 | 400 | Bad body: missing `agencyId`, disallowed model or tool, bad `messages` or `system`. Also Anthropic 400s such as an invalid message shape. |
 | 401 | The bearer token is missing or invalid. |
-| 402 | The platform key is in use and `token_balance < 1`. The body also includes `tokenBalance`. |
 | 403 | The user is not an active member of `agencyId`. |
 | 404 / 413 | Passed through from Anthropic (unknown model, request too large). |
 | 429 | The per-user rate limit is hit (a `Retry-After` header is set), or Anthropic returned 429. |
@@ -91,14 +101,15 @@ Response headers:
 | 503 | Anthropic is overloaded (529 or 503). |
 | 504 | The upstream call timed out (180 s). |
 
-Studio tokens are refunded on every non-200 response that happens after the charge.
-
 ### Key selection
 1. If `agency_settings.use_own_key === true` and `anthropic_key` is non-empty, the server uses the
-   agency's key. The key never leaves the server and **no studio tokens are charged**.
-2. Otherwise the server uses the platform key from env `ANTHROPIC_API_KEY` and charges studio tokens.
+   agency's key. The key never leaves the server.
+2. Otherwise the server uses the platform key from env `ANTHROPIC_API_KEY`.
 
-### Studio token cost (platform key)
+No studio tokens are charged either way. An estimated USD cost (list prices below) is logged per
+call for monitoring.
+
+### Studio token cost (ARCHIVED — no longer applied)
 - `tokens = max(1, ceil(estimated_usd / $0.10))`
 - $0.10 is the cheapest price a studio token is ever sold at (400 tokens for $40), so a call is never
   billed below cost.
@@ -123,7 +134,7 @@ Studio tokens are refunded on every non-200 response that happens after the char
 - **Rate limit:** 20 requests per minute and 300 per hour per user. It is kept in memory, so it
   resets on redeploy and is enforced per instance.
 - **Usage log line:** records the user id prefix, agency, model, key source, input, output and cache
-  token counts, search count, tokens charged, balance and latency.
+  token counts, search count, estimated USD cost and latency.
 - **Never logged:** prompt and completion contents.
 
 ## Env vars
@@ -144,7 +155,7 @@ Studio tokens are refunded on every non-200 response that happens after the char
      -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H 'Content-Type: application/json' \
      -d '{"agencyId":"<id>","model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"Say hi"}]}' -i
    ```
-   Expect 200, an `X-AI-Key-Source` header, and a one-token charge on platform-key agencies. Without
+   Expect 200 and an `X-AI-Key-Source` header (no token charge). Without
    the header, expect 401.
 
 ## Follow-up plan
@@ -183,8 +194,8 @@ Studio tokens are refunded on every non-200 response that happens after the char
 - For `/generate-image`, switch `softAuth` to `requireAuth` once the web sends tokens.
 
 **Step 4: purge the prospect hunter's key use.** `prospect-hunter.js` reads `agency_settings.anthropic_key`
-server-side. That is safe, but it should follow the same `use_own_key` and platform-key-plus-tokens
-rule for consistency.
+server-side. That is safe, but it should follow the same `use_own_key`-else-platform-key rule for
+consistency.
 
 ## Server fixes (branch `native-ai-proxy`)
 
@@ -223,7 +234,8 @@ returned 500 for every agency that already had an `agency_settings` row.
 **Verify:**
 1. On an agency that already has an `agency_settings` row, `POST /generate-image` should return 200
    (or a Gemini error), not a 500 with "duplicate key".
-2. Afterwards `token_balance` has dropped by 1, and it is refunded on a Gemini failure.
+2. For a call without a bearer token, `token_balance` has dropped by 1, and it is refunded on a
+   Gemini failure. Authenticated calls leave `token_balance` untouched.
 3. Register the same push token twice through `/push/register-token`. The second call returns
    `{ok:true}` and `last_seen_at` updates.
 4. In Railway logs, `falling back to INSERT` means a table is missing its unique constraint. Add
