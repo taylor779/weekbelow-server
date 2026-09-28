@@ -1,4 +1,4 @@
-# Native AI proxy and request auth
+# Native + server fixes: AI proxy, request auth and server bug fixes
 
 > ## ⚠️ Security: `AuthKey_8JSPR5Q2XB.p8` is committed to this public repo
 >
@@ -186,13 +186,46 @@ Studio tokens are refunded on every non-200 response that happens after the char
 server-side. That is safe, but it should follow the same `use_own_key` and platform-key-plus-tokens
 rule for consistency.
 
-## Known pre-existing issue (not changed here)
-In `supaRest` (`server.js`), `'Prefer': 'return=representation'` comes after `...extraHeaders`, so it
-overwrites the `resolution=merge-duplicates` header that the fluent `.upsert()` sets.
+## Server fixes (branch `native-ai-proxy`)
 
-As a result, `.upsert()` calls, and the raw `supaRest('POST', 'agency_settings', …)` calls in
-`/generate-image`, behave as plain INSERTs. They will likely fail with 409 on an existing row. That
-would break image token charging and refunds, and Stripe token top-ups.
+Each fix is its own commit. None of them needs a web change unless it says so.
 
-`/ai/claude` does not depend on this: it uses PATCH with compare-and-set. The issue is worth checking
-and fixing separately.
+### 1. `supaRest` Prefer header merge (upserts)
+
+**Bug:** `supaRest` set `Prefer: return=representation` after `...extraHeaders`, so it overwrote the
+`resolution=merge-duplicates` value that `.upsert()` passes. Every upsert ran as a plain INSERT and
+failed with 409 on an existing row. Since `supaRest` now rejects non-2xx responses, `/generate-image`
+returned 500 for every agency that already had an `agency_settings` row.
+
+**Fix:**
+- `supaRest` merges Prefer values into one comma-separated header and adds `return=representation`
+  only when no `return=` value was passed.
+- `.upsert(..., { ignoreDuplicates: true })` sends `resolution=ignore-duplicates`.
+- An empty `onConflict` no longer sends `on_conflict=`, so PostgREST falls back to the primary key.
+- If PostgREST answers `42P10` (no unique constraint matches `on_conflict`), the builder logs a
+  warning and retries as a plain INSERT. That is the old behaviour, so a table that lacks the
+  constraint does not start failing every write.
+
+**Upsert call sites audited:**
+
+| Call site | Conflict target | Notes |
+|---|---|---|
+| `/generate-image` charge and refunds | `agency_settings.agency_id` | Was a raw `supaRest('POST')` with no `on_conflict`. Now `_setAgencyTokenBalance()`, a fluent upsert. |
+| `/gift-tokens-email` | `agency_settings.agency_id` | Already correct. It works now that the Prefer value survives. |
+| `_patchBrand` (Stripe plan and status) | `agency_settings.agency_id` | Already correct. |
+| Stripe token purchase and monthly allowance | `agency_settings.agency_id` | **These were not upserts.** They credited only `app_state.brand.tokenBalance`, which no client or endpoint reads: the web and `/generate-image` / `/ai/claude` read `agency_settings.token_balance`. They now also credit `agency_settings.token_balance` through `_creditAgencyTokens()`. |
+| `/push/register-token` → `device_tokens` | `token` | Was `user_id,token`. The schema (`01_supabase_schema.sql`) declares `token TEXT NOT NULL UNIQUE` and no `(user_id, token)` constraint. On `token`, a device that signs in as another user is re-pointed instead of hitting 23505. |
+| `/invite-member` → `invites` | `agency_id,email` | Unchanged. It needs a unique constraint on `(agency_id, email)`; without one it falls back to INSERT. |
+| `/accept-project-invite` → `shared_projects`, `shared_project_data` | `project_id,guest_agency_id` and `project_id,owner_agency_id` | Unchanged. The same fallback applies. |
+| `notification_prefs` | — | The server never writes it. `/push/prefs` is a stub. |
+| `xero-routes.js` `xero_connections` | `agency_id` | Uses its own `fetch` with a correct Prefer header. Unaffected. |
+
+**Verify:**
+1. On an agency that already has an `agency_settings` row, `POST /generate-image` should return 200
+   (or a Gemini error), not a 500 with "duplicate key".
+2. Afterwards `token_balance` has dropped by 1, and it is refunded on a Gemini failure.
+3. Register the same push token twice through `/push/register-token`. The second call returns
+   `{ok:true}` and `last_seen_at` updates.
+4. In Railway logs, `falling back to INSERT` means a table is missing its unique constraint. Add
+   the constraint.
+

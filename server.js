@@ -47,13 +47,25 @@ function supaRest(method, table, params, body, extraHeaders) {
     const path = `/rest/v1/${table}${params ? '?' + params : ''}`;
     const url = new URL(SUPA_URL);
     const bodyStr = body ? JSON.stringify(body) : null;
+    // Merge Prefer values instead of letting one overwrite the other: the
+    // fluent .upsert() passes `resolution=merge-duplicates`, and every call
+    // wants `return=representation`. Previously the generic value came last and
+    // clobbered the upsert's, so upserts ran as plain INSERTs (409 on an
+    // existing row). PostgREST accepts a comma-separated Prefer list.
+    const extra = { ...(extraHeaders || {}) };
+    let extraPrefer = '';
+    for (const k of Object.keys(extra)) {
+      if (k.toLowerCase() === 'prefer') { extraPrefer = String(extra[k] || ''); delete extra[k]; }
+    }
+    const preferParts = extraPrefer.split(',').map(x => x.trim()).filter(Boolean);
+    if (!preferParts.some(x => /^return=/i.test(x))) preferParts.push('return=representation');
     const headers = {
       'apikey': SUPA_KEY,
       'Authorization': 'Bearer ' + SUPA_KEY,
-      ...(extraHeaders || {}),
+      ...extra,
       'Content-Type': 'application/json',
       'Accept': 'application/json',
-      'Prefer': 'return=representation',
+      'Prefer': preferParts.join(','),
     };
     if (bodyStr) headers['Content-Length'] = Buffer.byteLength(bodyStr);
     const req = https.request({
@@ -102,7 +114,7 @@ function _makeSupaQuery(table) {
     range(from, to) { s.limitN = (to - from + 1); return q; },
     update(body) { s.method = 'PATCH'; s.body = body; return q; },
     insert(body) { s.method = 'POST'; s.body = body; return q; },
-    upsert(body, opts) { s.method = 'POST'; s.body = body; s.upsertConflict = (opts && opts.onConflict) ? opts.onConflict : ''; return q; },
+    upsert(body, opts) { s.method = 'POST'; s.body = body; s.upsertConflict = (opts && opts.onConflict) ? opts.onConflict : ''; s.ignoreDuplicates = !!(opts && opts.ignoreDuplicates); return q; },
     delete() { s.method = 'DELETE'; return q; },
     then(resolve, reject) {
       return q._exec()
@@ -122,13 +134,29 @@ function _makeSupaQuery(table) {
       if (s.cols && s.method === 'GET') parts.push(`select=${s.cols.replace(/\s/g, '')}`);
       if (s.orderBy) parts.push(`order=${s.orderBy}`);
       if (s.limitN != null) parts.push(`limit=${s.limitN}`);
-      if (s.upsertConflict != null) parts.push(`on_conflict=${encodeURIComponent(s.upsertConflict)}`);
+      // Empty onConflict -> omit the param so PostgREST uses the primary key.
+      if (s.upsertConflict) parts.push(`on_conflict=${encodeURIComponent(s.upsertConflict)}`);
       return parts.join('&') || null;
     },
     async _exec() {
       const extraH = {};
-      if (s.upsertConflict != null) extraH['Prefer'] = 'resolution=merge-duplicates,return=representation';
-      return supaRest(s.method, s.table, q._qs(), s.body, extraH);
+      if (s.upsertConflict != null) {
+        extraH['Prefer'] = (s.ignoreDuplicates ? 'resolution=ignore-duplicates' : 'resolution=merge-duplicates') + ',return=representation';
+      }
+      try {
+        return await supaRest(s.method, s.table, q._qs(), s.body, extraH);
+      } catch (e) {
+        // 42P10 = no unique constraint matches on_conflict. Before the Prefer fix
+        // upserts silently ran as plain INSERTs, so a table missing the expected
+        // constraint used to "work" for new rows. Keep that behaviour (and say so
+        // in the log) rather than failing every write outright.
+        if (s.upsertConflict && e && e.code === '42P10') {
+          log('⚠', `upsert ${s.table}: no unique constraint on (${s.upsertConflict}); falling back to INSERT`);
+          const qs = (q._qs() || '').split('&').filter(x => x && !x.startsWith('on_conflict=')).join('&') || null;
+          return supaRest(s.method, s.table, qs, s.body, {});
+        }
+        throw e;
+      }
     },
   };
   return q;
@@ -933,7 +961,10 @@ async function handleStripeWebhook(req, res) {
         await supabaseAdmin.from('app_state').update({
           brand: { ...brand, tokenBalance: newBalance }
         }).eq('agency_id', agencyId);
-        log('🪙', `Credited ${tokensToAdd} tokens to ${agencyId}`);
+        // The clients and /generate-image, /ai/claude read agency_settings.token_balance,
+        // not brand.tokenBalance, so credit that too (upsert creates the row if missing).
+        const settingsBal = await _creditAgencyTokens(agencyId, tokensToAdd);
+        log('🪙', `Credited ${tokensToAdd} tokens to ${agencyId} (balance ${settingsBal})`);
       }
 
       // Subscription started via checkout — store customer + subscription IDs
@@ -996,6 +1027,7 @@ async function handleStripeWebhook(req, res) {
             await supabaseAdmin.from('app_state').update({
               brand: { ...brand, tokenBalance: ((brand.tokenBalance) || 0) + bonus }
             }).eq('agency_id', agencyId);
+            await _creditAgencyTokens(agencyId, bonus);
             log('🪙', `Monthly ${bonus} tokens added for agency ${agencyId} (${planId})`);
           }
         }
@@ -1048,6 +1080,25 @@ async function _applySubscription(agencyId, customerId, subscriptionId, planId, 
   });
 }
 
+// Add n tokens to agency_settings.token_balance (the balance every client and
+// the image/AI endpoints read). Returns the new balance.
+async function _creditAgencyTokens(agencyId, n) {
+  const { data: cur, error } = await supabaseAdmin.from('agency_settings')
+    .select('token_balance').eq('agency_id', agencyId).maybeSingle();
+  if (error) throw error;
+  const next = ((cur && typeof cur.token_balance === 'number') ? cur.token_balance : 0) + (n || 0);
+  await _setAgencyTokenBalance(agencyId, next);
+  return next;
+}
+
+// Write agency_settings.token_balance, creating the row if it doesn't exist.
+// Upsert on agency_id (the column every agency_settings lookup keys on).
+async function _setAgencyTokenBalance(agencyId, balance) {
+  const { error } = await supabaseAdmin.from('agency_settings')
+    .upsert({ agency_id: agencyId, token_balance: balance }, { onConflict: 'agency_id' });
+  if (error) throw error;
+}
+
 async function handleGenerateImage(req, res) {
   if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase not configured' });
   if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
@@ -1074,7 +1125,7 @@ async function handleGenerateImage(req, res) {
 
     const newBalance = balance - 1;
     // Upsert so it works even if the row doesn't exist yet
-    await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: newBalance });
+    await _setAgencyTokenBalance(agencyId, newBalance);
 
     const geminiRes = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=' + process.env.GEMINI_API_KEY,
@@ -1097,7 +1148,7 @@ async function handleGenerateImage(req, res) {
       const errBody = await geminiRes.text();
       console.error('Gemini API error', geminiRes.status, errBody.slice(0, 400));
       // Refund the token since generation failed
-      await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: balance });
+      await _setAgencyTokenBalance(agencyId, balance);
       // Handle rate limiting specifically
       if (geminiRes.status === 429) {
         return res.status(429).json({ error: 'Rate limit hit — please wait a few seconds and try again.' });
@@ -1113,7 +1164,7 @@ async function handleGenerateImage(req, res) {
       // Log full response to understand why no image was returned
       console.error('No image part in Gemini response:', JSON.stringify(geminiData).slice(0, 400));
       // Refund the token
-      await supaRest('POST', 'agency_settings', null, { agency_id: agencyId, token_balance: balance });
+      await _setAgencyTokenBalance(agencyId, balance);
       const reason = geminiData?.candidates?.[0]?.finishReason || 'unknown';
       return res.status(500).json({ error: 'No image returned from Gemini (finish reason: ' + reason + ')' });
     }
@@ -2347,7 +2398,7 @@ async function handleRegisterPushToken(req, res) {
       platform:     b.platform || 'ios',
       device_name:  b.deviceName || null,
       last_seen_at: new Date().toISOString(),
-    }, { onConflict: 'user_id,token' });
+    }, { onConflict: 'token' }); // device_tokens.token is UNIQUE (01_supabase_schema.sql); a device that changes user is re-pointed
     if (error) {
       log('❌', 'register-token error: ' + (error.message || error));
       return res.status(500).json({ error: error.message || String(error) });
