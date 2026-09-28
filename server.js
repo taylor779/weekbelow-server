@@ -2422,6 +2422,12 @@ async function _agencyActiveMembers(agencyId) {
 function _pushPrefOn(member, prefKey) {
   const p = (member && member.preferences) || {};
   if (p.pushEnabled === false) return false;   // master off
+  // Focus mode (set by the native app while a focus session runs): skip pushes
+  // until it ends. No focusModeUntil = on until switched off; an expired (or
+  // unparseable) focusModeUntil means the session is over, so pushes resume.
+  if (p.focusModeOn === true && (!p.focusModeUntil || Date.parse(p.focusModeUntil) > Date.now())) {
+    return false;
+  }
   if (!prefKey) return true;
   return p[prefKey] !== false;                 // default-on
 }

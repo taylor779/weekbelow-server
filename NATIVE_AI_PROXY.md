@@ -311,3 +311,20 @@ id in the body.
    Expect `{"ok":true,"sent":N}` with N > 0, and the email arrives.
 2. Set `preferences.emailWeekly=false` on one member, call it again, and expect N to drop by one.
 
+### 4. Focus mode suppresses pushes
+
+The native app writes `preferences.focusModeOn` and `preferences.focusModeUntil` (ISO) to the user's
+`agency_members` row while a focus session runs (see `ExtrasFocusMode.swift`).
+
+`_pushPrefOn()` now returns false, so no push is sent, when `focusModeOn === true` and either
+`focusModeUntil` is missing or `Date.parse(focusModeUntil) > Date.now()`. An expired
+`focusModeUntil` lets pushes resume even if the app never cleared the flag.
+
+This covers every preference-gated push: admin, assignment, comment and brief notifications, the
+2h timer check and the 8:45am reminder. `/push/send`, the diagnostic "send test", is not
+preference-gated and still sends.
+
+**Verify:** set `preferences = {"focusModeOn": true, "focusModeUntil": "<now + 10 min>"}` on a
+member, then trigger `/notify/project-assigned` for them. No push arrives, and `sendPushToUser` is
+never reached for them. Set `focusModeUntil` in the past and repeat. The push arrives.
+
