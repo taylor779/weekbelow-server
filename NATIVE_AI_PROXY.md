@@ -363,3 +363,23 @@ read `SUPABASE_SERVICE_ROLE_KEY`, while this server uses `SUPABASE_SERVICE_KEY`.
 3. About 60 s later, an agency that is due and has `serverHunt` and a key gets a `kind='run'` row in
    `prospect_staging`.
 
+### 6. `feedback_submitted` accepts the web's payload
+
+**Bug:** the websocket handler read only `msg.entry`, which the web never sends. The web's
+`submitFeedback`, around app.html L34878, sends these flat fields:
+`{type, agencyId, userName, userEmail, feedbackType, subject, preview, page}`.
+Web feedback therefore produced an admin email that said "[undefined] Feedback" and had an empty
+body. The native app (`AdminFeedback.swift`) sends the same flat fields **plus** `entry` (the full
+feedback row).
+
+**Fix:**
+- The handler builds the feedback from `entry` first and falls back to the flat fields
+  (`feedbackType`, `userName`, `userEmail`, `subject`, `preview`, `page`, `agencyId`).
+- The web sends only a 120-character `preview`. When that is all there is, the email notes that the
+  full text is in the `feedback` table.
+- User-supplied text is now HTML-escaped in the admin email.
+- The log line records the type and an agency id prefix instead of the user's name.
+
+**Verify:** submit feedback from the web and from native. `ADMIN_EMAIL` gets an email with the right
+type, subject, sender and text for both.
+

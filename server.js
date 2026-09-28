@@ -3140,18 +3140,32 @@ wss.on('connection', socket => {
       }
 
       case 'feedback_submitted': {
-        const fb=msg.entry||{};
-        log('💬', `Feedback from ${fb.user_name||'?'}: [${fb.type}] ${fb.subject}`);
+        // Native sends `entry` (the feedback row) plus flat fields; the web sends
+        // only flat fields (agencyId, userName, userEmail, feedbackType, subject,
+        // preview, page). Read either shape.
+        const e = (msg.entry && typeof msg.entry === 'object') ? msg.entry : {};
+        const fb = {
+          type:       String(e.type || msg.feedbackType || 'general'),
+          subject:    e.subject || msg.subject || '',
+          message:    e.message || msg.message || msg.preview || '',
+          user_name:  e.user_name || msg.userName || '',
+          user_email: e.user_email || msg.userEmail || '',
+          page:       e.page || msg.page || '',
+          agency_id:  e.agency_id || msg.agencyId || '',
+        };
+        const isPreview = !e.message && !msg.message && !!msg.preview;
+        log('💬', `Feedback [${fb.type}] from agency ${String(fb.agency_id || '?').slice(0, 8)}`);
         const adminEmail=process.env.ADMIN_EMAIL||'';
         if (adminEmail&&adminEmail.includes('@')&&RESEND_KEY) {
+          const H=_quoteEsc;
           const typeEmoji={bug:'🐛',feature:'💡',general:'💬'}[fb.type]||'💬';
           sendEmail({to:adminEmail,subject:`${typeEmoji} [${fb.type}] ${fb.subject||'Feedback'}`,html:wrap(`
-            <h2>${typeEmoji} New ${fb.type} feedback</h2>
-            <p class="sub">From <strong>${fb.user_name||'Unknown'}</strong> (${fb.user_email||'no email'}) on ${fb.page||'unknown page'}</p>
+            <h2>${typeEmoji} New ${H(fb.type)} feedback</h2>
+            <p class="sub">From <strong>${H(fb.user_name||'Unknown')}</strong> (${H(fb.user_email||'no email')}) on ${H(fb.page||'unknown page')}</p>
             <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
-              <div style="font-size:15px;font-weight:600;color:#fff;margin-bottom:8px;">${fb.subject||'(no subject)'}</div>
-              <div style="font-size:14px;color:#8080a0;line-height:1.7;white-space:pre-wrap;">${fb.message||''}</div>
-            </div>
+              <div style="font-size:15px;font-weight:600;color:#fff;margin-bottom:8px;">${H(fb.subject||'(no subject)')}</div>
+              <div style="font-size:14px;color:#8080a0;line-height:1.7;white-space:pre-wrap;">${H(fb.message)}${isPreview && fb.message.length >= 120 ? '…' : ''}</div>
+            </div>${isPreview ? '<p style="font-size:12px;color:#55556a;">First 120 characters shown; the full message is in the feedback table.</p>' : ''}
           `)});
         }
         break;
