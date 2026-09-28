@@ -288,7 +288,7 @@ app.post('/notify/new-brief',        handleNotifyNewBrief);
 app.post('/notify/project-assigned', handleNotifyProjectAssigned);
 app.post('/notify/timer-event',     handleNotifyTimerEvent);
 app.post('/push/register-token',  handleRegisterPushToken);
-app.post('/push/send',            handlePushSend);
+app.post('/push/send',            softAuth, handlePushSend); // TODO: requireAuth once the web sends bearer tokens
 app.post('/push/prefs',           handlePushPrefs);
 app.get('/push/prefs',            handlePushPrefs);
 app.get('/push/status',           handlePushStatus);
@@ -2571,6 +2571,15 @@ async function handlePushSend(req, res) {
     if (!b.userId || !b.title) {
       return res.status(400).json({ error: 'userId and title required' });
     }
+    if (req.authUser) {
+      // Authenticated: only yourself or someone in one of your own studios.
+      const ok = await _sharesAgency(String(req.authUser.id), String(b.userId));
+      if (!ok) return res.status(403).json({ error: 'You can only push to members of your own studio' });
+    } else {
+      // Legacy unauthenticated path (web sends no token yet). Kept for backward
+      // compatibility; will move to requireAuth once the web sends tokens.
+      log('⚠', 'DEPRECATED: unauthenticated /push/send (send Authorization: Bearer <token>)');
+    }
     const result = await sendPushToUser(String(b.userId), b.title, b.body || '', {
       deeplink:      b.deeplink,
       kind:          b.kind,
@@ -2582,6 +2591,22 @@ async function handlePushSend(req, res) {
     log('❌', 'push/send threw: ' + e.message);
     res.status(500).json({ error: e.message });
   }
+}
+
+// True when targetUserId is the caller, or both are active members of at least
+// one common agency (agency_members.user_id = Supabase auth id).
+async function _sharesAgency(callerUserId, targetUserId) {
+  if (!supabaseAdmin || !callerUserId || !targetUserId) return false;
+  if (callerUserId === targetUserId) return true;
+  const { data: mine, error: e1 } = await supabaseAdmin.from('agency_members')
+    .select('agency_id,active').eq('user_id', callerUserId);
+  if (e1) throw e1;
+  const agencies = (mine || []).filter(r => r && r.active !== false && r.agency_id).map(r => String(r.agency_id));
+  if (!agencies.length) return false;
+  const { data: theirs, error: e2 } = await supabaseAdmin.from('agency_members')
+    .select('agency_id,active').eq('user_id', targetUserId).in('agency_id', agencies);
+  if (e2) throw e2;
+  return (theirs || []).some(r => r && r.active !== false);
 }
 
 // ── /push/prefs ──────────────────────────────────────────────────────────────

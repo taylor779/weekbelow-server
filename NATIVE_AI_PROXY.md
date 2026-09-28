@@ -383,3 +383,36 @@ feedback row).
 **Verify:** submit feedback from the web and from native. `ADMIN_EMAIL` gets an email with the right
 type, subject, sender and text for both.
 
+### 7. `/push/send` behind `softAuth`, scoped to the caller's studios
+
+**Bug:** `/push/send` let anyone push arbitrary text to any `userId`. There is **no
+`/push/send-bulk` route** in this server, and neither the web nor the native app calls one, so there
+was nothing to harden there.
+
+**Fix:** `/push/send` now runs `softAuth`.
+- **With a valid bearer token:** the target `userId` (a Supabase auth id) must be the caller, or an
+  active member of an agency where the caller is also an active member. Otherwise the endpoint
+  returns 403. This uses `_sharesAgency()`.
+- **Without a token (the web today):** behaviour is unchanged, and the server logs
+  `DEPRECATED: unauthenticated /push/send`.
+
+**Follow-up:** switch `/push/send` to `requireAuth` once the web sends tokens. Its only caller is the
+push diagnostics "send test" button (`testPushSend`, app.html around L52759). It sends
+`userId: currentUser.supaId || currentUser.id`, so when it adds the header it must send the
+**Supabase auth id** (`supaId`), not the member id. A member id would get a 403.
+
+**Verify:**
+1. With no header, `POST /push/send {userId,title}` behaves as before, and the log shows the
+   deprecation line.
+2. With a valid token and your own auth id, expect 200.
+3. With a valid token and the auth id of a user outside your studios, expect 403.
+
+## What the web app must change
+
+These are not needed today, because every web path above stays backward-compatible:
+- **`/account/delete`:** add `Authorization: Bearer <access_token>`. The body `{token}` fallback
+  can then be removed.
+- **`/push/send`:** add the bearer header and send the Supabase auth id. Then move the route to
+  `requireAuth`.
+- **In general,** make `railwayFetch` attach `Authorization: Bearer <session.access_token>` to
+  every request, so that step 3 of the follow-up plan can proceed.
