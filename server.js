@@ -14,7 +14,12 @@
  *   ANTHROPIC_API_KEY     — Platform Anthropic key for /ai/claude (never sent to client)
  *   SUPABASE_URL          — https://fdjnzzrrodrjkngqzewy.supabase.co
  *   SUPABASE_SERVICE_KEY  — Supabase service_role key (bypasses RLS)
- *   ADMIN_EMAIL           — taylor@below.co.nz
+ *   ADMIN_EMAIL           — taylor@below.co.nz (platform owner; matched on the verified token)
+ *   PLATFORM_ADMIN_UID    — optional Supabase auth id of the platform owner (overrides ADMIN_EMAIL match)
+ *   APNS_KEY_P8 / APNS_KEY_ID / APNS_TEAM_ID — push; see SECURITY_NOTES.md
+ *   RATE_LIMITS           — 'off' disables the in-memory rate limiters
+ *
+ * Auth model and public routes: SECURITY_NOTES.md.
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
@@ -209,9 +214,100 @@ const supabaseAdmin = SUPA_URL && SUPA_KEY
   : null;
 
 // ── Request auth (bearer Supabase access token) ──────────────────────────────
-// softAuth never rejects (web app sends no token yet); requireAuth is strict.
+// Every studio route uses requireAuth (401 without a valid Supabase access
+// token) plus a membership check against the agency named in the request.
+// Public routes (share links, quote e-sign, client brief notify, health,
+// webhooks) are listed and explained in SECURITY_NOTES.md.
 const makeAuth = require('./auth');
-const { softAuth, requireAuth, requireMember, forgetUser } = makeAuth(supabaseAdmin);
+const { requireAuth, requireUser, userFromToken, requireMember, memberships, forgetUser } = makeAuth(supabaseAdmin);
+const { rateLimit, overLimit, clientIp, safeFetchText, escapeHtml, maskEmail } = require('./security');
+
+// Platform owner (bulk email, cross-studio recap trigger). Matched on the
+// verified token, never on a body field. PLATFORM_ADMIN_UID (Supabase auth id)
+// is optional and takes precedence when set.
+const PLATFORM_ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || 'taylor@below.co.nz').toLowerCase().trim();
+const PLATFORM_ADMIN_UID = String(process.env.PLATFORM_ADMIN_UID || '').trim();
+function isPlatformAdmin(user) {
+  if (!user || !user.id) return false;
+  if (PLATFORM_ADMIN_UID) return String(user.id) === PLATFORM_ADMIN_UID;
+  const email = String(user.email || '').toLowerCase().trim();
+  const confirmed = !!(user.email_confirmed_at || user.confirmed_at);
+  return confirmed && !!email && email === PLATFORM_ADMIN_EMAIL;
+}
+function requirePlatformAdmin(req, res, next) {
+  if (!isPlatformAdmin(req.authUser)) return res.status(403).json({ error: 'Unauthorized' });
+  next();
+}
+
+// Agency id named by a request (body, route param or query), in that order.
+function _agencyOf(req) {
+  const b = req.body || {};
+  return b.agencyId || b.agency_id || (req.params && req.params.agencyId) || (req.query && (req.query.agencyId || req.query.agency)) || null;
+}
+
+/**
+ * needMember({ get, admin, optional, collaborator })
+ *   get(req)      -> agency id (default _agencyOf)
+ *   admin         -> caller's membership must have role 'admin'
+ *   optional      -> no agency id given: caller must belong to at least one studio
+ *   collaborator  -> also accept a caller whose studio collaborates on a project
+ *                    owned by this agency (shared_projects), e.g. storyboard
+ *                    generation inside a shared project
+ * Sets req.member (the caller's agency_members row) when an agency id is given.
+ */
+function needMember(opts = {}) {
+  return async function (req, res, next) {
+    try {
+      const uid = req.authUser && req.authUser.id;
+      if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+      const agencyId = opts.get ? opts.get(req) : _agencyOf(req);
+      if (!agencyId) {
+        if (!opts.optional) return res.status(400).json({ error: 'agencyId required' });
+        const mine = await memberships(uid);
+        if (!mine.length) return res.status(403).json({ error: 'Not a member of any studio' });
+        return next();
+      }
+      const m = await requireMember(uid, String(agencyId));
+      if (!m) {
+        if (opts.collaborator && await _collaboratesWith(uid, String(agencyId))) return next();
+        return res.status(403).json({ error: 'Not a member of this agency' });
+      }
+      if (opts.admin && m.role !== 'admin') return res.status(403).json({ error: 'Admins only' });
+      req.member = m;
+      next();
+    } catch (e) {
+      log('⚠', 'membership check failed: ' + e.message);
+      res.status(500).json({ error: 'Membership check failed' });
+    }
+  };
+}
+
+// True when one of the caller's studios is a guest on a project owned by agencyId.
+async function _collaboratesWith(userId, ownerAgencyId) {
+  if (!supabaseAdmin) return false;
+  const mine = (await memberships(userId)).map(m => String(m.agency_id));
+  if (!mine.length) return false;
+  const { data, error } = await supabaseAdmin.from('shared_projects')
+    .select('guest_agency_id').eq('owner_agency_id', ownerAgencyId).in('guest_agency_id', mine).limit(1);
+  if (error) return false;
+  return Array.isArray(data) && data.length > 0;
+}
+
+// Rate limits (in-memory, per process). RATE_LIMITS=off disables them.
+const MIN = 60 * 1000, HOUR = 60 * MIN;
+const limitGlobalIp   = rateLimit({ name: 'global', windowMs: MIN, max: 600, by: 'ip' });
+const limitAI         = [rateLimit({ name: 'ai-m', windowMs: MIN, max: 20, by: 'user' }),
+                         rateLimit({ name: 'ai-h', windowMs: HOUR, max: 300, by: 'user' })];
+const limitEmail      = [rateLimit({ name: 'mail-m', windowMs: MIN, max: 10, by: 'user' }),
+                         rateLimit({ name: 'mail-h', windowMs: HOUR, max: 100, by: 'user' })];
+const limitBulkEmail  = rateLimit({ name: 'bulk', windowMs: HOUR, max: 5, by: 'user' });
+const limitUserWrites = rateLimit({ name: 'writes', windowMs: MIN, max: 240, by: 'user' });
+const limitLinks      = rateLimit({ name: 'links', windowMs: MIN, max: 30, by: 'user' });
+const limitPush       = rateLimit({ name: 'push', windowMs: MIN, max: 30, by: 'user' });
+const limitPublicRead = rateLimit({ name: 'pub-r', windowMs: MIN, max: 120, by: 'ip' });
+const limitPublicWrite= rateLimit({ name: 'pub-w', windowMs: MIN, max: 20, by: 'ip' });
+const limitBriefNotify= rateLimit({ name: 'brief', windowMs: 10 * MIN, max: 20, by: 'ip' });
+const limitAuthFail   = rateLimit({ name: 'lookup', windowMs: MIN, max: 60, by: 'ip' });
 
 const TOKEN_PACKAGES = {
   tokens_5:   { tokens: 20,  priceUsd: 5,  name: '20 Tokens — $5 USD'  },
@@ -287,54 +383,61 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/', (req, res) => res.send('BSMNT OK'));
+app.use(limitGlobalIp);
+
+// ── Route table ──────────────────────────────────────────────────────────────
+// auth   = requireAuth (valid Supabase access token)
+// member = caller is an active member of the agency in the request
+// admin  = caller is an admin of that agency
+// PUBLIC = no login by design; each one is noted with what protects it.
+app.get('/', (req, res) => res.send('BSMNT OK'));                                     // PUBLIC health check
 // Billing routes are archived (410 unless BILLING_ENABLED=true) — see top of file.
-app.post('/create-checkout',      billingGate, handleCreateCheckout);
-app.post('/create-subscription',  billingGate, handleCreateSubscription);
-app.get('/customer-portal',       billingGate, handleCustomerPortal);
-app.post('/cancel-subscription',  billingGate, handleCancelSubscription);
-app.post('/generate-image',       softAuth, handleGenerateImage);
-app.post('/briefing',             handleBriefing);
-app.get('/agency-brand/:agencyId', handleAgencyBrand);
-app.post('/submit-brief',          handleSubmitBrief);
-app.post('/ai-brainstorm',        handleAIBrainstorm);
-app.post('/send-project-invite',  handleSendProjectInvite);
-app.post('/invite-member',         handleInviteMember);
-app.post('/accept-project-invite',handleAcceptProjectInvite);
-app.get('/project-invites/:email', handleGetProjectInvites);
-app.get('/project-invites/id/:inviteId', handleGetInviteById);
-app.get('/check-member-invite/:email', handleCheckMemberInvite);
-app.post('/gift-tokens-email',    billingGate, handleGiftTokensEmail); // archived with billing (token economy)
-app.post('/bulk-email',           handleBulkEmail);
-app.post('/save-user-pref',       handleSaveUserPref);
-app.post('/link-preview',         handleLinkPreview);
-app.post('/set-member-active',    handleSetMemberActive);
-app.post('/append-time-log',      handleAppendTimeLog);
-app.post('/notify-deliverable-comment', handleNotifyDeliverableComment);
-app.post('/notify/project-created',  handleNotifyProjectCreated);
-app.post('/notify/new-brief',        handleNotifyNewBrief);
-app.post('/notify/project-assigned', handleNotifyProjectAssigned);
-app.post('/notify/timer-event',     handleNotifyTimerEvent);
-app.post('/push/register-token',  handleRegisterPushToken);
-app.post('/push/send',            softAuth, handlePushSend); // TODO: requireAuth once the web sends bearer tokens
-app.post('/push/prefs',           handlePushPrefs);
-app.get('/push/prefs',            handlePushPrefs);
-app.get('/push/status',           handlePushStatus);
-app.post('/send-recap',           handleSendRecapNow);
-app.post('/send-runsheet',         handleSendRunsheet);
-app.get('/project-report/:agencyId/:projectId', handleProjectReport);
-app.get('/project-share/:token',        handleGetProjectShare);
-app.post('/project-share/:token/edit',  handleEditProjectShare);
-app.get('/quote/:token',          handleGetQuote);
-app.post('/quote/:token/accept',  handleAcceptQuote);
-app.post('/send-quote',           handleSendQuote);
+app.post('/create-checkout',      billingGate, requireAuth, needMember({ admin: true }), handleCreateCheckout);
+app.post('/create-subscription',  billingGate, requireAuth, needMember({ admin: true }), handleCreateSubscription);
+app.get('/customer-portal',       billingGate, requireAuth, needMember({ admin: true }), handleCustomerPortal);
+app.post('/cancel-subscription',  billingGate, requireAuth, needMember({ admin: true }), handleCancelSubscription);
+app.post('/generate-image',       requireAuth, ...limitAI, needMember({ collaborator: true }), handleGenerateImage);
+app.post('/briefing',             requireAuth, ...limitAI, needMember({ optional: true }), handleBriefing);
+app.get('/agency-brand/:agencyId', limitPublicRead, handleAgencyBrand);                // PUBLIC: studio name + accent only
+app.post('/submit-brief',          handleSubmitBrief);                                   // retired (410): brief.html uses /notify/new-brief
+app.post('/ai-brainstorm',        requireAuth, ...limitAI, needMember({ optional: true }), handleAIBrainstorm);
+app.post('/send-project-invite',  requireAuth, ...limitEmail, needMember({ get: r => (r.body || {}).inviterAgencyId }), handleSendProjectInvite);
+app.post('/invite-member',        requireAuth, ...limitEmail, needMember({ admin: true }), handleInviteMember);
+app.post('/accept-project-invite',requireAuth, limitUserWrites, needMember({ get: r => (r.body || {}).guestAgencyId }), handleAcceptProjectInvite);
+app.get('/project-invites/:email', requireAuth, handleGetProjectInvites);              // own email only
+app.get('/project-invites/id/:inviteId', requireAuth, handleGetInviteById);            // invitee or owner-studio member
+app.get('/check-member-invite/:email', limitAuthFail, requireAuth, handleCheckMemberInvite); // own email only
+app.post('/gift-tokens-email',    billingGate, requireAuth, requirePlatformAdmin, handleGiftTokensEmail); // archived with billing (token economy)
+app.post('/bulk-email',           requireAuth, requirePlatformAdmin, limitBulkEmail, handleBulkEmail);
+app.post('/save-user-pref',       requireAuth, limitUserWrites, needMember(), handleSaveUserPref);
+app.post('/link-preview',         requireAuth, limitLinks, handleLinkPreview);
+app.post('/set-member-active',    requireAuth, limitUserWrites, handleSetMemberActive); // admin, or invitee re-activating their own row
+app.post('/append-time-log',      requireAuth, limitUserWrites, needMember(), handleAppendTimeLog);
+app.post('/notify-deliverable-comment', requireAuth, limitPush, needMember(), handleNotifyDeliverableComment);
+app.post('/notify/project-created',  requireAuth, limitPush, needMember(), handleNotifyProjectCreated);
+app.post('/notify/new-brief',        limitBriefNotify, handleNotifyNewBrief);           // PUBLIC: only fires for a brief saved in client_briefs
+app.post('/notify/project-assigned', requireAuth, limitPush, needMember(), handleNotifyProjectAssigned);
+app.post('/notify/timer-event',     requireAuth, limitUserWrites, needMember(), handleNotifyTimerEvent);
+app.post('/push/register-token',  requireAuth, limitUserWrites, handleRegisterPushToken);
+app.post('/push/send',            requireAuth, limitPush, handlePushSend);
+app.post('/push/prefs',           handlePushPrefs);                                     // PUBLIC no-op stub (stores nothing)
+app.get('/push/prefs',            handlePushPrefs);                                     // PUBLIC no-op stub
+app.get('/push/status',           requireAuth, handlePushStatus);
+app.post('/send-recap',           requireAuth, ...limitEmail, handleSendRecapNow);     // agency admin or platform admin
+app.post('/send-runsheet',        requireAuth, ...limitEmail, needMember(), handleSendRunsheet);
+app.get('/project-report/:agencyId/:projectId', limitPublicRead, handleProjectReport); // share token (?token=) or bearer + member
+app.get('/project-share/:token',        limitPublicRead, handleGetProjectShare);        // PUBLIC: 144-bit share token
+app.post('/project-share/:token/edit',  limitPublicWrite, handleEditProjectShare);      // PUBLIC: edit-link token only
+app.get('/quote/:token',          limitPublicRead, handleGetQuote);                      // PUBLIC: quote accept token
+app.post('/quote/:token/accept',  limitPublicWrite, handleAcceptQuote);                  // PUBLIC: quote accept token
+app.post('/send-quote',           requireAuth, ...limitEmail, handleSendQuote);          // member of the quote's studio
 app.post('/account/delete',       _bodyTokenToBearer, requireAuth, handleAccountDelete);
 
 // ── Native/web AI proxy (strict auth) ────────────────────────────────────────
 // See NATIVE_AI_PROXY.md. Keys never leave the server.
 const makeAiProxy = require('./ai-proxy');
 const { handleClaude } = makeAiProxy({ supabaseAdmin, requireMember, log });
-app.post('/ai/claude', requireAuth, handleClaude);
+app.post('/ai/claude', requireAuth, ...limitAI, handleClaude);
 
 // ── POST /account/delete (App Store 5.1.1(v)) ────────────────────────────────
 // Deletes the *authenticated* user's account. Identity comes only from a
@@ -570,6 +673,9 @@ async function handleSendQuote(req, res) {
     if (!token || !link) return res.status(400).json({ error: 'token and link required' });
     const found = await findQuoteByToken(token);
     if (!found) return res.status(404).json({ error: 'Quote not found' });
+    // Only the studio that owns the quote may email it (requireAuth ran).
+    if (!(await requireMember(req.authUser.id, String(found.agencyId)))) return res.status(404).json({ error: 'Quote not found' });
+    if (typeof link !== 'string' || !/^https?:\/\//i.test(link) || link.length > 2048) return res.status(400).json({ error: 'Invalid link' });
     const q = found.quote;
     const email = ((q.client && q.client.email) || '').trim();
     if (!email || email.indexOf('@') < 0) return res.status(400).json({ error: 'No client email on this quote.' });
@@ -605,21 +711,38 @@ async function handleSendQuote(req, res) {
 // Adds /xero/connect, /xero/callback, /xero/status, /xero/invoice.
 // Relies on the global express.json() + CORS registered above.
 const xeroRoutes = require('./xero-routes');
+// Guards run first and fall through (next()) to the router's handlers.
+// /xero/connect (browser redirect) and /xero/callback (Xero redirect) stay
+// public but only accept a signed state ticket issued by /xero/connect-url.
+const _xeroAgency = r => (r.body && r.body.agency) || (r.query && r.query.agency) || null;
+app.post('/xero/connect-url', requireAuth, limitUserWrites, needMember({ get: _xeroAgency }));
+app.get('/xero/status',       requireAuth, needMember({ get: _xeroAgency }));
+app.post('/xero/invoice',     requireAuth, limitUserWrites, needMember({ get: _xeroAgency }));
 app.use(xeroRoutes);
 
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, maxPayload: 5 * 1024 * 1024 });
 
+// Deliver only to authenticated sockets whose user belongs to payload.agencyId.
+// Payloads without an agencyId go nowhere (the old global fan-out leaked one
+// studio's data to every connected client).
 function broadcast(payload, excludeSocket = null) {
+  const agencyId = payload && payload.agencyId != null ? String(payload.agencyId) : null;
+  if (!agencyId) return;
   const msg = JSON.stringify(payload);
   for (const c of clients) {
-    if (c !== excludeSocket && c.readyState === WebSocket.OPEN) c.send(msg);
+    if (c === excludeSocket || c.readyState !== WebSocket.OPEN) continue;
+    if (!c.user || !c.agencies || !c.agencies.has(agencyId)) continue;
+    c.send(msg);
   }
 }
 
+// Sent after a socket authenticates: running timers for the caller's studios
+// only. No app state (the web and native apps read data from Supabase).
 function sendSnapshot(socket) {
-  const safeUsers = (appState.users || []).map(u => { const { pin, ...rest } = u; return rest; });
-  socket.send(JSON.stringify({ type:'snapshot', timers:Object.values(activeTimers), appState: { ...appState, users: safeUsers } }));
+  if (!socket.user) return;
+  const timers = Object.values(activeTimers).filter(t => t && t.agencyId && socket.agencies.has(String(t.agencyId)));
+  try { socket.send(JSON.stringify({ type:'snapshot', timers, appState: {} })); } catch (e) {}
 }
 
 // ── Token / Payment handlers ──────────────────────────────────────────────────
@@ -630,9 +753,10 @@ function sendSnapshot(socket) {
 async function handleSendRunsheet(req, res) {
   try {
     const { agencyId, projectId, recipients, message, runsheetUrl } = req.body || {};
-    if (!agencyId || !recipients || !recipients.length) {
+    if (!agencyId || !Array.isArray(recipients) || !recipients.length) {
       return res.status(400).json({ error: 'agencyId and recipients required' });
     }
+    if (recipients.length > 50) return res.status(400).json({ error: 'Too many recipients (max 50)' });
 
     const { data: stateRow } = await supabaseAdmin
       .from('app_state').select('projects,brand').eq('agency_id', agencyId).maybeSingle();
@@ -641,9 +765,14 @@ async function handleSendRunsheet(req, res) {
     const projects = Array.isArray(stateRow.projects) ? stateRow.projects : [];
     const proj = projects.find(p => String(p.id) === String(projectId));
     const brand = stateRow.brand || {};
-    const studioName = brand.appName || brand.name || 'BSMNT';
-    const projectName = proj ? proj.name : 'Project';
-    const accent = brand.accentColor || '#7c6fff';
+    // Everything below lands in an email: escape it (message/url come from the
+    // request body, names from studio data).
+    const studioName = escapeHtml(brand.appName || brand.name || 'BSMNT');
+    const projectNameRaw = proj ? String(proj.name || 'Project') : 'Project';
+    const projectName = escapeHtml(projectNameRaw);
+    const accent = /^#[0-9a-f]{3,8}$/i.test(String(brand.accentColor || '')) ? brand.accentColor : '#7c6fff';
+    const safeMessage = message ? escapeHtml(String(message).slice(0, 4000)).replace(/\n/g, '<br/>') : '';
+    const safeUrl = (typeof runsheetUrl === 'string' && /^https:\/\//i.test(runsheetUrl)) ? escapeHtml(runsheetUrl) : '';
 
     const emailBody = `
 <!DOCTYPE html>
@@ -656,12 +785,12 @@ async function handleSendRunsheet(req, res) {
     <div style="color:#fff;font-size:22px;font-weight:700;margin-top:6px;">Run Sheet: ${projectName}</div>
   </div>
   <div style="padding:24px 28px;">
-    ${message ? `<p style="color:#444;font-size:14px;line-height:1.6;margin:0 0 20px;">${message}</p>` : ''}
+    ${safeMessage ? `<p style="color:#444;font-size:14px;line-height:1.6;margin:0 0 20px;">${safeMessage}</p>` : ''}
     <p style="color:#666;font-size:14px;line-height:1.6;margin:0 0 20px;">
       You've been sent the run sheet for <strong>${projectName}</strong>. Click below to view the full schedule.
     </p>
-    ${runsheetUrl ? `
-    <a href="${runsheetUrl}" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600;">
+    ${safeUrl ? `
+    <a href="${safeUrl}" style="display:inline-block;background:${accent};color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600;">
       View Run Sheet →
     </a>` : ''}
   </div>
@@ -678,10 +807,10 @@ async function handleSendRunsheet(req, res) {
       if (!email || !email.includes('@')) return;
       await sendEmail({
         to: email,
-        subject: `Run Sheet: ${projectName}`,
+        subject: `Run Sheet: ${projectNameRaw}`,
         html: emailBody,
       });
-      log('📋', `Runsheet sent to ${email}`);
+      log('📋', `Runsheet sent to ${maskEmail(email)}`);
     }));
 
     const sent = results.filter(r => r.status === 'fulfilled').length;
@@ -916,6 +1045,7 @@ async function handleGiftTokensEmail(req, res) {
       .select('email,name')
       .eq('agency_id', agencyId)
       .eq('role', 'admin')
+      .eq('active', true)
       .limit(1);
 
     const recipient = members?.[0];
@@ -953,7 +1083,7 @@ async function handleGiftTokensEmail(req, res) {
         </div>
       </body></html>`,
     });
-    log('🎁', `Gift email sent to ${recipient.email} (${tokens} tokens)`);
+    log('🎁', `Gift email sent to ${maskEmail(recipient.email)} (${tokens} tokens)`);
   } catch(e) {
     log('⚠', 'Gift email error: ' + e.message);
   }
@@ -1085,9 +1215,14 @@ async function handleCancelSubscription(req, res) {
 // ── Manual recap trigger (admin only) ────────────────────────────────────────
 async function handleSendRecapNow(req, res) {
   try {
-    const { agencyId, adminEmail } = req.body;
-    if (adminEmail !== (process.env.ADMIN_EMAIL || 'taylor@below.co.nz'))
-      return res.status(403).json({ error: 'Admin only' });
+    const { agencyId } = req.body || {};
+    if (!agencyId) return res.status(400).json({ error: 'agencyId required' });
+    // Identity from the verified token (the old body `adminEmail` check was
+    // spoofable): an admin of this agency, or the platform owner.
+    if (!isPlatformAdmin(req.authUser)) {
+      const m = await requireMember(req.authUser.id, String(agencyId));
+      if (!m || m.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    }
 
     const { data: agData } = await supabaseAdmin
       .from('app_state').select('*').eq('agency_id', agencyId).maybeSingle();
@@ -1277,36 +1412,12 @@ async function handleGenerateImage(req, res) {
   try {
     const { prompt, agencyId, refImages, refImageData } = req.body;
     if (!prompt || !agencyId) return res.status(400).json({ error: 'prompt and agencyId required' });
-    // Authenticated callers (native app, and web once it sends bearer tokens)
-    // must be an active member of the agency. With billing archived they are
-    // never charged studio tokens and never refused for plan/balance reasons.
-    if (req.authUser) {
-      const member = await requireMember(req.authUser.id, agencyId);
-      if (!member) return res.status(403).json({ error: 'Not a member of this agency' });
-    }
+    // requireAuth + needMember({collaborator}) already ran (route table): the
+    // caller is a member of the agency, or collaborates on one of its projects.
+    // Billing is archived, so nobody is charged studio tokens.
     // Support both single refImageData (legacy) and refImages array
-    const imageRefs = refImages ? (Array.isArray(refImages) ? refImages : [refImages])
-                     : refImageData ? [refImageData] : [];
-
-    // Legacy unauthenticated calls (the web app doesn't send a bearer token
-    // yet) still spend 1 studio token: with no identity, the balance is the
-    // only thing stopping this from being an open, free Gemini proxy for
-    // anyone who knows an agency id. Remove this once the web sends auth and
-    // the route moves to requireAuth.
-    const chargeTokens = !req.authUser;
-    let balance = null, newBalance = null;
-    if (chargeTokens) {
-      // Read token balance — handle missing row gracefully
-      const settingsResult = await supabaseAdmin.from('agency_settings')
-        .select('token_balance').eq('agency_id', agencyId).maybeSingle();
-      const settings = settingsResult?.data;
-      balance = (settings && typeof settings.token_balance === 'number') ? settings.token_balance : 0;
-      if (balance <= 0) return res.status(402).json({ error: 'No tokens remaining. Purchase more in the app.' });
-
-      newBalance = balance - 1;
-      // Upsert so it works even if the row doesn't exist yet
-      await _setAgencyTokenBalance(agencyId, newBalance);
-    }
+    const imageRefs = (refImages ? (Array.isArray(refImages) ? refImages : [refImages])
+                     : refImageData ? [refImageData] : []).slice(0, 8);
 
     const geminiRes = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=' + process.env.GEMINI_API_KEY,
@@ -1328,8 +1439,6 @@ async function handleGenerateImage(req, res) {
     if (!geminiRes.ok) {
       const errBody = await geminiRes.text();
       console.error('Gemini API error', geminiRes.status, errBody.slice(0, 400));
-      // Refund the token since generation failed
-      if (chargeTokens) await _setAgencyTokenBalance(agencyId, balance);
       // Handle rate limiting specifically
       if (geminiRes.status === 429) {
         return res.status(429).json({ error: 'Rate limit hit — please wait a few seconds and try again.' });
@@ -1344,16 +1453,12 @@ async function handleGenerateImage(req, res) {
     if (!imgPart) {
       // Log full response to understand why no image was returned
       console.error('No image part in Gemini response:', JSON.stringify(geminiData).slice(0, 400));
-      // Refund the token
-      if (chargeTokens) await _setAgencyTokenBalance(agencyId, balance);
       const reason = geminiData?.candidates?.[0]?.finishReason || 'unknown';
       return res.status(500).json({ error: 'No image returned from Gemini (finish reason: ' + reason + ')' });
     }
 
-    log('🎬', `Generated image for ${agencyId}` + (chargeTokens ? ` — ${newBalance} tokens remaining (legacy unauthenticated call)` : ''));
-    const out = { imageUrl: 'data:' + imgPart.inlineData.mimeType + ';base64,' + imgPart.inlineData.data };
-    if (chargeTokens) out.tokenBalance = newBalance;
-    res.json(out);
+    log('🎬', `Generated image for ${agencyId} (user ${String(req.authUser.id).slice(0, 8)})`);
+    res.json({ imageUrl: 'data:' + imgPart.inlineData.mimeType + ';base64,' + imgPart.inlineData.data });
   } catch (e) {
     console.error('generate-image error:', e.message);
     res.status(500).json({ error: e.message });
@@ -1382,8 +1487,15 @@ async function handleAgencyBrand(req, res) {
   }
 }
 
-// ── POST /submit-brief — client brief form → email to studio admins ───────────
+// ── POST /submit-brief — RETIRED ──────────────────────────────────────────────
+// Unauthenticated, and it emailed a confirmation to any address in the body with
+// unescaped body fields (an open relay). Nothing calls it: brief.html saves to
+// client_briefs and then calls /notify/new-brief. The old implementation is
+// kept below (_legacySubmitBrief, unrouted) for reference.
 async function handleSubmitBrief(req, res) {
+  return res.status(410).json({ error: 'This endpoint has been retired. Use the brief form.' });
+}
+async function _legacySubmitBrief(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   const { agencyId, client, project } = req.body || {};
   if (!agencyId || !client?.email || !client?.name) {
@@ -1392,10 +1504,10 @@ async function handleSubmitBrief(req, res) {
   try {
     // Get agency admin emails + brand
     const [{ data: members }, { data: state }] = await Promise.all([
-      supabaseAdmin.from('agency_members').select('name,email,role').eq('agency_id', agencyId),
+      supabaseAdmin.from('agency_members').select('name,email,role,active').eq('agency_id', agencyId),
       supabaseAdmin.from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle(),
     ]);
-    const admins = (members || []).filter(m => ['admin','manager'].includes(m.role));
+    const admins = (members || []).filter(m => m && m.role === 'admin' && m.active !== false && m.email); // unrouted legacy
     if (!admins.length) return res.status(404).json({ error: 'No admin found for this studio' });
 
     const b = state?.brand || {};
@@ -1465,7 +1577,7 @@ async function handleSubmitBrief(req, res) {
       </div>`;
     await sendEmail({ to: client.email, subject: `Brief received — ${studioName}`, html: confirmHtml });
 
-    log('📋', `Brief submitted by ${client.name} (${client.email}) for agency ${agencyId}`);
+    log('📋', `Brief submitted for agency ${agencyId}`);
     res.json({ ok: true });
   } catch(e) {
     console.error('[submit-brief] error:', e.message);
@@ -1481,27 +1593,95 @@ async function handleSubmitBrief(req, res) {
 // the success screen isn't blocked). Payload is the flat summary that brief.html
 // POSTs: { agency_id, name, company, email, phone, project_type, budget,
 //          description, submitted_at }.
+//
+// PUBLIC (brief.html has no login), so the body is only used to FIND the brief:
+// the email is sent only when a matching client_briefs row exists (same agency,
+// submitted_at within a few seconds of the posted one, saved in the last 30
+// minutes), each brief is announced at most once, and the email content comes
+// from the saved row, not the request.
+const _briefsNotified = new Map(); // brief id -> notified at (ms); pruned after 24h
+async function _findRecentBrief(agencyId, submittedAt, email) {
+  const want = Date.parse(submittedAt || '');
+  if (!isFinite(want) || Math.abs(Date.now() - want) > 10 * 60 * 1000) return null;
+  const { data, error } = await supabaseAdmin.from('client_briefs')
+    .select('id,agency_id,submission,submitted_at').eq('agency_id', String(agencyId))
+    .order('submitted_at', { ascending: false }).limit(20);
+  if (error || !Array.isArray(data)) return null;
+  const wantEmail = String(email || '').toLowerCase().trim();
+  return data.find(r => {
+    const t = Date.parse(r && r.submitted_at);
+    if (!isFinite(t) || Math.abs(t - want) > 5000 || Math.abs(Date.now() - t) > 10 * 60 * 1000) return false;
+    let sub = r.submission;
+    if (typeof sub === 'string') { try { sub = JSON.parse(sub); } catch (e) { sub = {}; } }
+    const rowEmail = String((sub && sub.email) || '').toLowerCase().trim();
+    return !wantEmail || !rowEmail || rowEmail === wantEmail;
+  }) || null;
+}
+
+/**
+ * Who receives "the studio" emails (new client brief, etc.).
+ * Default: ACTIVE ADMINS of the agency with a real email. Deactivated/removed
+ * members, managers, freelancers and guests are never included by default.
+ * Override: app_state.brand.briefNotifyMemberIds = [agency_members.id, ...]
+ * (non-empty) -> exactly those members, still only if active, same agency and
+ * with an email.
+ */
+async function _studioNotifyRecipients(agencyId, brand) {
+  if (!supabaseAdmin || !agencyId) return [];
+  const { data, error } = await supabaseAdmin.from('agency_members')
+    .select('id,name,email,role,active').eq('agency_id', String(agencyId));
+  if (error) { log('⚠', 'studio recipients lookup failed: ' + error.message); return []; }
+  const usable = (data || []).filter(m => m && m.active !== false
+    && typeof m.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(m.email.trim()));
+  const override = brand && Array.isArray(brand.briefNotifyMemberIds)
+    ? brand.briefNotifyMemberIds.map(String).filter(Boolean) : [];
+  const picked = override.length
+    ? usable.filter(m => override.includes(String(m.id)))
+    : usable.filter(m => m.role === 'admin');
+  const seen = new Set();
+  return picked.filter(m => { const e = m.email.trim().toLowerCase(); if (seen.has(e)) return false; seen.add(e); return true; });
+}
+
 async function handleNotifyNewBrief(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const b = req.body || {};
-  const agencyId = b.agency_id;
+  const posted = req.body || {};
+  const agencyId = posted.agency_id;
   if (!agencyId) return res.status(400).json({ ok: false, error: 'agency_id required' });
 
   try {
-    // Recipients: admins + managers of this studio. Brand for studio name/accent.
-    const [{ data: members }, { data: state }] = await Promise.all([
-      supabaseAdmin.from('agency_members').select('name,email,role').eq('agency_id', agencyId),
-      supabaseAdmin.from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle(),
-    ]);
-    const admins = (members || []).filter(m => ['admin','manager'].includes(m.role) && m.email && m.email.includes('@'));
+    if (!supabaseAdmin) return res.json({ ok: false, error: 'not configured' });
+    const briefRow = await _findRecentBrief(agencyId, posted.submitted_at, posted.email);
+    if (!briefRow) {
+      log('📋', `[new-brief] no matching saved brief for agency ${agencyId}; not emailing`);
+      return res.json({ ok: false, error: 'brief not found' });
+    }
+    const briefKey = String(briefRow.id || (agencyId + '|' + briefRow.submitted_at));
+    const nowMs = Date.now();
+    for (const [k, t] of _briefsNotified) if (nowMs - t > 24 * 3600 * 1000) _briefsNotified.delete(k);
+    if (_briefsNotified.has(briefKey)) return res.json({ ok: true, sent: 0, note: 'already notified' });
+    _briefsNotified.set(briefKey, nowMs);
+    let sub = briefRow.submission;
+    if (typeof sub === 'string') { try { sub = JSON.parse(sub); } catch (e) { sub = {}; } }
+    sub = sub || {};
+    const b = {
+      name: sub.name || '', company: sub.company || '', email: sub.email || '', phone: sub.phone || '',
+      project_type: sub.project_type || '', budget: sub.budget || '',
+      description: String(sub.description || '').slice(0, 600),
+    };
+
+    // Recipients: active admins only (or brand.briefNotifyMemberIds), see
+    // _studioNotifyRecipients. Brand for studio name/accent.
+    const { data: state } = await supabaseAdmin.from('app_state').select('brand').eq('agency_id', agencyId).maybeSingle();
+    let brand = state?.brand || {};
+    if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch (e) { brand = {}; } }
+    const admins = await _studioNotifyRecipients(agencyId, brand);
     if (!admins.length) {
-      log('📋', `[new-brief] no admin/manager recipients for agency ${agencyId}`);
+      log('📋', `[new-brief] no active recipients for agency ${agencyId}`);
       return res.json({ ok: true, sent: 0, note: 'no recipients' });
     }
 
-    const brand = state?.brand || {};
     const studioName = brand.appName || brand.name || 'BSMNT';
-    const accent = brand.accentColor || '#7c6fff';
+    const accent = /^#[0-9a-f]{3,8}$/i.test(String(brand.accentColor || '')) ? brand.accentColor : '#7c6fff';
 
     const esc = (s) => String(s == null ? '' : s)
       .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1545,7 +1725,7 @@ async function handleNotifyNewBrief(req, res) {
     const results = await Promise.all(admins.map(a => sendEmail({ to: a.email, subject, html })));
     const sent = results.filter(r => !r || r.ok !== false).length;
 
-    log('📋', `[new-brief] emailed ${sent}/${admins.length} admin(s) for agency ${agencyId} · ${clientName}`);
+    log('📋', `[new-brief] emailed ${sent}/${admins.length} recipient(s) for agency ${agencyId}`);
     res.json({ ok: true, sent });
   } catch(e) {
     console.error('[new-brief] error:', e.message);
@@ -1674,20 +1854,13 @@ async function findProjectByToken(token) {
       return null;
     }
 
-    console.log('[share] Scanning', rows.length, 'row(s) for token:', token.slice(0,8) + '...');
 
     for (const row of rows) {
       let projects = row.projects;
       if (typeof projects === 'string') {
         try { projects = JSON.parse(projects); } catch(e) { continue; }
       }
-      if (!Array.isArray(projects)) {
-        console.log('[share] agency', row.agency_id, '— projects is', typeof projects, '(not array)');
-        continue;
-      }
-      console.log('[share] agency', row.agency_id, '—', projects.length, 'projects, checking tokens...');
-      const tokenProjects = projects.filter(p => p && (p.shareViewToken || p.shareEditToken));
-      console.log('[share]  projects with tokens:', tokenProjects.map(p => p.name + ':' + (p.shareViewToken||'').slice(0,6) + '/' + (p.shareEditToken||'').slice(0,6)));
+      if (!Array.isArray(projects)) continue;
 
       const proj = projects.find(p =>
         p && (p.shareViewToken === token || p.shareEditToken === token)
@@ -1695,7 +1868,6 @@ async function findProjectByToken(token) {
       if (proj) {
         let brand = row.brand;
         if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { brand = {}; } }
-        console.log('[share] ✅ Token matched project:', proj.name);
         return {
           project: proj,
           agencyId: row.agency_id,
@@ -1704,7 +1876,6 @@ async function findProjectByToken(token) {
         };
       }
     }
-    console.log('[share] ❌ Token not found in any project');
     return null;
   } catch(e) {
     console.error('[share] Exception:', e.message);
@@ -2025,11 +2196,20 @@ async function handleEditProjectShare(req, res) {
 
 
 // ── Project Collaboration Invites ─────────────────────────────────────────────
+function _sameEmail(a, b) {
+  const x = String(a || '').toLowerCase().trim(), y = String(b || '').toLowerCase().trim();
+  return !!x && x === y;
+}
 
 
+const INVITE_ROLES = ['admin', 'manager', 'member', 'user', 'crew', 'pilot', 'chief_pilot'];
 async function handleInviteMember(req, res) {
-  const { agencyId, email, role, memberData } = req.body || {};
-  if (!agencyId || !email) return res.status(400).json({ error: 'agencyId and email required' });
+  // requireAuth + needMember({admin}) ran: the caller is an admin of agencyId.
+  const { agencyId, email, memberData } = req.body || {};
+  let { role } = req.body || {};
+  if (!agencyId || !email || typeof email !== 'string' || !email.includes('@'))
+    return res.status(400).json({ error: 'agencyId and email required' });
+  if (role != null && !INVITE_ROLES.includes(String(role))) return res.status(400).json({ error: 'Invalid role' });
   try {
     const expires = new Date(Date.now() + 7*24*60*60*1000).toISOString();
     // Upsert on (agency_id, email) — prevents duplicate invite rows if admin sends twice
@@ -2049,7 +2229,7 @@ async function handleInviteMember(req, res) {
       can_edit_budgets:   memberData?.canEditBudgets   || false,
     }, { onConflict: 'agency_id,email', ignoreDuplicates: false });
     if (error) throw error;
-    log('✉', `Member invite created: ${email} → agency ${agencyId}`);
+    log('✉', `Member invite created: ${maskEmail(email)} → agency ${agencyId}`);
     res.json({ ok: true });
   } catch(e) {
     console.error('invite-member error:', e.message);
@@ -2086,15 +2266,17 @@ async function handleSendProjectInvite(req, res) {
       .select('id').eq('invited_email', invitedEmail).eq('project_id', projectId)
       .eq('owner_agency_id', inviterAgencyId).order('created_at', { ascending: false }).limit(1).maybeSingle();
     const inviteId = newInvite?.id || '';
-    const firstName = (guestMember.name || 'there').split(' ')[0];
-    const pn = projectName || 'a project';
-    const inn = inviterName || 'Someone';
+    const firstName = escapeHtml((guestMember.name || 'there').split(' ')[0]);
+    const pnRaw = String(projectName || 'a project').slice(0, 200);
+    const pn = escapeHtml(pnRaw);
+    const innRaw = String(inviterName || 'Someone').slice(0, 120);
+    const inn = escapeHtml(innRaw);
     sendEmail({
       to: invitedEmail,
-      subject: `${inn} invited you to collaborate on "${pn}"`,
-      html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;"><div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;"><div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;"><div style="font-size:48px;margin-bottom:12px;">🎬</div><h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">Project Invite</h1><p style="color:#9898aa;font-size:13px;margin:0;">via BSMNT</p></div><div style="padding:28px 32px;"><p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p><p style="color:#c8c8d8;font-size:15px;margin:0 0 20px;"><strong style="color:#eeeef2;">${inn}</strong> has invited you to collaborate on <strong style="color:#7c6fff;">${pn}</strong>.</p><p style="color:#9898aa;font-size:13px;margin:0 0 24px;">Open BSMNT to accept or decline — the invite is waiting in your notifications.</p><a href="https://bsmnt.co.nz/app.html?accept_invite=${inviteId}" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:14px;border-radius:8px;text-align:center;font-weight:600;font-size:15px;">Accept project invite \u2192</a><p style="color:#55556a;font-size:12px;margin:16px 0 0;text-align:center;">You can also decline from within the BSMNT app.</p></div><div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;"><p style="color:#55556a;font-size:11px;margin:0;">BSMNT \u00b7 Week Below</p></div></div></body></html>`,
+      subject: `${innRaw} invited you to collaborate on "${pnRaw}"`,
+      html: `<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body style="background:#0c0c0e;margin:0;padding:0;font-family:'DM Sans',system-ui,sans-serif;"><div style="max-width:500px;margin:40px auto;background:#131316;border:1px solid #2c2c36;border-radius:16px;overflow:hidden;"><div style="background:linear-gradient(135deg,rgba(124,111,255,0.3),rgba(192,132,252,0.15));padding:32px;text-align:center;border-bottom:1px solid #2c2c36;"><div style="font-size:48px;margin-bottom:12px;">🎬</div><h1 style="color:#eeeef2;font-size:22px;margin:0 0 4px;font-weight:700;">Project Invite</h1><p style="color:#9898aa;font-size:13px;margin:0;">via BSMNT</p></div><div style="padding:28px 32px;"><p style="color:#c8c8d8;font-size:15px;margin:0 0 16px;">Hey ${firstName},</p><p style="color:#c8c8d8;font-size:15px;margin:0 0 20px;"><strong style="color:#eeeef2;">${inn}</strong> has invited you to collaborate on <strong style="color:#7c6fff;">${pn}</strong>.</p><p style="color:#9898aa;font-size:13px;margin:0 0 24px;">Open BSMNT to accept or decline — the invite is waiting in your notifications.</p><a href="https://bsmnt.co.nz/app.html?accept_invite=${encodeURIComponent(inviteId)}" style="display:block;background:#7c6fff;color:#fff;text-decoration:none;padding:14px;border-radius:8px;text-align:center;font-weight:600;font-size:15px;">Accept project invite \u2192</a><p style="color:#55556a;font-size:12px;margin:16px 0 0;text-align:center;">You can also decline from within the BSMNT app.</p></div><div style="padding:16px 32px;border-top:1px solid #2c2c36;text-align:center;"><p style="color:#55556a;font-size:11px;margin:0;">BSMNT \u00b7 Week Below</p></div></div></body></html>`,
     }).catch(e => log('invite email err', e.message));
-    log('🤝', `Project invite sent: ${invitedEmail} to ${pn}`);
+    log('🤝', `Project invite sent: ${maskEmail(invitedEmail)} for project ${projectId}`);
     res.json({ ok: true });
   } catch(e) {
     var emsg = e.message || String(e);
@@ -2113,6 +2295,9 @@ async function handleAcceptProjectInvite(req, res) {
   try {
     const { data: invite } = await supabaseAdmin.from('project_invites').select('*').eq('id', inviteId).maybeSingle();
     if (!invite) return res.status(404).json({ error: 'Invite not found' });
+    // Only the invited person may answer (guestAgencyId membership checked in the route).
+    if (!_sameEmail(invite.invited_email, req.authUser.email))
+      return res.status(403).json({ error: 'This invite was sent to a different email address' });
     const newStatus = accept ? 'accepted' : 'declined';
     await supabaseAdmin.from('project_invites').update({ status: newStatus }).eq('id', inviteId);
     let projectData = null;
@@ -2152,6 +2337,9 @@ async function handleGetInviteById(req, res) {
     const { data: invite } = await supabaseAdmin.from('project_invites')
       .select('*').eq('id', inviteId).maybeSingle();
     if (!invite) return res.status(404).json({ error: 'Invite not found' });
+    const allowed = _sameEmail(invite.invited_email, req.authUser.email)
+      || !!(invite.owner_agency_id && await requireMember(req.authUser.id, String(invite.owner_agency_id)));
+    if (!allowed) return res.status(404).json({ error: 'Invite not found' });
     res.json({ invite });
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -2161,6 +2349,7 @@ async function handleGetInviteById(req, res) {
 async function handleGetProjectInvites(req, res) {
   const { email } = req.params;
   if (!email) return res.status(400).json({ error: 'email required' });
+  if (!_sameEmail(decodeURIComponent(email), req.authUser.email)) return res.status(403).json({ error: 'You can only list your own invites' });
   try {
     const { data } = await supabaseAdmin.from('project_invites')
       .select('*').eq('invited_email', decodeURIComponent(email)).eq('status', 'pending')
@@ -2177,6 +2366,8 @@ async function handleCheckMemberInvite(req, res) {
   const { email } = req.params;
   const acceptedFilter = req.query.accepted; // 'any' or undefined (= unaccepted only)
   if (!email) return res.status(400).json({ error: 'email required' });
+  // Own invite only: the email must be the verified token's email.
+  if (!_sameEmail(decodeURIComponent(email), req.authUser.email)) return res.status(403).json({ error: 'You can only look up your own invite' });
   try {
     const lcEmail = decodeURIComponent(email).toLowerCase().trim();
     // We can't use .order/.limit/.maybeSingle in one chain on the fluent helper
@@ -2321,11 +2512,11 @@ async function _notifyDeliverableComment(agencyId, proj, del, cmt, explicitAssig
 //                                       Portal → Keys
 //   APN_TEAM_ID / APNS_TEAM_ID       — 10-char Team ID from Apple Developer
 //                                       Portal → Membership
-//   APN_KEY_PATH / APNS_KEY_PATH     — relative path to the .p8 file on disk
-//                                       (e.g. './AuthKey.p8') — preferred
-//     OR
-//   APN_KEY_P8 / APNS_KEY_P8         — full .p8 contents inline, including
-//                                       the BEGIN/END lines. Used if no path.
+//   APN_KEY_P8 / APNS_KEY_P8         — the .p8 contents (PEM incl. BEGIN/END
+//                                       lines, or base64 of the file). PREFERRED.
+//     OR (legacy fallback, only when KEY_P8 is unset)
+//   APN_KEY_PATH / APNS_KEY_PATH     — path to a .p8 file on disk. Keep keys
+//                                       out of the repo (SECURITY_NOTES.md).
 //   APN_BUNDLE_ID / APNS_BUNDLE_ID   — defaults to 'nz.co.belowstudios.bsmnt1'
 //   APN_PRODUCTION / APNS_PRODUCTION — 'true' (default) or 'false'.
 //                                       *** TestFlight + App Store use the
@@ -2342,6 +2533,21 @@ function _apnEnv(name) {
   return process.env['APN_' + name] || process.env['APNS_' + name] || '';
 }
 
+// Normalise an APNs key from an env var: PEM with real or escaped (\n)
+// newlines, or base64 of the whole .p8 file.
+function _apnKeyFromEnv(raw) {
+  let v = String(raw || '').trim();
+  if (!v) return '';
+  if (/^["']/.test(v) && v[0] === v[v.length - 1]) v = v.slice(1, -1);
+  if (!v.includes('-----BEGIN')) {
+    try {
+      const dec = Buffer.from(v, 'base64').toString('utf8');
+      if (dec.includes('-----BEGIN')) v = dec.trim();
+    } catch (e) { /* not base64 */ }
+  }
+  return v.replace(/\\n/g, '\n');
+}
+
 let _apnProvider = null;
 let _apnProviderError = null;
 
@@ -2354,13 +2560,18 @@ function getApnProvider() {
   const keyId  = _apnEnv('KEY_ID');
   const teamId = _apnEnv('TEAM_ID');
 
-  // Two ways to provide the .p8 key:
-  //   1. APN_KEY_PATH — relative path to the .p8 file on disk (your setup)
-  //   2. APN_KEY_P8   — full .p8 contents pasted into an env var
+  // Two ways to provide the .p8 key (env var wins; the file is only a fallback):
+  //   1. APNS_KEY_P8 / APN_KEY_P8 — the .p8 contents in an env var: the PEM text
+  //      (real newlines or literal \n), or the whole file base64-encoded.
+  //   2. APNS_KEY_PATH / APN_KEY_PATH — path to a .p8 file on disk. Used ONLY
+  //      when no KEY_P8 env var is set. Legacy: the key must not live in the repo
+  //      (see SECURITY_NOTES.md for the rotation steps).
   let keyContents = null;
   const keyPath = _apnEnv('KEY_PATH');
-  const keyInline = _apnEnv('KEY_P8');
-  if (keyPath) {
+  const keyInline = _apnKeyFromEnv(_apnEnv('KEY_P8'));
+  if (keyInline) {
+    keyContents = keyInline;
+  } else if (keyPath) {
     try {
       keyContents = fs.readFileSync(keyPath, 'utf8');
     } catch(e) {
@@ -2368,8 +2579,6 @@ function getApnProvider() {
       log('❌', _apnProviderError);
       return null;
     }
-  } else if (keyInline) {
-    keyContents = keyInline;
   }
 
   if (!keyId || !teamId || !keyContents) {
@@ -2576,12 +2785,17 @@ async function handleNotifyTimerEvent(req, res) {
 async function handleRegisterPushToken(req, res) {
   try {
     const b = req.body || {};
-    if (!b.userId || !b.token) {
-      return res.status(400).json({ error: 'userId and token required' });
+    if (!b.token || typeof b.token !== 'string' || b.token.length > 512) {
+      return res.status(400).json({ error: 'token required' });
     }
     if (!supabaseAdmin) return res.status(500).json({ error: 'supabase not configured' });
+    // The owner is the verified caller, never the body's userId.
+    const uid = String(req.authUser.id);
+    if (b.agencyId && !(await requireMember(uid, String(b.agencyId)))) {
+      return res.status(403).json({ error: 'Not a member of this agency' });
+    }
     const { error } = await supabaseAdmin.from('device_tokens').upsert({
-      user_id:      String(b.userId),
+      user_id:      uid,
       agency_id:    b.agencyId ? String(b.agencyId) : null,
       token:        String(b.token),
       platform:     b.platform || 'ios',
@@ -2592,7 +2806,7 @@ async function handleRegisterPushToken(req, res) {
       log('❌', 'register-token error: ' + (error.message || error));
       return res.status(500).json({ error: error.message || String(error) });
     }
-    log('🔔', 'Push token registered for user ' + String(b.userId).slice(0, 8) + '…');
+    log('🔔', 'Push token registered for user ' + uid.slice(0, 8) + '…');
     res.json({ ok: true });
   } catch(e) {
     log('❌', 'register-token threw: ' + e.message);
@@ -2610,15 +2824,9 @@ async function handlePushSend(req, res) {
     if (!b.userId || !b.title) {
       return res.status(400).json({ error: 'userId and title required' });
     }
-    if (req.authUser) {
-      // Authenticated: only yourself or someone in one of your own studios.
-      const ok = await _sharesAgency(String(req.authUser.id), String(b.userId));
-      if (!ok) return res.status(403).json({ error: 'You can only push to members of your own studio' });
-    } else {
-      // Legacy unauthenticated path (web sends no token yet). Kept for backward
-      // compatibility; will move to requireAuth once the web sends tokens.
-      log('⚠', 'DEPRECATED: unauthenticated /push/send (send Authorization: Bearer <token>)');
-    }
+    // requireAuth ran: only yourself or someone in one of your own studios.
+    const ok = await _sharesAgency(String(req.authUser.id), String(b.userId));
+    if (!ok) return res.status(403).json({ error: 'You can only push to members of your own studio' });
     const result = await sendPushToUser(String(b.userId), b.title, b.body || '', {
       deeplink:      b.deeplink,
       kind:          b.kind,
@@ -2710,7 +2918,7 @@ async function handlePushStatus(req, res) {
       status.apns.keyId = _apnEnv('KEY_ID') || null;
       status.apns.teamId = _apnEnv('TEAM_ID') || null;
       status.apns.usingPrefix = process.env.APN_KEY_ID ? 'APN_' : (process.env.APNS_KEY_ID ? 'APNS_' : 'NONE');
-      status.apns.keySource = _apnEnv('KEY_PATH') ? 'file:' + _apnEnv('KEY_PATH') : (_apnEnv('KEY_P8') ? 'inline-env-var' : 'NONE');
+      status.apns.keySource = _apnEnv('KEY_P8') ? 'env-var' : (_apnEnv('KEY_PATH') ? 'file (legacy fallback)' : 'NONE');
     } else {
       status.apns.error = _apnProviderError;
     }
@@ -2732,19 +2940,42 @@ async function handlePushStatus(req, res) {
 }
 
 
+// Allowed for (a) an admin of the agency (Team page enable/disable, re-adding a
+// removed member), or (b) the invitee re-activating THEIR OWN membership row
+// while accepting an invite to that agency (web handlePendingInvite fallback).
+// Nobody can change their own row otherwise, and admins can't deactivate themselves.
 async function handleSetMemberActive(req, res) {
   const { userId, agencyId, active } = req.body || {};
   if (!userId || !agencyId || active === undefined) {
     return res.status(400).json({ error: 'userId, agencyId, active required' });
   }
   try {
+    const caller = await requireMember(req.authUser.id, String(agencyId));
+    const isAdmin = !!(caller && caller.role === 'admin');
+    if (isAdmin && String(caller.id) === String(userId) && !active) {
+      return res.status(400).json({ error: 'You can\u2019t remove yourself from your own studio.' });
+    }
+    if (!isAdmin) {
+      let ok = false;
+      if (active) {
+        const email = String(req.authUser.email || '').toLowerCase().trim();
+        const [{ data: target }, { data: inv }] = await Promise.all([
+          supabaseAdmin.from('agency_members').select('id,email,user_id')
+            .eq('id', String(userId)).eq('agency_id', String(agencyId)).maybeSingle(),
+          supabaseAdmin.from('invites').select('id').eq('agency_id', String(agencyId)).eq('email', email).limit(1),
+        ]);
+        ok = !!(target && email && Array.isArray(inv) && inv.length &&
+          (String(target.user_id || '') === String(req.authUser.id) || String(target.email || '').toLowerCase().trim() === email));
+      }
+      if (!ok) return res.status(403).json({ error: 'Admins only' });
+    }
     const { error } = await supabaseAdmin
       .from('agency_members')
       .update({ active: !!active })
       .eq('id', userId)
       .eq('agency_id', agencyId);
     if (error) return res.status(500).json({ error: error.message });
-    log('👤', `Member ${userId} active=${active} in agency ${agencyId}`);
+    log('👤', `Member ${userId} active=${active} in agency ${agencyId} (by ${String(req.authUser.id).slice(0, 8)})`);
     res.json({ ok: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -2754,13 +2985,16 @@ async function handleSetMemberActive(req, res) {
 
 async function handleLinkPreview(req, res) {
   const { url } = req.body || {};
-  if (!url) return res.status(400).json({ error: 'url required' });
+  if (!url || typeof url !== 'string' || url.length > 2048) return res.status(400).json({ error: 'url required' });
   try {
-    const resp = await fetch(url, {
+    // SSRF-safe: http/https only, every resolved address must be public (no
+    // loopback/private/link-local/metadata, IPv4 or IPv6), connection pinned to
+    // the checked address, redirects re-checked (max 3), 5s, 512 KB cap.
+    const resp = await safeFetchText(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; BSMNT/1.0)' },
-      signal: AbortSignal.timeout(5000)
+      timeoutMs: 5000, maxBytes: 512 * 1024, maxRedirects: 3,
     });
-    const html = await resp.text();
+    const html = resp.text || '';
     function getMeta(prop) {
       const patterns = [
         new RegExp('<meta[^>]+property=["\']' + prop + '["\'][^>]*content=["\']([^"\']+)["\']', 'i'),
@@ -2782,8 +3016,10 @@ async function handleLinkPreview(req, res) {
 }
 
 async function handleSaveUserPref(req, res) {
-  const { userId, agencyId, key, value } = req.body || {};
-  if (!userId || !agencyId || !key) return res.status(400).json({ error: 'userId, agencyId, key required' });
+  // The member row comes from the verified token (user_id), never from the
+  // body's userId, so nobody can edit another member's preferences.
+  const { agencyId, key, value } = req.body || {};
+  if (!agencyId || !key) return res.status(400).json({ error: 'agencyId, key required' });
   // Whitelist allowed pref keys — never let clients write arbitrary fields
   const ALLOWED = ['uiTheme', 'cardStyle', 'bgTheme', 'accentColor', 'navOrder', 'lightMode', 'checklist'];
   if (!ALLOWED.includes(key)) return res.status(400).json({ error: 'Key not allowed: ' + key });
@@ -2791,17 +3027,17 @@ async function handleSaveUserPref(req, res) {
     // Fetch current preferences first
     const { data: row } = await supabaseAdmin
       .from('agency_members')
-      .select('preferences')
-      .eq('id', userId)
-      .eq('agency_id', agencyId)
+      .select('id,preferences')
+      .eq('user_id', String(req.authUser.id))
+      .eq('agency_id', String(agencyId))
       .maybeSingle();
     if (!row) return res.status(404).json({ error: 'Member not found' });
     const prefs = Object.assign({}, row.preferences || {}, { [key]: value });
     const { error } = await supabaseAdmin
       .from('agency_members')
       .update({ preferences: prefs })
-      .eq('id', userId)
-      .eq('agency_id', agencyId);
+      .eq('id', String(row.id))
+      .eq('agency_id', String(agencyId));
     if (error) return res.status(500).json({ error: error.message });
     res.json({ ok: true });
   } catch(e) {
@@ -2810,12 +3046,10 @@ async function handleSaveUserPref(req, res) {
 }
 
 async function handleBulkEmail(req, res) {
-  const { subject, body, senderName, agencyId } = req.body || {};
+  const { subject, body } = req.body || {};
   if (!subject || !body) return res.status(400).json({ error: 'subject and body required' });
-  // Only allow Taylor to send bulk emails
-  if (agencyId !== 'b29ba033-e4a6-4e61-a7c4-1ec3a6c6708f') {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
+  // Platform owner only: enforced by requirePlatformAdmin on the verified token
+  // (the old body agencyId check could be spoofed by anyone).
 
   try {
     // Fetch all agency admin emails from agency_members
@@ -2843,7 +3077,7 @@ async function handleBulkEmail(req, res) {
         await sendEmail({ to: r.email, subject, html: personalised });
         sent++;
       } catch(e) {
-        log('✉ bulk-email error for', r.email, e.message);
+        log('✉', 'bulk-email error for ' + maskEmail(r.email) + ': ' + e.message);
         failed++;
       }
     }
@@ -2869,8 +3103,8 @@ async function getAgencyLogoHtml(agencyId, height='36px') {
 }
 
 function sendEmail({ to, subject, html }) {
-  if (!RESEND_KEY) { log('✉', `[no key] Would send to ${to}: ${subject}`); return Promise.resolve(); }
-  if (!to || !to.includes('@')) { log('✉', `Skipping — invalid address: ${to}`); return Promise.resolve(); }
+  if (!RESEND_KEY) { log('✉', `[no key] Would send to ${maskEmail(to)}: ${subject}`); return Promise.resolve(); }
+  if (!to || typeof to !== 'string' || !to.includes('@')) { log('✉', 'Skipping — invalid address'); return Promise.resolve(); }
   const body = JSON.stringify({ from: FROM_EMAIL, to, subject, html });
   return new Promise(resolve => {
     const req = https.request({
@@ -2880,8 +3114,8 @@ function sendEmail({ to, subject, html }) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) { log('✉', `Sent to ${to} — ${subject}`); resolve({ ok:true }); }
-        else { log('✉', `Failed (${res.statusCode}) to ${to}: ${data}`); resolve({ ok:false, error:`HTTP ${res.statusCode}`, detail:data }); }
+        if (res.statusCode >= 200 && res.statusCode < 300) { log('✉', `Sent to ${maskEmail(to)} — ${subject}`); resolve({ ok:true }); }
+        else { log('✉', `Failed (${res.statusCode}) to ${maskEmail(to)}: ${String(data).slice(0, 300)}`); resolve({ ok:false, error:`HTTP ${res.statusCode}`, detail:data }); }
       });
     });
     req.on('error', e => { log('✉', `Error: ${e.message}`); resolve({ ok:false, error:e.message }); });
@@ -2953,15 +3187,23 @@ async function weeklyEmail(user, { myProjects, completedThisWeek, hoursLastWeek,
   };
 }
 
-function assignmentEmail(user, project, byName, logoHtml) {
-  const firstName = (user.name || 'there').split(' ')[0];
+function assignmentEmail(user, projectIn, byNameIn, logoHtml) {
+  const H = escapeHtml;
+  const project = {
+    name: String((projectIn && projectIn.name) || 'a project'),
+    client: H(projectIn && projectIn.client || ''),
+    endDate: projectIn && /^\d{4}-\d{2}-\d{2}$/.test(String(projectIn.endDate || '')) ? projectIn.endDate : '',
+    description: H(projectIn && projectIn.description || ''),
+  };
+  const byName = H(byNameIn || 'Someone');
+  const firstName = H((user.name || 'there').split(' ')[0]);
   const dueFmt = project.endDate ? new Date(project.endDate+'T12:00:00').toLocaleDateString('en-NZ',{day:'numeric',month:'long',year:'numeric'}) : null;
   return {
     subject: `You've been added to "${project.name}"`,
     html: wrap(`<h2>You're on a new project</h2>
       <p class="sub">${byName} has assigned you to a project.</p>
       <div class="proj-card">
-        <div class="proj-card-name">${project.name}</div>
+        <div class="proj-card-name">${H(project.name)}</div>
         ${project.client?`<div class="proj-card-client">${project.client}</div>`:''}
         ${dueFmt?`<div class="proj-card-due">📅 Due ${dueFmt}</div>`:''}
         ${project.description?`<div class="proj-card-desc">${project.description}</div>`:''}
@@ -3034,233 +3276,319 @@ function scheduleWeeklyRecap() {
   setTimeout(()=>{sendWeeklyRecaps();scheduleWeeklyRecap();scheduleRetainerCheck();},ms);
 }
 
-function notifyAssignments(newProjects, prevProjects, triggerName) {
-  if(!Array.isArray(newProjects))return;
-  newProjects.forEach(newP=>{
-    const oldP=(prevProjects||[]).find(p=>String(p.id)===String(newP.id));
-    const oldIds=(oldP?oldP.assigned||[]:[]).map(String);
-    const newIds=(newP.assigned||[]).map(String);
-    const added=newIds.filter(id=>!oldIds.includes(id));
-    log('🔍',`Assignment check "${newP.name}": added=[${added}]`);
-    if(!added.length)return;
-    const cl=(appState.clients||[]).find(c=>c.id===newP.clientId);
-    const proj={name:newP.name,client:cl?cl.name:'',endDate:newP.endDate,description:newP.description};
-    added.forEach(uid=>{
-      const user=(appState.users||[]).find(u=>String(u.id)===uid);
-      if(!user||!user.email||!user.email.includes('@')||user.emailAssign===false)return;
-      const{subject,html}=assignmentEmail(user,proj,triggerName||'Someone');
-      log('✉',`Assignment email → ${user.email} for "${newP.name}"`);
-      sendEmail({to:user.email,subject,html});
-    });
+// Assignment emails for projects synced over the socket (web wsSend app_sync).
+// Multi-tenant: recipients are ACTIVE members of the sender's agency, looked up
+// in agency_members (never the emails in the message), and only when their
+// emailAssign preference isn't off. Everything interpolated is escaped.
+const _assignPrev = new Map(); // agencyId -> previous projects snapshot (assignment diff only)
+async function notifyAssignments(agencyId, newProjects, prevProjects, triggerName) {
+  if (!Array.isArray(newProjects) || !supabaseAdmin || !agencyId) return;
+  const adds = [];
+  newProjects.forEach(newP => {
+    if (!newP) return;
+    const oldP = (prevProjects || []).find(p => p && String(p.id) === String(newP.id));
+    const oldIds = (oldP ? oldP.assigned || [] : []).map(String);
+    const added = (newP.assigned || []).map(String).filter(id => !oldIds.includes(id));
+    if (added.length) adds.push({ newP, added });
   });
+  if (!adds.length) return;
+  const { data: members, error } = await supabaseAdmin.from('agency_members')
+    .select('id,name,email,active,preferences,email_assign').eq('agency_id', String(agencyId));
+  if (error) { log('⚠', 'assignment recipients: ' + error.message); return; }
+  const logoHtml = await getAgencyLogoHtml(agencyId);
+  for (const { newP, added } of adds) {
+    for (const uid of added) {
+      const m = (members || []).find(x => String(x.id) === uid);
+      if (!m || m.active === false || !m.email || !String(m.email).includes('@')) continue;
+      const pref = (m.preferences && m.preferences.emailAssign != null) ? m.preferences.emailAssign : m.email_assign;
+      if (pref === false) continue;
+      const { subject, html } = assignmentEmail(m, { name: newP.name, client: '', endDate: newP.endDate, description: newP.description }, triggerName || 'Someone', logoHtml);
+      sendEmail({ to: m.email, subject, html });
+    }
+  }
 }
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
+// Every socket must authenticate before anything else is processed:
+//   first message {type:'auth', token:<Supabase access token>, agencyId?}
+//   (or ?token=<access token> on the URL, for clients that can't send first).
+// Unauthenticated sockets get no snapshot and every other message is refused.
+// Messages are handled strictly in order per socket, so a client can send auth
+// and then its payload back-to-back. Broadcasts only reach sockets whose user
+// is a member of the payload's agencyId.
 
-wss.on('connection', socket => {
+const WS_AUTH_TIMEOUT_MS = 30 * 1000;
+
+async function _wsAuthenticate(socket, token, wantAgencyId) {
+  const user = await userFromToken(token);
+  if (!user) return false;
+  const rows = await memberships(user.id);
+  socket.user = user;
+  socket.memberRows = rows;
+  socket.agencies = new Set(rows.map(r => String(r.agency_id)));
+  socket.agencyId = (wantAgencyId && socket.agencies.has(String(wantAgencyId))) ? String(wantAgencyId)
+                  : (rows[0] ? String(rows[0].agency_id) : null);
+  return true;
+}
+
+// The agency a message acts on: msg.agencyId if the caller belongs to it,
+// otherwise the socket's default agency.
+function _wsAgency(socket, msgAgencyId) {
+  if (msgAgencyId && socket.agencies && socket.agencies.has(String(msgAgencyId))) return String(msgAgencyId);
+  if (msgAgencyId) return null;
+  return socket.agencyId || null;
+}
+function _wsIsAdminOf(socket, agencyId) {
+  return !!(socket.memberRows || []).find(r => String(r.agency_id) === String(agencyId) && r.role === 'admin');
+}
+// agency_members.id (the app's user id in timers/assignments) owned by this socket's user.
+function _wsOwnMember(socket, memberId) {
+  return (socket.memberRows || []).find(r => String(r.id) === String(memberId)) || null;
+}
+function _wsSend(socket, obj) {
+  try { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(obj)); } catch (e) {}
+}
+
+wss.on('connection', (socket, req) => {
   clients.add(socket);
-  log('+', `Client connected (total: ${clients.size})`);
-  log('🔑', `RESEND_API_KEY: ${RESEND_KEY ? 'SET (' + RESEND_KEY.slice(0,8) + '...)' : 'NOT SET'}`);
   socket._lastSync = 0; socket._syncCount = 0;
-  sendSnapshot(socket);
+  socket.user = null; socket.agencies = new Set(); socket.memberRows = [];
+  socket._ip = clientIp(req || { headers: {} });
+  socket._chain = Promise.resolve();
+  log('+', `Client connected (total: ${clients.size})`);
+
+  // Optional URL token (?token=). The web sends {type:'auth'} as its first message instead.
+  try {
+    const q = new URL((req && req.url) || '/', 'http://x').searchParams;
+    const t = q.get('token');
+    if (t) socket._chain = socket._chain.then(() => _wsAuthenticate(socket, t, q.get('agencyId'))
+      .then(ok => { if (ok) { _wsSend(socket, { type: 'auth_ok' }); sendSnapshot(socket); } }));
+  } catch (e) {}
+
+  // Drop sockets that never authenticate.
+  socket._authTimer = setTimeout(() => { if (!socket.user) { try { socket.close(4401, 'auth required'); } catch (e) {} } }, WS_AUTH_TIMEOUT_MS);
 
   socket.on('message', raw => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-    switch (msg.type) {
-
-      case 'timer_start': {
-        const { userId, userName, userColor, userInitials, projectId, projectName, taskId, phase } = msg;
-        if (!userId) return;
-        activeTimers[String(userId)] = { userId, userName, userColor, userInitials, projectId, projectName, taskId, phase, startedAt: new Date().toISOString() };
-        broadcast({ type:'timer_start', timer:activeTimers[String(userId)] }, socket);
-        _notifyTimerEvent('start', userId, userName, projectName);
-        log('▶', `${userName} started timer on "${projectName}"`);
-        break;
-      }
-
-      case 'timer_stop': {
-        const { userId } = msg;
-        if (!userId) return;
-        const timer = activeTimers[String(userId)];
-        delete activeTimers[String(userId)];
-        broadcast({ type:'timer_stop', userId, timer }, socket);
-        if (timer) _notifyTimerEvent('stop', userId, timer.userName, timer.projectName);
-        if (timer) log('■', `${timer.userName} stopped timer`);
-        break;
-      }
-
-      case 'app_sync': {
-        const now = Date.now();
-        if (now - (socket._lastSync||0) < 500) {
-          socket._syncCount = (socket._syncCount||0) + 1;
-          if (socket._syncCount > 5) { log('⚠','Rate limit: app_sync throttled'); break; }
-        } else { socket._syncCount = 0; }
-        socket._lastSync = now;
-        const { projects, clients:cls, users, archived, tasks, wbState, templates, brand, userName } = msg;
-        const prevProjects = JSON.parse(JSON.stringify(appState.projects||[]));
-        if (projects  !== undefined) appState.projects  = projects;
-        if (cls       !== undefined) appState.clients   = cls;
-        if (users     !== undefined) appState.users = users.map(u => { const { pin, ...rest } = u; return rest; });
-        if (archived  !== undefined) appState.archived  = archived;
-        if (tasks     !== undefined) appState.tasks     = tasks;
-        if (wbState   !== undefined) appState.wbState   = wbState;
-        if (templates !== undefined) appState.templates = templates;
-        if (msg.taskTemplates  !== undefined) appState.taskTemplates  = msg.taskTemplates;
-        if (msg.businessCosts  !== undefined) appState.businessCosts  = msg.businessCosts;
-        if (msg.retainers      !== undefined) appState.retainers      = msg.retainers;
-        if (brand     !== undefined) appState.brand     = brand;
-        appState.seeded = true;
-        scheduleSave();
-        broadcast({ type:'app_sync', appState, triggeredBy:userName||'?' }, socket);
-        log('🔄', `State updated by ${userName||'unknown'}`);
-        if (projects !== undefined) notifyAssignments(projects, prevProjects, userName);
-        break;
-      }
-
-      case 'wb_sync': {
-        appState.wbState = msg.wbState||appState.wbState;
-        appState.seeded = true; scheduleSave();
-        broadcast({ type:'wb_sync', wbState:appState.wbState, triggeredBy:msg.userName||'?' }, socket);
-        break;
-      }
-
-      case 'tasks_sync': {
-        appState.tasks = msg.tasks||appState.tasks;
-        appState.seeded = true; scheduleSave();
-        broadcast({ type:'tasks_sync', tasks:appState.tasks, triggeredBy:msg.userName||'?' }, socket);
-        break;
-      }
-
-      case 'ping': { sendSnapshot(socket); break; }
-
-      case 'test_email': {
-        const to = msg.to;
-        if (!to||!to.includes('@')) { socket.send(JSON.stringify({type:'email_result',ok:false,error:'No valid email address.'})); break; }
-        if (!RESEND_KEY) { socket.send(JSON.stringify({type:'email_result',ok:false,to,error:'RESEND_API_KEY not set.'})); break; }
-        sendEmail({ to, subject:'✅ BSMNT — email test', html:wrap(`
-          <h2>Test email ✓</h2>
-          <p class="sub">BSMNT emails are working correctly.</p>
-          <p style="font-size:13px;color:#8080a0;">Sent: ${new Date().toISOString()}</p>
-        `) }).then(r => socket.send(JSON.stringify({type:'email_result',ok:r.ok,to,error:r.error||null})));
-        log('✉', `Test email → ${to}`);
-        break;
-      }
-
-      case 'send_recap_now': {
-        log('✉', `Manual recap by ${msg.userName||'?'} (agency ${msg.agencyId})`);
-        (async () => {
-          try {
-            if (!supabaseAdmin) throw new Error('Supabase not configured on the server.');
-            const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', msg.agencyId).maybeSingle();
-            if (!agData) throw new Error('Agency not found.');
-            const users = await _recapRecipients(msg.agencyId);
-            let sent = 0, fails = 0;
-            for (const user of users) {
-              const r = await _sendMemberRecap(user, agData, users, msg.agencyId);
-              if (r && r.ok === false) fails++; else sent++;
-            }
-            socket.send(JSON.stringify({ type:'recap_result', ok: fails === 0, count: sent, sent, fails,
-              error: fails ? (sent + ' sent, ' + fails + ' failed · check the bsmnt.co.nz domain in Resend') : null }));
-          } catch(e) {
-            socket.send(JSON.stringify({ type:'recap_result', ok:false, error:e.message }));
-          }
-        })();
-        break;
-      }
-
-      case 'feedback_reply': {
-        const { userEmail, subject, replyText, senderName } = msg;
-        if (!userEmail||!userEmail.includes('@')||!RESEND_KEY||!replyText?.trim()) break;
-        sendEmail({ to:userEmail, subject:subject||'Re: your feedback', html:wrap(`
-          <h2>✉ Reply to your feedback</h2>
-          <p class="sub">Re: <strong>${subject||'your feedback'}</strong></p>
-          <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:3px solid #7c6fff;">
-            <div style="font-size:14px;color:#e0e0ec;line-height:1.75;white-space:pre-wrap;">${replyText.trim()}</div>
-          </div>
-          <p style="font-size:13px;color:#8080a0;margin:0;">— ${senderName||'The BSMNT team'}</p>
-        `) });
-        log('✉', `Feedback reply → ${userEmail}`);
-        break;
-      }
-
-      case 'project_assigned': {
-        const { to, userName:uName, projectName, assignedBy } = msg;
-        if (!to||!to.includes('@')||!RESEND_KEY) break;
-        const proj=(appState.projects||[]).find(p=>p.name===projectName);
-        const user=(appState.users||[]).find(u=>u.email===to)||{name:uName};
-        if (proj) {
-          const cl=(appState.clients||[]).find(c=>c.id===proj.clientId);
-          const{subject,html}=assignmentEmail(user,{name:proj.name,client:cl?cl.name:'',endDate:proj.endDate,description:proj.description},assignedBy||'Someone');
-          sendEmail({to,subject,html});
-        } else {
-          sendEmail({to,subject:`You've been added to "${projectName}"`,html:wrap(`
-            <h2>You're on a new project</h2>
-            <p class="sub">${assignedBy||'Someone'} added you to <strong>${projectName}</strong>.</p>
-            <p style="font-size:13px;color:#8080a0;line-height:1.7;margin:0;">Log in to BSMNT to view the full brief.</p>
-          `)});
-        }
-        log('✉', `project_assigned → ${to} for "${projectName}"`);
-        break;
-      }
-
-      case 'feedback_submitted': {
-        // Native sends `entry` (the feedback row) plus flat fields; the web sends
-        // only flat fields (agencyId, userName, userEmail, feedbackType, subject,
-        // preview, page). Read either shape.
-        const e = (msg.entry && typeof msg.entry === 'object') ? msg.entry : {};
-        const fb = {
-          type:       String(e.type || msg.feedbackType || 'general'),
-          subject:    e.subject || msg.subject || '',
-          message:    e.message || msg.message || msg.preview || '',
-          user_name:  e.user_name || msg.userName || '',
-          user_email: e.user_email || msg.userEmail || '',
-          page:       e.page || msg.page || '',
-          agency_id:  e.agency_id || msg.agencyId || '',
-        };
-        const isPreview = !e.message && !msg.message && !!msg.preview;
-        log('💬', `Feedback [${fb.type}] from agency ${String(fb.agency_id || '?').slice(0, 8)}`);
-        const adminEmail=process.env.ADMIN_EMAIL||'';
-        if (adminEmail&&adminEmail.includes('@')&&RESEND_KEY) {
-          const H=_quoteEsc;
-          const typeEmoji={bug:'🐛',feature:'💡',general:'💬'}[fb.type]||'💬';
-          sendEmail({to:adminEmail,subject:`${typeEmoji} [${fb.type}] ${fb.subject||'Feedback'}`,html:wrap(`
-            <h2>${typeEmoji} New ${H(fb.type)} feedback</h2>
-            <p class="sub">From <strong>${H(fb.user_name||'Unknown')}</strong> (${H(fb.user_email||'no email')}) on ${H(fb.page||'unknown page')}</p>
-            <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
-              <div style="font-size:15px;font-weight:600;color:#fff;margin-bottom:8px;">${H(fb.subject||'(no subject)')}</div>
-              <div style="font-size:14px;color:#8080a0;line-height:1.7;white-space:pre-wrap;">${H(fb.message)}${isPreview && fb.message.length >= 120 ? '…' : ''}</div>
-            </div>${isPreview ? '<p style="font-size:12px;color:#55556a;">First 120 characters shown; the full message is in the feedback table.</p>' : ''}
-          `)});
-        }
-        break;
-      }
-
-      case 'feedback_status_update': {
-        const { to, subject, status, userName:uName2, customMessage } = msg;
-        if (!to||!to.includes('@')||!RESEND_KEY) break;
-        const statusMsg=customMessage||{
-          reviewing:"We're looking into this and will keep you posted.",
-          shipped:"Great news — this has been shipped!",
-          closed:"We've reviewed this and closed it out. Thanks for your time.",
-        }[status]||`Status: ${status}`;
-        const col=status==='shipped'?'#34d399':status==='reviewing'?'#fbbf24':'#7c6fff';
-        sendEmail({to,subject:`Re: ${subject||'your feedback'}`,html:wrap(`
-          <h2>Update on your feedback</h2>
-          <p class="sub">Re: <strong>${subject||'your feedback'}</strong></p>
-          <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid ${col};">
-            <div style="font-size:14px;color:#e0e0ec;line-height:1.75;white-space:pre-wrap;">${statusMsg}</div>
-          </div>
-          <p style="font-size:13px;color:#8080a0;">— ${uName2||'The team'}</p>
-        `)});
-        log('✉', `Feedback reply → ${to}: ${status}`);
-        break;
-      }
-    }
+    socket._chain = socket._chain
+      .then(() => _wsHandleMessage(socket, raw))
+      .catch(e => log('⚠', 'ws message error: ' + (e && e.message)));
   });
 
-  socket.on('close', () => { clients.delete(socket); log('-', `Client disconnected (total: ${clients.size})`); });
+  socket.on('close', () => { clearTimeout(socket._authTimer); clients.delete(socket); log('-', `Client disconnected (total: ${clients.size})`); });
   socket.on('error', err => { console.error('Socket error:', err.message); clients.delete(socket); });
 });
+
+async function _wsHandleMessage(socket, raw) {
+  let msg; try { msg = JSON.parse(raw); } catch { return; }
+  if (!msg || typeof msg !== 'object') return;
+
+  if (msg.type === 'auth') {
+    if (overLimit('ws-auth', socket._ip, MIN, 30)) return _wsSend(socket, { type: 'auth_error', error: 'rate limited' });
+    const ok = await _wsAuthenticate(socket, msg.token, msg.agencyId).catch(() => false);
+    if (!ok) { _wsSend(socket, { type: 'auth_error', error: 'invalid token' }); return; }
+    clearTimeout(socket._authTimer);
+    _wsSend(socket, { type: 'auth_ok' });
+    sendSnapshot(socket);
+    return;
+  }
+  if (!socket.user) {
+    _wsSend(socket, { type: 'error', error: 'unauthorized', for: String(msg.type || '') });
+    return;
+  }
+  const uid = String(socket.user.id);
+  if (overLimit('ws-msg', uid, MIN, 120)) return;
+  const EMAIL_TYPES = ['test_email', 'send_recap_now', 'feedback_reply', 'project_assigned', 'feedback_submitted', 'feedback_status_update'];
+  if (EMAIL_TYPES.includes(msg.type) && (overLimit('ws-mail-m', uid, MIN, 20) || overLimit('ws-mail-h', uid, HOUR, 200))) {
+    if (msg.type === 'test_email') _wsSend(socket, { type: 'email_result', ok: false, error: 'Too many emails. Try again later.' });
+    if (msg.type === 'send_recap_now') _wsSend(socket, { type: 'recap_result', ok: false, error: 'Too many requests. Try again later.' });
+    return;
+  }
+  const H = escapeHtml;
+
+  switch (msg.type) {
+
+    case 'timer_start': {
+      const { userId, userName, userColor, userInitials, projectId, projectName, taskId, phase } = msg;
+      const mem = userId && _wsOwnMember(socket, userId);
+      if (!mem) return;
+      const agencyId = String(mem.agency_id);
+      activeTimers[String(userId)] = { agencyId, userId, userName, userColor, userInitials, projectId, projectName, taskId, phase, startedAt: new Date().toISOString() };
+      broadcast({ type:'timer_start', agencyId, timer:activeTimers[String(userId)] }, socket);
+      _notifyTimerEvent('start', userId, userName, projectName);
+      log('▶', `Timer started (member ${String(userId).slice(0, 8)})`);
+      break;
+    }
+
+    case 'timer_stop': {
+      const { userId } = msg;
+      const mem = userId && _wsOwnMember(socket, userId);
+      if (!mem) return;
+      const timer = activeTimers[String(userId)];
+      delete activeTimers[String(userId)];
+      broadcast({ type:'timer_stop', agencyId: String(mem.agency_id), userId, timer }, socket);
+      if (timer) _notifyTimerEvent('stop', userId, timer.userName, timer.projectName);
+      break;
+    }
+
+    case 'app_sync': {
+      // Web forwards its projects here only so assignment emails can fire. The
+      // old code merged every studio's data into one global state and pushed it
+      // to every socket; now it is per-agency, in memory, and never re-broadcast.
+      const now = Date.now();
+      if (now - (socket._lastSync||0) < 500) {
+        socket._syncCount = (socket._syncCount||0) + 1;
+        if (socket._syncCount > 5) { log('⚠','Rate limit: app_sync throttled'); break; }
+      } else { socket._syncCount = 0; }
+      socket._lastSync = now;
+      const agencyId = _wsAgency(socket, msg.agencyId);
+      if (!agencyId || !Array.isArray(msg.projects)) break;
+      const prev = _assignPrev.get(agencyId);
+      _assignPrev.set(agencyId, msg.projects.map(p => ({ id: p && p.id, assigned: (p && p.assigned) || [] })));
+      // First sync after a restart has no baseline: record it, don't email everyone.
+      if (prev) notifyAssignments(agencyId, msg.projects, prev, msg.userName).catch(e => log('⚠', 'assign notify: ' + e.message));
+      break;
+    }
+
+    case 'wb_sync':
+    case 'tasks_sync': {
+      // Legacy relays; scoped to the sender's agency and not persisted.
+      const agencyId = _wsAgency(socket, msg.agencyId);
+      if (!agencyId) break;
+      const out = msg.type === 'wb_sync'
+        ? { type:'wb_sync', agencyId, wbState: msg.wbState || {}, triggeredBy: msg.userName || '?' }
+        : { type:'tasks_sync', agencyId, tasks: msg.tasks || [], triggeredBy: msg.userName || '?' };
+      broadcast(out, socket);
+      break;
+    }
+
+    case 'ping': { sendSnapshot(socket); break; }
+
+    case 'test_email': {
+      const to = msg.to;
+      if (!to || typeof to !== 'string' || !to.includes('@')) { _wsSend(socket, {type:'email_result',ok:false,error:'No valid email address.'}); break; }
+      if (!(socket.memberRows || []).some(r => r.role === 'admin') && !isPlatformAdmin(socket.user)) { _wsSend(socket, {type:'email_result',ok:false,to,error:'Admins only.'}); break; }
+      if (!RESEND_KEY) { _wsSend(socket, {type:'email_result',ok:false,to,error:'RESEND_API_KEY not set.'}); break; }
+      sendEmail({ to, subject:'✅ BSMNT — email test', html:wrap(`
+        <h2>Test email ✓</h2>
+        <p class="sub">BSMNT emails are working correctly.</p>
+        <p style="font-size:13px;color:#8080a0;">Sent: ${new Date().toISOString()}</p>
+      `) }).then(r => _wsSend(socket, {type:'email_result',ok:!!(r && r.ok),to,error:(r && r.error)||null}));
+      log('✉', `Test email → ${maskEmail(to)}`);
+      break;
+    }
+
+    case 'send_recap_now': {
+      const agencyId = _wsAgency(socket, msg.agencyId);
+      if (!agencyId || (!_wsIsAdminOf(socket, agencyId) && !isPlatformAdmin(socket.user))) {
+        _wsSend(socket, { type:'recap_result', ok:false, error:'Admins only.' });
+        break;
+      }
+      log('✉', `Manual recap (agency ${agencyId})`);
+      try {
+        if (!supabaseAdmin) throw new Error('Supabase not configured on the server.');
+        const { data: agData } = await supabaseAdmin.from('app_state').select('*').eq('agency_id', agencyId).maybeSingle();
+        if (!agData) throw new Error('Agency not found.');
+        const users = await _recapRecipients(agencyId);
+        let sent = 0, fails = 0;
+        for (const user of users) {
+          const r = await _sendMemberRecap(user, agData, users, agencyId);
+          if (r && r.ok === false) fails++; else sent++;
+        }
+        _wsSend(socket, { type:'recap_result', ok: fails === 0, count: sent, sent, fails,
+          error: fails ? (sent + ' sent, ' + fails + ' failed · check the bsmnt.co.nz domain in Resend') : null });
+      } catch(e) {
+        _wsSend(socket, { type:'recap_result', ok:false, error:e.message });
+      }
+      break;
+    }
+
+    case 'feedback_reply': {
+      // Platform feedback inbox (owner only).
+      if (!isPlatformAdmin(socket.user)) break;
+      const { userEmail, subject, replyText, senderName } = msg;
+      if (!userEmail||typeof userEmail!=='string'||!userEmail.includes('@')||!RESEND_KEY||!replyText||!String(replyText).trim()) break;
+      sendEmail({ to:userEmail, subject:String(subject||'Re: your feedback'), html:wrap(`
+        <h2>✉ Reply to your feedback</h2>
+        <p class="sub">Re: <strong>${H(subject||'your feedback')}</strong></p>
+        <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:3px solid #7c6fff;">
+          <div style="font-size:14px;color:#e0e0ec;line-height:1.75;white-space:pre-wrap;">${H(String(replyText).trim())}</div>
+        </div>
+        <p style="font-size:13px;color:#8080a0;margin:0;">— ${H(senderName||'The BSMNT team')}</p>
+      `) });
+      log('✉', `Feedback reply → ${maskEmail(userEmail)}`);
+      break;
+    }
+
+    case 'project_assigned': {
+      // Only to an active member of the sender's studio.
+      const agencyId = _wsAgency(socket, msg.agencyId);
+      const { to, projectName, assignedBy } = msg;
+      if (!agencyId || !to || typeof to !== 'string' || !to.includes('@') || !RESEND_KEY) break;
+      const { data: rows } = await supabaseAdmin.from('agency_members')
+        .select('id,name,email,active').eq('agency_id', agencyId);
+      const member = (rows || []).find(r => r && r.active !== false && String(r.email || '').toLowerCase().trim() === to.toLowerCase().trim());
+      if (!member) break;
+      const logoHtml = await getAgencyLogoHtml(agencyId);
+      const { subject, html } = assignmentEmail(member, { name: String(projectName || 'a project') }, String(assignedBy || 'Someone'), logoHtml);
+      sendEmail({ to: member.email, subject, html });
+      log('✉', `project_assigned → ${maskEmail(member.email)}`);
+      break;
+    }
+
+    case 'feedback_submitted': {
+      // Native sends `entry` (the feedback row) plus flat fields; the web sends
+      // only flat fields (agencyId, userName, userEmail, feedbackType, subject,
+      // preview, page). Read either shape. Goes to ADMIN_EMAIL only.
+      const e = (msg.entry && typeof msg.entry === 'object') ? msg.entry : {};
+      const fb = {
+        type:       String(e.type || msg.feedbackType || 'general'),
+        subject:    e.subject || msg.subject || '',
+        message:    e.message || msg.message || msg.preview || '',
+        user_name:  e.user_name || msg.userName || '',
+        user_email: e.user_email || msg.userEmail || socket.user.email || '',
+        page:       e.page || msg.page || '',
+        agency_id:  e.agency_id || msg.agencyId || '',
+      };
+      const isPreview = !e.message && !msg.message && !!msg.preview;
+      log('💬', `Feedback [${fb.type}] from agency ${String(fb.agency_id || '?').slice(0, 8)}`);
+      const adminEmail=process.env.ADMIN_EMAIL||'';
+      if (adminEmail&&adminEmail.includes('@')&&RESEND_KEY) {
+        const typeEmoji={bug:'🐛',feature:'💡',general:'💬'}[fb.type]||'💬';
+        sendEmail({to:adminEmail,subject:`${typeEmoji} [${fb.type}] ${String(fb.subject||'Feedback').slice(0, 200)}`,html:wrap(`
+          <h2>${typeEmoji} New ${H(fb.type)} feedback</h2>
+          <p class="sub">From <strong>${H(fb.user_name||'Unknown')}</strong> (${H(fb.user_email||'no email')}) on ${H(fb.page||'unknown page')}</p>
+          <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid #7c6fff;">
+            <div style="font-size:15px;font-weight:600;color:#fff;margin-bottom:8px;">${H(fb.subject||'(no subject)')}</div>
+            <div style="font-size:14px;color:#8080a0;line-height:1.7;white-space:pre-wrap;">${H(fb.message)}${isPreview && String(fb.message).length >= 120 ? '…' : ''}</div>
+          </div>${isPreview ? '<p style="font-size:12px;color:#55556a;">First 120 characters shown; the full message is in the feedback table.</p>' : ''}
+        `)});
+      }
+      break;
+    }
+
+    case 'feedback_status_update': {
+      if (!isPlatformAdmin(socket.user)) break;
+      const { to, subject, status, userName:uName2, customMessage } = msg;
+      if (!to||typeof to!=='string'||!to.includes('@')||!RESEND_KEY) break;
+      const statusMsg=customMessage||{
+        reviewing:"We're looking into this and will keep you posted.",
+        shipped:"Great news — this has been shipped!",
+        closed:"We've reviewed this and closed it out. Thanks for your time.",
+      }[status]||`Status: ${status}`;
+      const col=status==='shipped'?'#34d399':status==='reviewing'?'#fbbf24':'#7c6fff';
+      sendEmail({to,subject:`Re: ${String(subject||'your feedback').slice(0, 200)}`,html:wrap(`
+        <h2>Update on your feedback</h2>
+        <p class="sub">Re: <strong>${H(subject||'your feedback')}</strong></p>
+        <div style="background:#0c0c0e;border:1px solid #25252f;border-radius:10px;padding:20px 24px;margin:20px 0;border-left:4px solid ${col};">
+          <div style="font-size:14px;color:#e0e0ec;line-height:1.75;white-space:pre-wrap;">${H(statusMsg)}</div>
+        </div>
+        <p style="font-size:13px;color:#8080a0;">— ${H(uName2||'The team')}</p>
+      `)});
+      log('✉', `Feedback status → ${maskEmail(to)}: ${String(status).slice(0, 20)}`);
+      break;
+    }
+  }
+}
 
 // ── Retainer auto-spawn ───────────────────────────────────────────────────────
 
@@ -3315,19 +3643,23 @@ async function handleProjectReport(req, res) {
     const { data: state, error: stateErr } = await supabaseAdmin.from('app_state')
       .select('projects,clients,brand').eq('agency_id', agencyId).maybeSingle();
     if (stateErr) log('❌', `app_state query error: ${stateErr.message}`);
-    if (!state) return res.status(404).send(`Studio not found (err: ${stateErr?.message || 'no row'})`);
+    if (!state) return res.status(404).send('Project not found');
     // Parse projects — sometimes JSONB comes back as string from service key
     let rawProjects = state.projects;
     if (typeof rawProjects === 'string') {
       try { rawProjects = JSON.parse(rawProjects); } catch(e) { rawProjects = []; }
     }
-    log('🔍', `state keys: ${Object.keys(state||{}).join(', ')}, projects type: ${typeof state?.projects}, isArray: ${Array.isArray(rawProjects)}, count: ${rawProjects?.length}`);
-
     const allProjects = Array.isArray(rawProjects) ? rawProjects : [];
     const proj = allProjects.find(p => String(p.id) === String(projectId));
-    if (!proj) {
-      log('📄', `Project not found. Agency ${agencyId} has ${allProjects.length} projects: [${allProjects.slice(0,5).map(p=>p.id+':'+p.name?.slice(0,15)).join(', ')}]`);
-      return res.status(404).send(`Project not found (${allProjects.length} projects in DB, looking for ${projectId})`);
+    if (!proj) return res.status(404).send('Project not found');
+    // Access: the project's share link token (?token=, same tokens as
+    // /project-share) for client viewers, or a studio member's bearer token.
+    const qToken = typeof req.query.token === 'string' ? req.query.token : '';
+    const viaShareToken = qToken.length >= 10 && (qToken === proj.shareViewToken || qToken === proj.shareEditToken);
+    if (!viaShareToken) {
+      const user = await requireUser(req);
+      if (!user) return res.status(401).send('This report link needs a share token.');
+      if (!(await requireMember(user.id, String(agencyId)))) return res.status(404).send('Project not found');
     }
     const client  = (state.clients||[]).find(c => String(c.id) === String(proj.clientId));
     const brand   = state.brand || {};
@@ -3335,8 +3667,10 @@ async function handleProjectReport(req, res) {
     let users = [];
     try {
       const { data: members } = await supabaseAdmin.from('agency_members')
-        .select('id,name,email,role,initials,color').eq('agency_id', agencyId);
-      users = members || [];
+        .select('id,name,email,role,initials,color,active').eq('agency_id', agencyId);
+      // Active members only; share-link viewers don't get staff emails.
+      users = (members || []).filter(m => m && m.active !== false)
+        .map(m => viaShareToken ? Object.assign({}, m, { email: '' }) : m);
     } catch(e) { /* team members are optional */ }
     const rs      = proj.runsheet || {};
     const timeline    = rs.timeline || rs.rows || [];

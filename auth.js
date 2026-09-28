@@ -5,6 +5,8 @@
  * Auth using the service-role key, and checks agency membership.
  *
  *   requireUser(req)                 -> Promise<user|null>   (null = no/invalid token)
+ *   userFromToken(token)             -> Promise<user|null>   (same, for a raw token, e.g. WebSocket auth)
+ *   memberships(userId)              -> Promise<row[]>       (active agency_members rows for a user)
  *   requireMember(userId, agencyId)  -> Promise<member|null> (active agency_members row)
  *   softAuth                         -> middleware: sets req.authUser when a valid
  *                                       token is present, NEVER rejects
@@ -50,9 +52,12 @@ module.exports = function makeAuth(supabaseAdmin) {
   const memberCache = new Map();  // userId|agencyId -> member row (or null)
 
   async function requireUser(req) {
+    return userFromToken(_bearer(req));
+  }
+
+  async function userFromToken(token) {
     if (!supabaseAdmin || !supabaseAdmin.auth) return null;
-    const token = _bearer(req);
-    if (!token) return null;
+    if (!token || typeof token !== 'string' || token.split('.').length !== 3) return null;
     const cached = _cacheGet(userCache, token);
     if (cached !== undefined) return cached;
     let user = null;
@@ -83,6 +88,15 @@ module.exports = function makeAuth(supabaseAdmin) {
     return row;
   }
 
+  // All active memberships for a user (uncached: used for "any studio" checks).
+  async function memberships(userId) {
+    if (!supabaseAdmin || !userId) return [];
+    const { data, error } = await supabaseAdmin.from('agency_members')
+      .select('id,user_id,agency_id,role,active,email').eq('user_id', String(userId));
+    if (error) throw new Error('membership lookup failed: ' + error.message);
+    return (Array.isArray(data) ? data : []).filter(r => r && r.active !== false && r.agency_id);
+  }
+
   // Opt-in, non-rejecting: existing web callers send no token and keep working.
   async function softAuth(req, res, next) {
     try { req.authUser = await requireUser(req); }
@@ -90,7 +104,7 @@ module.exports = function makeAuth(supabaseAdmin) {
     next();
   }
 
-  // Strict: for new endpoints only.
+  // Strict: 401 without a valid Supabase access token.
   async function requireAuth(req, res, next) {
     try {
       const user = await requireUser(req);
@@ -111,5 +125,5 @@ module.exports = function makeAuth(supabaseAdmin) {
     for (const k of memberCache.keys()) if (k.startsWith(id + '|')) memberCache.delete(k);
   }
 
-  return { requireUser, requireMember, softAuth, requireAuth, forgetUser };
+  return { requireUser, userFromToken, requireMember, memberships, softAuth, requireAuth, forgetUser };
 };

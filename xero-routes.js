@@ -27,7 +27,49 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
+
+// AUTH (added 2026-09-29): server.js mounts requireAuth + a studio-membership
+// check in front of POST /xero/connect-url, GET /xero/status and POST
+// /xero/invoice (req.authUser is set by then). The OAuth `state` is an
+// HMAC-signed, 15-minute ticket {agency, user, exp} issued only by
+// /xero/connect-url, so nobody can bind their own Xero org to another studio
+// by crafting /xero/connect?agency=<id> or a callback URL.
+const STATE_TTL_MS = 15 * 60 * 1000;
+function _stateKey() {
+  const base = process.env.XERO_STATE_SECRET || process.env.XERO_CLIENT_SECRET || '';
+  return base ? crypto.createHash('sha256').update('bsmnt-xero-state:' + base).digest() : null;
+}
+function _b64u(buf) { return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function signState(agency, userId) {
+  const key = _stateKey();
+  if (!key) throw new Error('XERO_CLIENT_SECRET not set');
+  const body = _b64u(JSON.stringify({ a: String(agency), u: String(userId || ''), e: Date.now() + STATE_TTL_MS, n: crypto.randomBytes(8).toString('hex') }));
+  const sig = _b64u(crypto.createHmac('sha256', key).update(body).digest());
+  return body + '.' + sig;
+}
+function verifyState(state) {
+  const key = _stateKey();
+  if (!key || typeof state !== 'string') return null;
+  const [body, sig] = state.split('.');
+  if (!body || !sig) return null;
+  const want = _b64u(crypto.createHmac('sha256', key).update(body).digest());
+  const a = Buffer.from(sig), b = Buffer.from(want);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  let obj;
+  try { obj = JSON.parse(Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')); } catch (e) { return null; }
+  if (!obj || !obj.a || !obj.e || obj.e < Date.now()) return null;
+  return { agency: String(obj.a), userId: String(obj.u || '') };
+}
+function authorizeUrl(state, scope) {
+  return 'https://login.xero.com/identity/connect/authorize'
+    + '?response_type=code'
+    + '&client_id=' + encodeURIComponent(XERO_CLIENT_ID)
+    + '&redirect_uri=' + encodeURIComponent(XERO_REDIRECT_URI)
+    + '&scope=' + encodeURIComponent(scope || SCOPES)
+    + '&state=' + encodeURIComponent(state);
+}
 
 const XERO_CLIENT_ID     = process.env.XERO_CLIENT_ID;
 const XERO_CLIENT_SECRET = process.env.XERO_CLIENT_SECRET;
@@ -169,17 +211,30 @@ async function validAccessToken(agency, opts) {
 }
 
 // ── 1) Start OAuth ───────────────────────────────────────────────────────────
+// POST /xero/connect-url {agency}  (auth + membership enforced in server.js)
+//   -> { url } : the Xero authorise URL carrying a signed state ticket.
+router.post('/xero/connect-url', (req, res) => {
+  const agency = String((req.body && req.body.agency) || '');
+  if (!agency) return res.status(400).json({ error: 'Missing agency' });
+  if (!req.authUser) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const state = signState(agency, req.authUser.id);
+    res.json({ url: authorizeUrl(state), connectUrl: '/xero/connect?state=' + encodeURIComponent(state) });
+  } catch (e) {
+    console.error('[xero/connect-url]', e.message);
+    res.status(500).json({ error: 'Xero is not configured on the server' });
+  }
+});
+
+// GET /xero/connect?state=<signed ticket from /xero/connect-url>
+// (the old ?agency=<id> form is refused: it let anyone start a connect for any studio)
 router.get('/xero/connect', (req, res) => {
-  const agency = String(req.query.agency || '');
-  if (!agency) return res.status(400).send('Missing agency');
+  const state = String(req.query.state || '');
+  const ticket = verifyState(state);
+  if (!ticket) return res.status(401).send('This Xero connect link has expired. Go back to BSMNT and press Connect again.');
   // Optional ?scope=... override for diagnosing invalid_scope (e.g. ?scope=openid).
   const scope = req.query.scope ? String(req.query.scope) : SCOPES;
-  const url = 'https://login.xero.com/identity/connect/authorize'
-    + '?response_type=code'
-    + '&client_id=' + encodeURIComponent(XERO_CLIENT_ID)
-    + '&redirect_uri=' + encodeURIComponent(XERO_REDIRECT_URI)
-    + '&scope=' + encodeURIComponent(scope)
-    + '&state=' + encodeURIComponent(agency);
+  const url = authorizeUrl(state, scope);
   // Add &debug=1 to see exactly what this server builds (no redirect).
   if (req.query.debug) {
     return res.type('text/plain').send(
@@ -198,8 +253,10 @@ router.get('/xero/connect', (req, res) => {
 router.get('/xero/callback', async (req, res) => {
   try {
     const code = String(req.query.code || '');
-    const agency = String(req.query.state || '');
-    if (!code || !agency) return res.status(400).send('Missing code/state');
+    const ticket = verifyState(String(req.query.state || ''));
+    if (!code) return res.status(400).send('Missing code/state');
+    if (!ticket) return res.status(400).send('This Xero connection attempt expired or was not started from BSMNT. Please press Connect again in BSMNT.');
+    const agency = ticket.agency;
     const tok = await exchangeCode(code);
     const tenant = await getTenant(tok.access_token);
     if (!tenant) return res.status(400).send('No Xero organisation connected.');
@@ -213,8 +270,8 @@ router.get('/xero/callback', async (req, res) => {
     const back = APP_RETURN_URL + (APP_RETURN_URL.indexOf('?') >= 0 ? '&' : '?') + 'xero=connected';
     res.redirect(back);
   } catch (e) {
-    console.error('[xero/callback]', e);
-    res.status(500).send('Xero connection failed: ' + e.message);
+    console.error('[xero/callback]', e && e.message);
+    res.status(500).send('Xero connection failed. Please try again from BSMNT.');
   }
 });
 
