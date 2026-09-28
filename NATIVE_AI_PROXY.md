@@ -229,3 +229,47 @@ returned 500 for every agency that already had an `agency_settings` row.
 4. In Railway logs, `falling back to INSERT` means a table is missing its unique constraint. Add
    the constraint.
 
+### 2. `POST /account/delete` (new)
+
+**Callers:**
+- The web (`deleteAccountConfirmed`, app.html around L33170) sends `POST /account/delete` with the
+  body `{ "token": "<supabase access token>" }` and **no** Authorization header. It treats any 2xx as
+  success, shows `resp.text()` on failure, then signs out.
+- The native app (`MyAccountView.swift`) sends the same body **and** `Authorization: Bearer`.
+
+**Auth:** `requireAuth`. Identity comes only from a verified Supabase access token, never from a user
+id in the body.
+- For the web, `_bodyTokenToBearer` copies `body.token` into the Authorization header when no header
+  is present. The token is still verified with Supabase Auth, so this is not weaker than the header,
+  and the web works today with no change.
+- **Web should change** to send `Authorization: Bearer <access_token>`. Once it does, the body
+  fallback can be removed.
+
+**Behaviour:**
+1. Loads the caller's `agency_members` rows.
+2. Returns **409** `{ error, code: "transfer_admin_first", agencyId }` if the caller is the only active
+   admin of a studio that has other active members. Nothing is changed when this happens.
+3. Sets every membership row to `active = false`. It then tries to set `user_id = null` on those
+   rows, so a foreign key to `auth.users` can neither block nor cascade the delete.
+   - If `user_id` is NOT NULL, that second step is skipped with a warning.
+   - Studio data (`app_state`, `agency_settings`, projects) is **not** deleted, even when the caller
+     was the only member.
+4. Deletes the caller's `device_tokens`, `notification_prefs` and `notifications_sent` rows.
+   `notification_prefs` and `notifications_sent` are best effort.
+5. Calls `DELETE /auth/v1/admin/users/{id}` with the service key. A 404 counts as already deleted.
+6. Clears the auth and membership caches for the user, then returns `{ ok: true }`.
+7. Logs only an 8-character user id prefix. No email or name is logged.
+
+**Verify:**
+1. Without a token, expect `401`:
+   ```sh
+   curl -si -X POST $RAILWAY_URL/account/delete -H 'Content-Type: application/json' -d '{}'
+   ```
+2. With a token from a throwaway user, expect `200 {"ok":true}`:
+   ```sh
+   curl -si -X POST $RAILWAY_URL/account/delete -H 'Content-Type: application/json' -d "{\"token\":\"$TOKEN\"}"
+   ```
+   Afterwards the user is gone from Auth → Users, and their `agency_members` rows have
+   `active = false`.
+3. As the sole admin of a studio that has another active member, expect `409`.
+

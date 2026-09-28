@@ -182,7 +182,7 @@ const supabaseAdmin = SUPA_URL && SUPA_KEY
 // ── Request auth (bearer Supabase access token) ──────────────────────────────
 // softAuth never rejects (web app sends no token yet); requireAuth is strict.
 const makeAuth = require('./auth');
-const { softAuth, requireAuth, requireMember } = makeAuth(supabaseAdmin);
+const { softAuth, requireAuth, requireMember, forgetUser } = makeAuth(supabaseAdmin);
 
 const TOKEN_PACKAGES = {
   tokens_5:   { tokens: 20,  priceUsd: 5,  name: '20 Tokens — $5 USD'  },
@@ -298,12 +298,99 @@ app.post('/project-share/:token/edit',  handleEditProjectShare);
 app.get('/quote/:token',          handleGetQuote);
 app.post('/quote/:token/accept',  handleAcceptQuote);
 app.post('/send-quote',           handleSendQuote);
+app.post('/account/delete',       _bodyTokenToBearer, requireAuth, handleAccountDelete);
 
 // ── Native/web AI proxy (strict auth) ────────────────────────────────────────
 // See NATIVE_AI_PROXY.md. Keys never leave the server.
 const makeAiProxy = require('./ai-proxy');
 const { handleClaude } = makeAiProxy({ supabaseAdmin, requireMember, log });
 app.post('/ai/claude', requireAuth, handleClaude);
+
+// ── POST /account/delete (App Store 5.1.1(v)) ────────────────────────────────
+// Deletes the *authenticated* user's account. Identity comes only from a
+// verified Supabase access token (requireAuth); nothing in the body names the
+// user. The web app currently sends the token in the JSON body ({ token })
+// instead of the Authorization header; _bodyTokenToBearer promotes it to the
+// header when no header is present. It is still verified with Supabase Auth,
+// so this is as strong as the header. The web should move to the header.
+function _bodyTokenToBearer(req, res, next) {
+  const h = req.headers && req.headers.authorization;
+  const t = req.body && typeof req.body.token === 'string' ? req.body.token.trim() : '';
+  if (!h && t && t.split('.').length === 3) req.headers.authorization = 'Bearer ' + t;
+  next();
+}
+
+async function _supaAdminDeleteUser(userId) {
+  const r = await fetch(SUPA_URL.replace(/\/$/, '') + '/auth/v1/admin/users/' + encodeURIComponent(userId), {
+    method: 'DELETE',
+    headers: { 'apikey': SUPA_KEY, 'Authorization': 'Bearer ' + SUPA_KEY },
+  });
+  if (!r.ok && r.status !== 404) {
+    const t = await r.text().catch(() => '');
+    const err = new Error('auth admin delete ' + r.status + (t ? ': ' + t.slice(0, 160) : ''));
+    err.status = r.status;
+    throw err;
+  }
+}
+
+async function handleAccountDelete(req, res) {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase not configured' });
+  const userId = String(req.authUser.id);
+  const uidLog = userId.slice(0, 8) + '…';
+  try {
+    // 1. The user's memberships (all studios).
+    const { data: mine, error: mErr } = await supabaseAdmin.from('agency_members')
+      .select('id,agency_id,role,active').eq('user_id', userId);
+    if (mErr) throw mErr;
+    const memberships = (mine || []).filter(m => m && m.active !== false);
+
+    // 2. Refuse if they're the only active admin of a studio that still has
+    //    other active members. Checked for every studio before changing anything.
+    for (const m of memberships) {
+      if (m.role !== 'admin') continue;
+      const { data: rows, error } = await supabaseAdmin.from('agency_members')
+        .select('id,user_id,role,active').eq('agency_id', String(m.agency_id));
+      if (error) throw error;
+      const others = (rows || []).filter(r => r && r.active !== false && String(r.user_id || '') !== userId);
+      if (others.length && !others.some(r => r.role === 'admin')) {
+        log('🗑', `account/delete refused for ${uidLog}: sole admin of a studio with other members`);
+        return res.status(409).json({
+          error: 'You are the only admin of a studio that has other members. Transfer admin to another member first, then delete your account.',
+          code: 'transfer_admin_first',
+          agencyId: m.agency_id,
+        });
+      }
+    }
+
+    // 3. Deactivate every membership row. Studio data (app_state, projects,
+    //    agency_settings) is left intact, even if they were the sole member.
+    const { error: uErr } = await supabaseAdmin.from('agency_members')
+      .update({ active: false }).eq('user_id', userId);
+    if (uErr) throw uErr;
+    // Detach the rows from the auth user so the auth delete can't be blocked by
+    // (or cascade through) a foreign key. Best effort: user_id may be NOT NULL.
+    const { error: dErr } = await supabaseAdmin.from('agency_members')
+      .update({ user_id: null }).eq('user_id', userId);
+    if (dErr) log('⚠', `account/delete: could not detach member rows (${dErr.code || dErr.status || 'err'})`);
+
+    // 4. Personal push data.
+    const { error: tErr } = await supabaseAdmin.from('device_tokens').delete().eq('user_id', userId);
+    if (tErr) throw tErr;
+    const { error: pErr } = await supabaseAdmin.from('notification_prefs').delete().eq('user_id', userId);
+    if (pErr && pErr.status !== 404) log('⚠', `account/delete: notification_prefs (${pErr.code || pErr.status || 'err'})`);
+    const { error: sErr } = await supabaseAdmin.from('notifications_sent').delete().eq('user_id', userId);
+    if (sErr && sErr.status !== 404) log('⚠', `account/delete: notifications_sent (${sErr.code || sErr.status || 'err'})`);
+
+    // 5. The auth user itself.
+    await _supaAdminDeleteUser(userId);
+    forgetUser(userId);
+    log('🗑', `Account deleted: ${uidLog} (${memberships.length} membership(s) deactivated)`);
+    res.json({ ok: true });
+  } catch (e) {
+    log('❌', `account/delete failed for ${uidLog}: ${e && (e.code || e.status || '')} ${e && e.message ? e.message.slice(0, 120) : ''}`);
+    res.status(500).json({ error: 'Account deletion failed. Please try again or email support@below.co.nz.' });
+  }
+}
 
 // ── BSMNT public quote / e-sign page ──────────────────────────────────────────
 // The client opens a share link (?quote=<token>) with no auth and no agency id,

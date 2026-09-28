@@ -9,6 +9,7 @@
  *   softAuth                         -> middleware: sets req.authUser when a valid
  *                                       token is present, NEVER rejects
  *   requireAuth                      -> middleware: 401 unless a valid token is present
+ *   forgetUser(userId)               -> drop cached user/membership entries
  *
  * Usage (server.js):
  *   const makeAuth = require('./auth');
@@ -101,5 +102,14 @@ module.exports = function makeAuth(supabaseAdmin) {
     }
   }
 
-  return { requireUser, requireMember, softAuth, requireAuth };
+  // Drop cached user/membership entries for a user (e.g. after account deletion),
+  // so a still-unexpired token isn't honoured from cache for the rest of the TTL.
+  function forgetUser(userId) {
+    if (!userId) return;
+    const id = String(userId);
+    for (const [k, e] of userCache) if (e && e.value && String(e.value.id) === id) userCache.delete(k);
+    for (const k of memberCache.keys()) if (k.startsWith(id + '|')) memberCache.delete(k);
+  }
+
+  return { requireUser, requireMember, softAuth, requireAuth, forgetUser };
 };
