@@ -10,6 +10,7 @@
  *   STRIPE_SECRET_KEY     — Stripe secret key
  *   STRIPE_WEBHOOK_SECRET — Stripe webhook signing secret
  *   GEMINI_API_KEY        — Platform Gemini key (never sent to client)
+ *   ANTHROPIC_API_KEY     — Platform Anthropic key for /ai/claude (never sent to client)
  *   SUPABASE_URL          — https://fdjnzzrrodrjkngqzewy.supabase.co
  *   SUPABASE_SERVICE_KEY  — Supabase service_role key (bypasses RLS)
  *   ADMIN_EMAIL           — taylor@below.co.nz
@@ -132,7 +133,28 @@ function _makeSupaQuery(table) {
   };
   return q;
 }
-const supabaseAdmin = SUPA_URL && SUPA_KEY ? { from: (table) => _makeSupaQuery(table) } : null;
+// Verify a user's access token (JWT) with Supabase Auth using the service key.
+// Mirrors supabase-js `supabaseAdmin.auth.getUser(token)` -> { data: { user }, error }.
+async function _supaGetUser(token) {
+  try {
+    const r = await fetch(SUPA_URL.replace(/\/$/, '') + '/auth/v1/user', {
+      headers: { 'apikey': SUPA_KEY, 'Authorization': 'Bearer ' + token },
+    });
+    if (!r.ok) return { data: { user: null }, error: new Error('auth ' + r.status) };
+    const user = await r.json();
+    return { data: { user: (user && user.id) ? user : null }, error: null };
+  } catch (e) {
+    return { data: { user: null }, error: e };
+  }
+}
+const supabaseAdmin = SUPA_URL && SUPA_KEY
+  ? { from: (table) => _makeSupaQuery(table), auth: { getUser: _supaGetUser } }
+  : null;
+
+// ── Request auth (bearer Supabase access token) ──────────────────────────────
+// softAuth never rejects (web app sends no token yet); requireAuth is strict.
+const makeAuth = require('./auth');
+const { softAuth, requireAuth, requireMember } = makeAuth(supabaseAdmin);
 
 const TOKEN_PACKAGES = {
   tokens_5:   { tokens: 20,  priceUsd: 5,  name: '20 Tokens — $5 USD'  },
@@ -203,6 +225,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.header('Access-Control-Max-Age', '86400'); // cache preflight 24h
+  res.header('Access-Control-Expose-Headers', 'X-Studio-Tokens-Charged, X-Studio-Token-Balance, X-AI-Key-Source');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
@@ -212,7 +235,7 @@ app.post('/create-checkout',      handleCreateCheckout);
 app.post('/create-subscription',  handleCreateSubscription);
 app.get('/customer-portal',       handleCustomerPortal);
 app.post('/cancel-subscription',  handleCancelSubscription);
-app.post('/generate-image',       handleGenerateImage);
+app.post('/generate-image',       softAuth, handleGenerateImage);
 app.post('/briefing',             handleBriefing);
 app.get('/agency-brand/:agencyId', handleAgencyBrand);
 app.post('/submit-brief',          handleSubmitBrief);
@@ -247,6 +270,12 @@ app.post('/project-share/:token/edit',  handleEditProjectShare);
 app.get('/quote/:token',          handleGetQuote);
 app.post('/quote/:token/accept',  handleAcceptQuote);
 app.post('/send-quote',           handleSendQuote);
+
+// ── Native/web AI proxy (strict auth) ────────────────────────────────────────
+// See NATIVE_AI_PROXY.md. Keys never leave the server.
+const makeAiProxy = require('./ai-proxy');
+const { handleClaude } = makeAiProxy({ supabaseAdmin, requireMember, log });
+app.post('/ai/claude', requireAuth, handleClaude);
 
 // ── BSMNT public quote / e-sign page ──────────────────────────────────────────
 // The client opens a share link (?quote=<token>) with no auth and no agency id,
@@ -1025,6 +1054,13 @@ async function handleGenerateImage(req, res) {
   try {
     const { prompt, agencyId, refImages, refImageData } = req.body;
     if (!prompt || !agencyId) return res.status(400).json({ error: 'prompt and agencyId required' });
+    // Authenticated callers (native app, and web once it sends tokens) must be
+    // an active member of the agency they are spending tokens for. Calls with no
+    // valid token keep today's behaviour until the web app sends auth headers.
+    if (req.authUser) {
+      const member = await requireMember(req.authUser.id, agencyId);
+      if (!member) return res.status(403).json({ error: 'Not a member of this agency' });
+    }
     // Support both single refImageData (legacy) and refImages array
     const imageRefs = refImages ? (Array.isArray(refImages) ? refImages : [refImages])
                      : refImageData ? [refImageData] : [];
