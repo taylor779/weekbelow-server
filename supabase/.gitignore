@@ -1,0 +1,13 @@
+# Supabase
+.branches
+.temp
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local
+
+# Dumps of the live database never go in git
+prod-schema.sql
+*.dump
+*-data.sql
