@@ -213,6 +213,57 @@ const supabaseAdmin = SUPA_URL && SUPA_KEY
   ? { from: (table) => _makeSupaQuery(table), auth: { getUser: _supaGetUser } }
   : null;
 
+// ── Conditional (compare-and-swap) write to one app_state row ────────────────
+// The web (supaSync) and native (flush) set local_version = Date.now() on every
+// write. A server read-modify-write used to PATCH the whole column blind, so a
+// client write landing between our read and our write was silently reverted.
+// Now the PATCH only matches while local_version is still the value we read;
+// on 0 rows we re-read and re-apply `mutate`. mutate(row) returns the columns
+// to write, or null to write nothing (idempotent no-op / not found); it may
+// throw to abort. updated_by/local_version are set like a client write.
+const APP_STATE_CAS_TRIES = 6;
+async function casUpdateAppState(agencyId, cols, mutate, updatedBy) {
+  const aid = encodeURIComponent(String(agencyId));
+  for (let attempt = 0; attempt < APP_STATE_CAS_TRIES; attempt++) {
+    const rows = await supaRest('GET', 'app_state', `agency_id=eq.${aid}&select=${cols},local_version&limit=1`, null);
+    const row = Array.isArray(rows) ? (rows[0] || null) : null;
+    if (!row) return { row: null, written: false };
+    const readVersion = row.local_version;
+    const patch = await mutate(row);
+    if (!patch) return { row, written: false };
+    const body = Object.assign({}, patch, {
+      updated_by: String(updatedBy || 'server'),
+      local_version: Math.max(Date.now(), (Number(readVersion) || 0) + 1),
+    });
+    const guard = readVersion == null ? 'local_version=is.null' : `local_version=eq.${encodeURIComponent(readVersion)}`;
+    const out = await supaRest('PATCH', 'app_state', `agency_id=eq.${aid}&${guard}&select=agency_id`, body);
+    if (Array.isArray(out) && out.length) return { row, written: true, local_version: body.local_version };
+    // Someone wrote in between: back off a little and redo from a fresh read.
+    await new Promise(r => setTimeout(r, 40 * (attempt + 1) + Math.floor(Math.random() * 60)));
+  }
+  const e = new Error('Studio data is busy (concurrent edits). Please try again.');
+  e.status = 409;
+  throw e;
+}
+
+// Tell open apps (web + native) to refetch the row: the same event they send
+// after their own writes, on the per-agency Supabase Realtime channel.
+async function broadcastStateUpdate(agencyId, updatedBy, extra) {
+  try {
+    await fetch(SUPA_URL + '/realtime/v1/api/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SUPA_KEY, 'apikey': SUPA_KEY },
+      body: JSON.stringify({ messages: [{
+        topic: 'realtime:app-state-' + agencyId,
+        event: 'state_update',
+        payload: Object.assign({ updated_by: String(updatedBy), agency_id: agencyId, ts: Date.now() }, extra || {}),
+      }] }),
+    });
+  } catch (e) {
+    console.warn('[state_update] Realtime broadcast failed:', e.message);
+  }
+}
+
 // ── Request auth (bearer Supabase access token) ──────────────────────────────
 // Every studio route uses requireAuth (401 without a valid Supabase access
 // token) plus a membership check against the agency named in the request.
@@ -653,26 +704,36 @@ async function handleAcceptQuote(req, res) {
     const found = await findQuoteByToken(req.params.token);
     if (!found) return res.status(404).json({ error: 'Quote not found' });
     // Re-read the current brand fresh, modify only the matching quote, write back
-    // (same read-modify-write the project-share edit endpoint uses).
-    const { data: row } = await supabaseAdmin.from('app_state').select('brand').eq('agency_id', found.agencyId).maybeSingle();
-    let brand = row && row.brand;
-    if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { brand = null; } }
-    if (!brand || !Array.isArray(brand._quotes)) return res.status(404).json({ error: 'Quote not found' });
-    const idx = brand._quotes.findIndex(q => q && q.acceptToken === req.params.token);
-    if (idx === -1) return res.status(404).json({ error: 'Quote not found' });
-    if (brand._quotes[idx].status === 'accepted' && brand._quotes[idx].acceptance) {
-      return res.json({ ok: true, status: 'accepted', acceptance: brand._quotes[idx].acceptance });
-    }
+    // conditionally on local_version (casUpdateAppState), so a studio save that
+    // lands in between is re-read and kept instead of being reverted.
     const acceptance = {
       name: String(name).trim(),
       acceptedAt: new Date().toISOString(),
       ip: ((req.headers['x-forwarded-for'] || '').split(',')[0] || '').trim() || null
     };
-    brand._quotes[idx].status = 'accepted';
-    brand._quotes[idx].acceptance = acceptance;
-    const { error: upErr } = await supabaseAdmin.from('app_state').update({ brand }).eq('agency_id', found.agencyId);
-    if (upErr) { console.error('[quote] accept save error:', upErr.message || upErr); return res.status(500).json({ error: 'Could not save your acceptance. Please try again.' }); }
-    const q = brand._quotes[idx];
+    let q = null, already = null;
+    const result = await casUpdateAppState(found.agencyId, 'brand', function(row) {
+      q = null; already = null;
+      let brand = row.brand;
+      if (typeof brand === 'string') { try { brand = JSON.parse(brand); } catch(e) { brand = null; } }
+      if (!brand || !Array.isArray(brand._quotes)) return null;
+      const idx = brand._quotes.findIndex(x => x && x.acceptToken === req.params.token);
+      if (idx === -1) return null;
+      if (brand._quotes[idx].status === 'accepted' && brand._quotes[idx].acceptance) {
+        already = brand._quotes[idx].acceptance;
+        return null;
+      }
+      const quotes = brand._quotes.slice();
+      quotes[idx] = Object.assign({}, quotes[idx], { status: 'accepted', acceptance });
+      q = quotes[idx];
+      return { brand: Object.assign({}, brand, { _quotes: quotes }) };
+    }, 'share:quote');
+    if (already) return res.json({ ok: true, status: 'accepted', acceptance: already });
+    if (!result.written || !q) return res.status(404).json({ error: 'Quote not found' });
+    const brand = found.brand || {};
+    // Supabase Realtime signal too: native apps (and web tabs without the Railway
+    // socket) refetch brand, so their next save doesn't write the old quote back.
+    broadcastStateUpdate(found.agencyId, 'share:quote', { op: 'quote_accept' }).catch(function(){});
     // 1) Live-update any open studio app (broadcast is global, so tag the agency
     //    and let each client filter on agencyId).
     try {
@@ -1971,22 +2032,18 @@ async function handleEditProjectShare(req, res) {
     if (!found) return res.status(404).json({ error: 'Link not found or expired' });
     if (found.type !== 'edit') return res.status(403).json({ error: 'This is a view-only link. Use the edit link to make changes.' });
 
-    // Load full current state
-    const { data: stateRow } = await supabaseAdmin
-      .from('app_state')
-      .select('*')
-      .eq('agency_id', found.agencyId)
-      .maybeSingle();
-    if (!stateRow) return res.status(404).json({ error: 'State not found' });
-
-    const projects = Array.isArray(stateRow.projects) ? [...stateRow.projects] : [];
-    const projIdx = projects.findIndex(p => p.id === found.project.id);
-    if (projIdx < 0) return res.status(404).json({ error: 'Project not found in state' });
-
-    let proj = { ...projects[projIdx] };
     const guest = (guestName || 'External').slice(0, 40);
+    // Push a comment unless one with the same id is already there (a retried
+    // request must not add it twice). Returns true when it was added.
+    const _addComment = (list, c) => {
+      if (list.some(x => x && String(x.id) === String(c.id))) return false;
+      list.push(c); return true;
+    };
 
     // ── Apply the operation ───────────────────────────────────────────────────
+    // Runs against a fresh copy of the project on every write attempt (see
+    // casUpdateAppState below). Returns null, or { status, error } to refuse.
+    const applyOp = (proj) => {
     switch(op) {
 
       // Tasks
@@ -2129,7 +2186,7 @@ async function handleEditProjectShare(req, res) {
       case 'comment_add': {
         const cmt = payload.comment;
         if (!cmt || !cmt.id || !cmt.text) {
-          return res.status(400).json({ error: 'comment must have id and text' });
+          return { status: 400, error: 'comment must have id and text' };
         }
         // Tag with guest provenance regardless of what client sent (prevents impersonation)
         cmt.isGuest = true;
@@ -2143,23 +2200,23 @@ async function handleEditProjectShare(req, res) {
           const del = proj.deliverables.find(x => String(x.id) === tId);
           if (del) {
             if (!del.comments) del.comments = [];
-            del.comments.push(cmt);
+            // fire push after the row is written (not again for a retry)
+            if (_addComment(del.comments, cmt)) deliverableForNotify = del;
             attached = true;
-            deliverableForNotify = del; // fire push after the row is written
           }
         } else if (tType === 'shot' && Array.isArray(proj.shotList)) {
           const sh = proj.shotList.find(x => String(x.id) === tId);
-          if (sh) { if (!sh.comments) sh.comments = []; sh.comments.push(cmt); attached = true; }
+          if (sh) { if (!sh.comments) sh.comments = []; _addComment(sh.comments, cmt); attached = true; }
         } else if (tType === 'rsRow' && proj.runsheet) {
           const rsRows = proj.runsheet.rows || proj.runsheet.timeline || [];
           const rr = rsRows.find(x => String(x.id) === tId);
-          if (rr) { if (!rr.comments) rr.comments = []; rr.comments.push(cmt); attached = true; }
+          if (rr) { if (!rr.comments) rr.comments = []; _addComment(rr.comments, cmt); attached = true; }
         } else if (tType === 'panel' && proj.runsheet) {
           const pnls = proj.runsheet.sbPanels || proj.runsheet.panels || proj.panels || [];
           const pn = pnls.find(x => String(x.id) === tId);
-          if (pn) { if (!pn.comments) pn.comments = []; pn.comments.push(cmt); attached = true; }
+          if (pn) { if (!pn.comments) pn.comments = []; _addComment(pn.comments, cmt); attached = true; }
         }
-        if (!attached) return res.status(404).json({ error: 'Target not found for comment' });
+        if (!attached) return { status: 404, error: 'Target not found for comment' };
         // Stash for post-write notify
         proj._pendingCommentNotify = deliverableForNotify
           ? { deliverable: deliverableForNotify, comment: cmt }
@@ -2168,21 +2225,35 @@ async function handleEditProjectShare(req, res) {
       }
 
       default:
-        return res.status(400).json({ error: 'Unknown operation: ' + op });
+        return { status: 400, error: 'Unknown operation: ' + op };
     }
+    return null;
+    };
 
-    // Write back to Supabase
-    // Stash + strip the temp pending-notify so it doesn't persist in Supabase
-    const _pending = proj._pendingCommentNotify || null;
-    if (_pending) delete proj._pendingCommentNotify;
-
-    projects[projIdx] = proj;
-    const { error: writeErr } = await supabaseAdmin
-      .from('app_state')
-      .update({ projects, updated_by: 'share:' + guest, local_version: Date.now() })
-      .eq('agency_id', found.agencyId);
-
-    if (writeErr) return res.status(500).json({ error: writeErr.message });
+    // Write back: conditional on local_version, so a studio member's save that
+    // lands between our read and our write is re-read and kept, not reverted.
+    let proj = null, _pending = null, refusal = null;
+    const result = await casUpdateAppState(found.agencyId, 'projects', function(row) {
+      proj = null; _pending = null; refusal = null;
+      const projects = Array.isArray(row.projects) ? [...row.projects] : [];
+      const projIdx = projects.findIndex(p => p && p.id === found.project.id);
+      // Gone, or the edit link was revoked/rotated since we looked it up.
+      if (projIdx < 0 || projects[projIdx].shareEditToken !== token) {
+        refusal = { status: 404, error: 'Project not found in state' };
+        return null;
+      }
+      const next = { ...projects[projIdx] };
+      const err = applyOp(next);
+      if (err) { refusal = err; return null; }
+      // Stash + strip the temp pending-notify so it doesn't persist in Supabase
+      _pending = next._pendingCommentNotify || null;
+      delete next._pendingCommentNotify;
+      projects[projIdx] = next;
+      proj = next;
+      return { projects };
+    }, 'share:' + guest);
+    if (!result.row) return res.status(404).json({ error: 'State not found' });
+    if (refusal) return res.status(refusal.status).json({ error: refusal.error });
 
     // Fire push notifications for guest deliverable comments (best-effort, non-blocking)
     if (_pending) {
@@ -2191,42 +2262,15 @@ async function handleEditProjectShare(req, res) {
     }
 
     // Notify owner via Supabase Realtime broadcast so their app picks up the change immediately
-    // Uses the REST broadcast API which works from server-side without a WebSocket connection
-    try {
-      await fetch(
-        SUPA_URL + '/realtime/v1/api/broadcast',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + SUPA_KEY,
-            'apikey': SUPA_KEY,
-          },
-          body: JSON.stringify({
-            messages: [{
-              topic: 'realtime:app-state-' + found.agencyId,
-              event: 'state_update',
-              payload: {
-                updated_by: 'share:' + guest,
-                agency_id: found.agencyId,
-                op: op,
-                ts: Date.now(),
-              }
-            }]
-          })
-        }
-      );
-    } catch(broadcastErr) {
-      // Non-fatal — owner will pick it up via 30s polling fallback
-      console.warn('[share] Realtime broadcast failed:', broadcastErr.message);
-    }
+    // (non-fatal on failure: the owner picks it up via the 30s polling fallback).
+    await broadcastStateUpdate(found.agencyId, 'share:' + guest, { op: op });
 
     log('✏️', `Share edit [${op}] on project ${found.project.name} by ${guest}`);
     res.json({ ok: true, project: sanitizeProject(proj) });
 
   } catch(e) {
     console.error('[share] EDIT error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e && e.status === 409 ? 409 : 500).json({ error: e.message });
   }
 }
 
@@ -2335,13 +2379,15 @@ async function handleAcceptProjectInvite(req, res) {
     if (!_sameEmail(invite.invited_email, req.authUser.email))
       return res.status(403).json({ error: 'This invite was sent to a different email address' });
     const newStatus = accept ? 'accepted' : 'declined';
-    await supabaseAdmin.from('project_invites').update({ status: newStatus }).eq('id', inviteId);
     let projectData = null;
     if (accept) {
-      // Create collaboration link
-      await supabaseAdmin.from('shared_projects').upsert({
+      // Create collaboration link first; the invite is only marked accepted once
+      // the link exists (a failure here used to leave an "accepted" invite with
+      // no collaboration and still answer ok).
+      const { error: linkErr } = await supabaseAdmin.from('shared_projects').upsert({
         project_id: invite.project_id, owner_agency_id: invite.owner_agency_id, guest_agency_id: guestAgencyId,
       }, { onConflict: 'project_id,guest_agency_id' });
+      if (linkErr) throw linkErr;
       // Copy project JSON from owner's app_state
       const { data: ownerState } = await supabaseAdmin.from('app_state').select('projects').eq('agency_id', invite.owner_agency_id).maybeSingle();
       const project = (ownerState?.projects || []).find(p => String(p.id) === String(invite.project_id));
@@ -2358,6 +2404,8 @@ async function handleAcceptProjectInvite(req, res) {
       }
       log('🤝', `Collaboration accepted: ${invite.project_name} by agency ${guestAgencyId}`);
     }
+    const { error: stErr } = await supabaseAdmin.from('project_invites').update({ status: newStatus }).eq('id', inviteId);
+    if (stErr) throw stErr;
     res.json({ ok: true, status: newStatus, project: projectData });
   } catch(e) {
     console.error('accept-project-invite:', e.message);
@@ -2438,33 +2486,40 @@ async function handleAppendTimeLog(req, res) {
   if (!entry.hours || !entry.date || !entry.user) {
     return res.status(400).json({ error: 'entry must have hours, date, user' });
   }
+  if (typeof entry !== 'object' || Array.isArray(entry)) {
+    return res.status(400).json({ error: 'entry must be an object' });
+  }
   try {
-    // Read current projects
-    const { data: row, error: readErr } = await supabaseAdmin
-      .from('app_state')
-      .select('projects')
-      .eq('agency_id', agencyId)
-      .maybeSingle();
-    if (readErr) return res.status(500).json({ error: readErr.message });
-    if (!row) return res.status(404).json({ error: 'Agency state not found' });
-
-    // Find the project and append the entry atomically on the server
-    const projects = (row.projects || []).map(function(p) {
-      if (String(p.id) !== String(projectId)) return p;
+    // Conditional read-append-write (casUpdateAppState): a client write that
+    // lands between our read and write makes us re-read instead of reverting it.
+    // Idempotent on entry.id, so a retried request (client timeout, or the web's
+    // own full sync having already written the entry) can't store it twice.
+    let found = false, duplicate = false;
+    const result = await casUpdateAppState(agencyId, 'projects', function(row) {
+      found = false; duplicate = false;
+      const projects = Array.isArray(row.projects) ? row.projects : [];
+      const idx = projects.findIndex(p => p && String(p.id) === String(projectId));
+      if (idx < 0) return null;
+      found = true;
+      const p = projects[idx];
       const timeLog = Array.isArray(p.timeLog) ? p.timeLog : [];
-      return Object.assign({}, p, { timeLog: timeLog.concat([entry]) });
-    });
+      const hasId = entry.id != null && String(entry.id) !== '';
+      if (hasId && timeLog.some(e => e && e.id != null && String(e.id) === String(entry.id))) { duplicate = true; return null; }
+      const next = projects.slice();
+      next[idx] = Object.assign({}, p, { timeLog: timeLog.concat([entry]) });
+      return { projects: next };
+    }, req.member && req.member.id);
+    if (!result.row) return res.status(404).json({ error: 'Agency state not found' });
+    // Used to answer ok and drop the entry. Clients fall back to their own
+    // merge-write on a non-ok answer, so the entry isn't lost.
+    if (!found) return res.status(404).json({ error: 'Project not found', code: 'project_not_found' });
 
-    // Write back — using service key so RLS is bypassed
-    const { error: writeErr } = await supabaseAdmin
-      .from('app_state')
-      .update({ projects })
-      .eq('agency_id', agencyId);
-    if (writeErr) return res.status(500).json({ error: writeErr.message });
-
-    log('⏱', `Time log appended: ${entry.hours}h to project ${projectId} for agency ${agencyId}`);
-    res.json({ ok: true });
+    log('⏱', duplicate
+      ? `Time log already present (retry): project ${projectId} for agency ${agencyId}`
+      : `Time log appended: ${entry.hours}h to project ${projectId} for agency ${agencyId}`);
+    res.json({ ok: true, duplicate });
   } catch(e) {
+    if (e && e.status === 409) return res.status(409).json({ error: e.message });
     log('⏱ append-time-log error:', e.message);
     res.status(500).json({ error: e.message });
   }
