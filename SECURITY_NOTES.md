@@ -65,6 +65,13 @@ Routes that are public by design, and what protects them:
 `POST /submit-brief` is retired (410). It was an open email relay and nothing
 calls it.
 
+## Leaving a studio
+
+`POST /studio/leave { agencyId }` (bearer + member) deactivates the caller's own
+`agency_members` row, never anyone else's. The only admin of a studio that still
+has other active members gets 409 `transfer_admin_first`. The row is kept
+(`active: false`), so an admin can re-enable it from Team; studio data is untouched.
+
 ## Who gets studio emails
 
 - **New client brief:** active admins of the studio with an email address.

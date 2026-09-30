@@ -432,6 +432,7 @@ app.get('/quote/:token',          limitPublicRead, handleGetQuote);             
 app.post('/quote/:token/accept',  limitPublicWrite, handleAcceptQuote);                  // PUBLIC: quote accept token
 app.post('/send-quote',           requireAuth, ...limitEmail, handleSendQuote);          // member of the quote's studio
 app.post('/account/delete',       _bodyTokenToBearer, requireAuth, handleAccountDelete);
+app.post('/studio/leave',         requireAuth, limitUserWrites, needMember(), handleLeaveStudio); // the caller's own membership only
 
 // ── Native/web AI proxy (strict auth) ────────────────────────────────────────
 // See NATIVE_AI_PROXY.md. Keys never leave the server.
@@ -522,6 +523,41 @@ async function handleAccountDelete(req, res) {
   } catch (e) {
     log('❌', `account/delete failed for ${uidLog}: ${e && (e.code || e.status || '')} ${e && e.message ? e.message.slice(0, 120) : ''}`);
     res.status(500).json({ error: 'Account deletion failed. Please try again or email support@below.co.nz.' });
+  }
+}
+
+// ── POST /studio/leave { agencyId } ─────────────────────────────────────────
+// The caller leaves one studio. Identity comes from the verified token and the
+// row is the caller's own active membership (needMember), so nobody can remove
+// someone else. Same rule as account deletion: the only admin of a studio that
+// still has other active members must hand admin over first. The row is
+// deactivated, not deleted, so an admin can re-enable it from Team; studio data
+// is untouched.
+async function handleLeaveStudio(req, res) {
+  if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase not configured' });
+  const userId = String(req.authUser.id);
+  const me = req.member;
+  const agencyId = String(me.agency_id);
+  try {
+    const { data: rows, error } = await supabaseAdmin.from('agency_members')
+      .select('id,user_id,role,active').eq('agency_id', agencyId);
+    if (error) throw error;
+    const others = (rows || []).filter(r => r && r.active !== false && String(r.id) !== String(me.id));
+    if (me.role === 'admin' && others.length && !others.some(r => r.role === 'admin')) {
+      return res.status(409).json({
+        error: 'You are the only admin of this studio. Make another member an admin first, then leave.',
+        code: 'transfer_admin_first',
+      });
+    }
+    const { error: uErr } = await supabaseAdmin.from('agency_members')
+      .update({ active: false }).eq('id', me.id).eq('user_id', userId);
+    if (uErr) throw uErr;
+    forgetUser(userId);
+    log('👋', `Left studio ${agencyId.slice(0, 8)}… (${userId.slice(0, 8)}…)${others.length ? '' : ', was its last member'}`);
+    res.json({ ok: true, lastMember: others.length === 0 });
+  } catch (e) {
+    log('⚠', 'studio/leave failed: ' + e.message);
+    res.status(500).json({ error: 'Could not leave the studio' });
   }
 }
 
