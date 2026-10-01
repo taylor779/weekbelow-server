@@ -1070,6 +1070,9 @@ function scheduleLongTimerCheck() {
           .select('user_id,active,preferences').eq('id', String(uid)).maybeSingle();
         if (!m || m.active === false || !m.user_id) continue;
         if (!_pushPrefOn(m, 'pushTimerLongRunning')) continue;
+        // Restarts reset _longTimerReminded: don't nudge the same session twice.
+        if (await _sentRecently(String(m.user_id), 'timer_long_running', Math.max(elapsed - TWO_H, 0) + 10 * 60 * 1000)) continue;
+        await _recordSent(String(m.user_id), 'timer_long_running', 'Timer still running');
         const hrs = Math.floor(elapsed / 3600000);
         await sendPushToUser(String(m.user_id), 'Timer still running',
           'Your timer on ' + (t.projectName || 'a project') + ' has been going ' + hrs + 'h+. Still on it, or left running?',
@@ -1085,6 +1088,25 @@ function scheduleLongTimerCheck() {
   }, 5 * 60 * 1000);
 }
 scheduleLongTimerCheck();
+
+// Durable "already sent" check for scheduled pushes, backed by notifications_sent
+// (the in-memory sets reset on every deploy/restart). Fails open (sends) on DB errors.
+async function _sentRecently(userId, kind, withinMs) {
+  try {
+    const since = new Date(Date.now() - withinMs).toISOString();
+    const { data, error } = await supabaseAdmin.from('notifications_sent')
+      .select('id').eq('user_id', userId).eq('kind', kind).gte('sent_at', since).limit(1);
+    if (error) return false;
+    return Array.isArray(data) && data.length > 0;
+  } catch (e) { return false; }
+}
+async function _recordSent(userId, kind, title, body, data) {
+  try {
+    await supabaseAdmin.from('notifications_sent').insert({
+      user_id: userId, kind: kind, title: title || '', body: body || '', data: data || null, delivered: true,
+    });
+  } catch (e) { /* best effort */ }
+}
 
 // ── 8:45am daily "track your time" reminder (per agency timezone) ─────────────
 const _morningReminded = new Set();
@@ -1102,11 +1124,16 @@ function scheduleMorningTrackReminder() {
         const dateStr = userNow.getFullYear() + '-' + (userNow.getMonth() + 1) + '-' + userNow.getDate();
         const members = await _agencyActiveMembers(state.agency_id);
         for (const m of members) {
-          const key = state.agency_id + '|' + m.id + '|' + dateStr;
+          if (!m.user_id) continue;
+          // One reminder per PERSON per day: someone in two studios used to get one per membership.
+          const key = String(m.user_id) + '|' + dateStr;
           if (_morningReminded.has(key)) continue;
           _morningReminded.add(key);
-          if (!m.user_id) continue;
           if (!_pushPrefOn(m, 'pushForgotToTrack')) continue;
+          // Durable guard too (survives restarts and a second server instance): skip if already sent
+          // in the last 12 hours.
+          if (await _sentRecently(String(m.user_id), 'morning_reminder', 12 * 3600 * 1000)) continue;
+          await _recordSent(String(m.user_id), 'morning_reminder', 'Track your time');
           await sendPushToUser(String(m.user_id), 'Track your time',
             'Morning! Start your timer so today\'s hours land on the right project.',
             { kind: 'morning_reminder' }).catch(function(){});
