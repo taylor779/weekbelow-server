@@ -462,6 +462,7 @@ app.post('/gift-tokens-email',    billingGate, requireAuth, requirePlatformAdmin
 app.post('/bulk-email',           requireAuth, requirePlatformAdmin, limitBulkEmail, handleBulkEmail);
 app.post('/save-user-pref',       requireAuth, limitUserWrites, needMember(), handleSaveUserPref);
 app.post('/link-preview',         requireAuth, limitLinks, handleLinkPreview);
+app.post('/photo-search',         requireAuth, limitLinks, handlePhotoSearch);
 app.post('/set-member-active',    requireAuth, limitUserWrites, handleSetMemberActive); // admin, or invitee re-activating their own row
 app.post('/append-time-log',      requireAuth, limitUserWrites, needMember(), handleAppendTimeLog);
 app.post('/notify-deliverable-comment', requireAuth, limitPush, needMember(), handleNotifyDeliverableComment);
@@ -3317,6 +3318,34 @@ async function handleSetMemberActive(req, res) {
   }
 }
 
+
+// Board photo search (native Brainstorm "Find photos"). Pexels: free API, key on Railway only
+// (PEXELS_API_KEY). Results are hot-linkable; Pexels asks that photographers are credited, so each
+// result carries the name + profile link and the app captions the card with it.
+async function handlePhotoSearch(req, res) {
+  const key = process.env.PEXELS_API_KEY;
+  if (!key) return res.status(503).json({ error: 'Photo search is not set up yet (PEXELS_API_KEY).' });
+  const query = String((req.body && req.body.query) || '').trim().slice(0, 100);
+  const page = Math.max(1, Math.min(20, parseInt((req.body && req.body.page) || 1, 10) || 1));
+  const orientation = ['landscape', 'portrait', 'square'].includes(req.body && req.body.orientation) ? req.body.orientation : '';
+  if (!query) return res.status(400).json({ error: 'query required' });
+  try {
+    const u = 'https://api.pexels.com/v1/search?per_page=30&page=' + page + '&query=' + encodeURIComponent(query)
+      + (orientation ? '&orientation=' + orientation : '');
+    const r = await fetch(u, { headers: { Authorization: key }, signal: AbortSignal.timeout(12000) });
+    if (r.status === 429) return res.status(429).json({ error: 'Photo search is busy, try again in a minute' });
+    if (!r.ok) return res.status(502).json({ error: 'Photo search failed (' + r.status + ')' });
+    const j = await r.json();
+    const photos = (j.photos || []).map(p => ({
+      id: p.id, width: p.width, height: p.height, alt: p.alt || '', avgColor: p.avg_color || '',
+      thumb: (p.src && (p.src.medium || p.src.small)) || '', full: (p.src && (p.src.large2x || p.src.large || p.src.original)) || '',
+      photographer: p.photographer || '', photographerUrl: p.photographer_url || '', url: p.url || '',
+    }));
+    res.json({ photos, page, hasMore: !!j.next_page });
+  } catch (e) {
+    res.status(502).json({ error: 'Photo search failed: ' + e.message });
+  }
+}
 
 async function handleLinkPreview(req, res) {
   const { url } = req.body || {};
