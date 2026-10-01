@@ -3319,30 +3319,89 @@ async function handleSetMemberActive(req, res) {
 }
 
 
-// Board photo search (native Brainstorm "Find photos"). Pexels: free API, key on Railway only
-// (PEXELS_API_KEY). Results are hot-linkable; Pexels asks that photographers are credited, so each
-// result carries the name + profile link and the app captions the card with it.
+// Board photo search (native Brainstorm "Find photos"). Sources, best first:
+//   - Pexels when PEXELS_API_KEY is set (curated stock; free key, currently not being issued)
+//   - Openverse otherwise (openly licensed images from Flickr, Wikimedia… no key needed: anonymous
+//     limits are 20/min + 200/day per server IP; set OPENVERSE_CLIENT_ID + OPENVERSE_CLIENT_SECRET
+//     from a self-serve registration for higher limits).
+// Results are cached for an hour per query/page/orientation so repeat searches cost nothing.
+// Every result carries credit (photographer / creator + licence) and the app captions cards with it.
+const _photoCache = new Map();
+let _ovToken = null, _ovTokenExp = 0;
+async function _openverseHeaders() {
+  const id = process.env.OPENVERSE_CLIENT_ID, secret = process.env.OPENVERSE_CLIENT_SECRET;
+  if (!id || !secret) return {};
+  if (_ovToken && Date.now() < _ovTokenExp - 60000) return { Authorization: 'Bearer ' + _ovToken };
+  try {
+    const r = await fetch('https://api.openverse.org/v1/auth_tokens/token/', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: id, client_secret: secret }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return {};
+    const j = await r.json();
+    _ovToken = j.access_token; _ovTokenExp = Date.now() + (j.expires_in || 3600) * 1000;
+    return { Authorization: 'Bearer ' + _ovToken };
+  } catch (_) { return {}; }
+}
+
+async function _searchPexels(query, page, orientation, key) {
+  const u = 'https://api.pexels.com/v1/search?per_page=30&page=' + page + '&query=' + encodeURIComponent(query)
+    + (orientation ? '&orientation=' + orientation : '');
+  const r = await fetch(u, { headers: { Authorization: key }, signal: AbortSignal.timeout(12000) });
+  if (!r.ok) throw Object.assign(new Error('Pexels ' + r.status), { status: r.status });
+  const j = await r.json();
+  return {
+    hasMore: !!j.next_page, source: 'pexels',
+    photos: (j.photos || []).map(p => ({
+      id: 'px' + p.id, width: p.width, height: p.height, alt: p.alt || '', avgColor: p.avg_color || '',
+      thumb: (p.src && (p.src.medium || p.src.small)) || '', full: (p.src && (p.src.large2x || p.src.large || p.src.original)) || '',
+      photographer: p.photographer || '', photographerUrl: p.photographer_url || '', url: p.url || '',
+      credit: 'Photo by ' + (p.photographer || 'unknown') + ' on Pexels', license: 'Pexels licence',
+    })),
+  };
+}
+
+async function _searchOpenverse(query, page, orientation) {
+  const aspect = { landscape: 'wide', portrait: 'tall', square: 'square' }[orientation] || '';
+  const auth = await _openverseHeaders();
+  const size = auth.Authorization ? 30 : 20;            // anonymous requests are capped at 20 per page
+  const u = 'https://api.openverse.org/v1/images/?page_size=' + size + '&mature=false&page=' + page + '&q=' + encodeURIComponent(query)
+    + (aspect ? '&aspect_ratio=' + aspect : '');
+  const r = await fetch(u, { headers: { 'User-Agent': 'BSMNT/1.0 (bsmnt.co.nz)', ...auth }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw Object.assign(new Error('Openverse ' + r.status), { status: r.status });
+  const j = await r.json();
+  return {
+    hasMore: page < (j.page_count || 0), source: 'openverse',
+    photos: (j.results || []).filter(p => p.url).map(p => {
+      const lic = (p.license ? 'CC ' + String(p.license).toUpperCase() + (p.license_version ? ' ' + p.license_version : '') : '');
+      return {
+        id: 'ov' + p.id, width: p.width || 1, height: p.height || 1, alt: p.title || '', avgColor: '',
+        thumb: p.thumbnail || p.url, full: p.url,
+        photographer: p.creator || '', photographerUrl: p.creator_url || '', url: p.foreign_landing_url || '',
+        credit: (p.title ? '“' + p.title + '” ' : '') + (p.creator ? 'by ' + p.creator : '') + (lic ? ' · ' + lic : ''),
+        license: lic,
+      };
+    }),
+  };
+}
+
 async function handlePhotoSearch(req, res) {
-  const key = process.env.PEXELS_API_KEY;
-  if (!key) return res.status(503).json({ error: 'Photo search is not set up yet (PEXELS_API_KEY).' });
   const query = String((req.body && req.body.query) || '').trim().slice(0, 100);
   const page = Math.max(1, Math.min(20, parseInt((req.body && req.body.page) || 1, 10) || 1));
   const orientation = ['landscape', 'portrait', 'square'].includes(req.body && req.body.orientation) ? req.body.orientation : '';
   if (!query) return res.status(400).json({ error: 'query required' });
+  const key = process.env.PEXELS_API_KEY;
+  const ck = (key ? 'px|' : 'ov|') + query.toLowerCase() + '|' + page + '|' + orientation;
+  const hit = _photoCache.get(ck);
+  if (hit && Date.now() - hit.at < 3600000) return res.json({ ...hit.data, page });
   try {
-    const u = 'https://api.pexels.com/v1/search?per_page=30&page=' + page + '&query=' + encodeURIComponent(query)
-      + (orientation ? '&orientation=' + orientation : '');
-    const r = await fetch(u, { headers: { Authorization: key }, signal: AbortSignal.timeout(12000) });
-    if (r.status === 429) return res.status(429).json({ error: 'Photo search is busy, try again in a minute' });
-    if (!r.ok) return res.status(502).json({ error: 'Photo search failed (' + r.status + ')' });
-    const j = await r.json();
-    const photos = (j.photos || []).map(p => ({
-      id: p.id, width: p.width, height: p.height, alt: p.alt || '', avgColor: p.avg_color || '',
-      thumb: (p.src && (p.src.medium || p.src.small)) || '', full: (p.src && (p.src.large2x || p.src.large || p.src.original)) || '',
-      photographer: p.photographer || '', photographerUrl: p.photographer_url || '', url: p.url || '',
-    }));
-    res.json({ photos, page, hasMore: !!j.next_page });
+    const data = key ? await _searchPexels(query, page, orientation, key) : await _searchOpenverse(query, page, orientation);
+    _photoCache.set(ck, { at: Date.now(), data });
+    if (_photoCache.size > 500) _photoCache.delete(_photoCache.keys().next().value);
+    res.json({ ...data, page });
   } catch (e) {
+    if (e.status === 429) return res.status(429).json({ error: 'Photo search is busy, try again in a minute' });
     res.status(502).json({ error: 'Photo search failed: ' + e.message });
   }
 }
