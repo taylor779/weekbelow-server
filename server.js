@@ -463,6 +463,13 @@ app.post('/bulk-email',           requireAuth, requirePlatformAdmin, limitBulkEm
 app.post('/save-user-pref',       requireAuth, limitUserWrites, needMember(), handleSaveUserPref);
 app.post('/link-preview',         requireAuth, limitLinks, handleLinkPreview);
 app.post('/photo-search',         requireAuth, limitLinks, handlePhotoSearch);
+// Brainstorm boards shared with other studios (table board_studio_shares, server-only).
+app.post('/boards/share-studio',   requireAuth, ...limitEmail, needMember(), handleBoardShareStudio);
+app.post('/boards/studio-shares',  requireAuth, needMember(), handleBoardStudioShares);
+app.post('/boards/unshare-studio', requireAuth, needMember(), handleBoardUnshareStudio);
+app.post('/boards/shared-with-me', requireAuth, needMember(), handleBoardsSharedWithMe);
+app.post('/boards/shared/load',    requireAuth, needMember(), handleSharedBoardLoad);
+app.post('/boards/shared/save',    requireAuth, limitUserWrites, needMember(), handleSharedBoardSave);
 app.post('/set-member-active',    requireAuth, limitUserWrites, handleSetMemberActive); // admin, or invitee re-activating their own row
 app.post('/append-time-log',      requireAuth, limitUserWrites, needMember(), handleAppendTimeLog);
 app.post('/notify-deliverable-comment', requireAuth, limitPush, needMember(), handleNotifyDeliverableComment);
@@ -3404,6 +3411,151 @@ async function handlePhotoSearch(req, res) {
     if (e.status === 429) return res.status(429).json({ error: 'Photo search is busy, try again in a minute' });
     res.status(502).json({ error: 'Photo search failed: ' + e.message });
   }
+}
+
+// ── Boards shared with other studios ──────────────────────────────────────────
+// The owner's board is already published to shared_boards (share links); a studio share lets members
+// of another studio open and (role 'edit') edit that published copy from their own Brainstorm. Their
+// saves are written with updated_by 'guest', so the owner's app adopts them exactly like link-guest
+// edits (bsh_changed on channel bshare-<board_key>). All reads/writes go through here: the guest's
+// studio can't read the owner's app_state, and board_studio_shares has no client policies.
+function _boardSharesMissing(e) { const m = (e && (e.message || String(e))) || ''; return m.includes('does not exist') || m.includes('42P01'); }
+function _boardSharesErr(res, e, what) {
+  if (_boardSharesMissing(e)) return res.status(503).json({ error: 'Studio board sharing is not set up yet (run supabase/sql/2026-10-02_board_studio_shares.sql).' });
+  console.error(what + ':', e.message || e);
+  return res.status(500).json({ error: 'Something went wrong' });
+}
+async function _agencyNames(ids) {
+  const uniq = [...new Set(ids.filter(Boolean).map(String))];
+  if (!uniq.length) return {};
+  const { data } = await supabaseAdmin.from('agencies').select('id,name').in('id', uniq);
+  const out = {}; (data || []).forEach(a => { out[String(a.id)] = a.name || 'A studio'; });
+  return out;
+}
+
+async function handleBoardShareStudio(req, res) {
+  const { agencyId, boardKey, boardName, email, role } = req.body || {};
+  const em = String(email || '').trim();
+  if (!boardKey || !em.includes('@')) return res.status(400).json({ error: 'boardKey and an email are required' });
+  if (!String(boardKey).startsWith(String(agencyId) + ':')) return res.status(403).json({ error: 'Not your board' });
+  try {
+    const { data: pub } = await supabaseAdmin.from('shared_boards').select('board_key').eq('board_key', boardKey).maybeSingle();
+    if (!pub) return res.status(409).json({ error: 'Publish the board first' });
+    const { data: found, error: fe } = await supabaseAdmin.from('agency_members')
+      .select('id,name,agency_id,email,active').ilike('email', em.replace(/[%_]/g, '\\$&'));
+    if (fe) throw fe;
+    const matches = (found || []).filter(m => m.active !== false && _sameEmail(m.email, em));
+    if (!matches.length) return res.status(404).json({ error: 'No BSMNT account found for that email' });
+    const targets = matches.filter(m => String(m.agency_id) !== String(agencyId));
+    if (!targets.length) return res.status(400).json({ error: 'That person is already in your studio' });
+    const perStudio = {}; targets.forEach(m => { if (!perStudio[m.agency_id]) perStudio[m.agency_id] = m; });
+    const r = role === 'view' ? 'view' : 'edit';
+    const name = String(boardName || 'A board').slice(0, 200);
+    const rows = Object.values(perStudio).map(m => ({
+      board_key: boardKey, board_name: name, owner_agency_id: String(agencyId), guest_agency_id: String(m.agency_id),
+      role: r, invited_email: em, invited_member_id: String(m.id), created_by: req.member && String(req.member.id),
+    }));
+    const { error: ie } = await supabaseAdmin.from('board_studio_shares').upsert(rows, { onConflict: 'board_key,guest_agency_id' });
+    if (ie) throw ie;
+    const names = await _agencyNames([agencyId, ...Object.keys(perStudio)]);
+    const owner = names[String(agencyId)] || 'A studio';
+    const who = (req.member && req.member.name) || 'Someone';
+    for (const m of Object.values(perStudio)) {
+      const first = escapeHtml(String(m.name || 'there').split(' ')[0]);
+      sendEmail({
+        to: em,
+        subject: `${who} shared the board "${name}" with you`,
+        html: wrap(`<p>Hey ${first},</p><p><strong>${escapeHtml(who)}</strong> at <strong>${escapeHtml(owner)}</strong> shared the brainstorm board <strong>${escapeHtml(name)}</strong> with ${escapeHtml(names[String(m.agency_id)] || 'your studio')}.</p><p>Open <strong>Brainstorm</strong> in BSMNT: it's under <em>Shared with you</em>${r === 'edit' ? ' and you can add to it' : ' (view only)'}.</p>`),
+      }).catch(() => {});
+      pushToMemberIds(String(m.agency_id), [m.id], 'pushBoardShared', 'Board shared with you',
+        `${who} (${owner}) shared "${name}"`, { kind: 'board_shared', boardKey }).catch(() => {});
+    }
+    log('🧠', `Board ${boardKey} shared with ${Object.keys(perStudio).length} studio(s) (${maskEmail(em)})`);
+    res.json({ ok: true, studios: Object.keys(perStudio).map(id => names[id] || 'A studio') });
+  } catch (e) { return _boardSharesErr(res, e, 'share-studio'); }
+}
+
+async function handleBoardStudioShares(req, res) {
+  const { agencyId, boardKey } = req.body || {};
+  if (!boardKey || !String(boardKey).startsWith(String(agencyId) + ':')) return res.status(403).json({ error: 'Not your board' });
+  try {
+    const { data, error } = await supabaseAdmin.from('board_studio_shares').select('*').eq('board_key', boardKey).order('created_at');
+    if (error) throw error;
+    const names = await _agencyNames((data || []).map(r => r.guest_agency_id));
+    res.json({ shares: (data || []).map(r => ({ id: r.id, studio: names[String(r.guest_agency_id)] || 'A studio',
+      email: r.invited_email || '', role: r.role, createdAt: r.created_at })) });
+  } catch (e) { return _boardSharesErr(res, e, 'studio-shares'); }
+}
+
+async function handleBoardUnshareStudio(req, res) {
+  const { agencyId, id, boardKey } = req.body || {};
+  try {
+    let q = supabaseAdmin.from('board_studio_shares').select('*');
+    q = id ? q.eq('id', id) : q.eq('board_key', boardKey || '');
+    const { data, error } = await q;
+    if (error) throw error;
+    const mine = (data || []).filter(r => String(r.owner_agency_id) === String(agencyId) || String(r.guest_agency_id) === String(agencyId));
+    if (!mine.length) return res.status(404).json({ error: 'Share not found' });
+    const { error: de } = await supabaseAdmin.from('board_studio_shares').delete().in('id', mine.map(r => r.id));
+    if (de) throw de;
+    res.json({ ok: true, removed: mine.length });
+  } catch (e) { return _boardSharesErr(res, e, 'unshare-studio'); }
+}
+
+async function handleBoardsSharedWithMe(req, res) {
+  const { agencyId } = req.body || {};
+  try {
+    const { data: shares, error } = await supabaseAdmin.from('board_studio_shares').select('*').eq('guest_agency_id', String(agencyId));
+    if (error) throw error;
+    if (!shares || !shares.length) return res.json({ boards: [] });
+    const { data: pubs } = await supabaseAdmin.from('shared_boards').select('board_key,board_name,board_json,updated_at')
+      .in('board_key', shares.map(s => s.board_key));
+    const byKey = {}; (pubs || []).forEach(p => { byKey[p.board_key] = p; });
+    const names = await _agencyNames(shares.map(s => s.owner_agency_id));
+    const boards = shares.filter(s => byKey[s.board_key]).map(s => {
+      const p = byKey[s.board_key];
+      return { id: s.id, boardKey: s.board_key, name: p.board_name || s.board_name || 'Shared board',
+        ownerStudio: names[String(s.owner_agency_id)] || 'A studio', role: s.role, updatedAt: p.updated_at, board: p.board_json || {} };
+    });
+    res.json({ boards });
+  } catch (e) { return _boardSharesErr(res, e, 'shared-with-me'); }
+}
+
+async function _guestShare(agencyId, boardKey) {
+  const { data, error } = await supabaseAdmin.from('board_studio_shares').select('*')
+    .eq('board_key', boardKey || '').eq('guest_agency_id', String(agencyId)).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function handleSharedBoardLoad(req, res) {
+  const { agencyId, boardKey } = req.body || {};
+  try {
+    const share = await _guestShare(agencyId, boardKey);
+    if (!share) return res.status(404).json({ error: 'This board is no longer shared with your studio' });
+    const { data: p, error } = await supabaseAdmin.from('shared_boards').select('board_name,board_json,updated_at,updated_by')
+      .eq('board_key', boardKey).maybeSingle();
+    if (error) throw error;
+    if (!p) return res.status(404).json({ error: 'The owner stopped sharing this board' });
+    res.json({ name: p.board_name || share.board_name, role: share.role, board: p.board_json || {}, updatedAt: p.updated_at });
+  } catch (e) { return _boardSharesErr(res, e, 'shared/load'); }
+}
+
+async function handleSharedBoardSave(req, res) {
+  const { agencyId, boardKey, board } = req.body || {};
+  if (!board || typeof board !== 'object' || !Array.isArray(board.cards)) return res.status(400).json({ error: 'board required' });
+  try {
+    const share = await _guestShare(agencyId, boardKey);
+    if (!share) return res.status(404).json({ error: 'This board is no longer shared with your studio' });
+    if (share.role !== 'edit') return res.status(403).json({ error: 'View only' });
+    if (JSON.stringify(board).length > 4 * 1024 * 1024) return res.status(413).json({ error: 'Board too large' });
+    const now = new Date().toISOString();
+    // updated_by 'guest' = the owner's app adopts it like a link guest's edit.
+    const { error } = await supabaseAdmin.from('shared_boards')
+      .update({ board_json: board, updated_by: 'guest', updated_at: now }).eq('board_key', boardKey);
+    if (error) throw error;
+    res.json({ ok: true, updatedAt: now });
+  } catch (e) { return _boardSharesErr(res, e, 'shared/save'); }
 }
 
 async function handleLinkPreview(req, res) {
