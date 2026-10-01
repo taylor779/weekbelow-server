@@ -1144,6 +1144,223 @@ function scheduleMorningTrackReminder() {
 }
 scheduleMorningTrackReminder();
 
+// ── Project notifications (per member, per project) ───────────────────────────
+// Each member chooses, per project, in agency_members.preferences:
+//   projectAlerts: { "<projectId>": { shoot: true, deadline: [7,3,1,0], budget: [50,80,100],
+//                                     activity: ["task_done","task_assigned","stage","deliverable","comment"] } }
+//   projectReminders: [ { id, projectId, at: ISO 8601, note } ]
+// Master switch: preferences.pushProjectAlerts (default on). Every send is recorded in
+// notifications_sent so restarts / extra instances never double-send.
+
+function _localParts(tz) {
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: tz || 'Pacific/Auckland' }));
+  const pad = n => String(n).padStart(2, '0');
+  return { date: d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()),
+           minutes: d.getHours() * 60 + d.getMinutes() };
+}
+function _addDays(ymd, n) {
+  const d = new Date(ymd + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+// "6:30am", "6:30am-7:00am", "18:30", "6.30 pm" -> minutes after midnight (web _onsetRsTimeParse).
+function _timeMinutes(t) {
+  const m = String(t || '').trim().toLowerCase().match(/^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?/);
+  if (!m) return null;
+  let h = parseInt(m[1], 10); const min = parseInt(m[2] || '0', 10);
+  if (m[3] === 'pm' && h < 12) h += 12;
+  if (m[3] === 'am' && h === 12) h = 0;
+  return (h > 23 || min > 59) ? null : h * 60 + min;
+}
+function _fmtMinutes(mins) {
+  const h = Math.floor(mins / 60), m = mins % 60, h12 = ((h + 11) % 12) + 1;
+  return h12 + (m ? ':' + String(m).padStart(2, '0') : '') + (h < 12 ? 'am' : 'pm');
+}
+function _callMinutes(p) {
+  const rows = (p.runsheet && Array.isArray(p.runsheet.timeline)) ? p.runsheet.timeline : [];
+  if (!rows.length) return null;
+  const firstDay = rows[0] && rows[0].day;
+  const mins = rows.filter(r => r && r.day === firstDay).map(r => _timeMinutes(r.time || r.timeStart)).filter(v => v != null);
+  return mins.length ? Math.min.apply(null, mins) : null;
+}
+function _projectSpend(p, costRates) {
+  let labour = 0;
+  for (const e of (Array.isArray(p.timeLog) ? p.timeLog : [])) {
+    labour += (Number(e && e.hours) || 0) * (costRates[String(e && (e.user || e.userId))] || 0);
+  }
+  let hard = [];
+  if (Array.isArray(p.hardCosts)) hard = p.hardCosts.slice();
+  else if (Number(p.hardCosts)) hard = [{ id: 'legacy', amount: Number(p.hardCosts) }];
+  for (const e of (Array.isArray(p.budgetEntries) ? p.budgetEntries : [])) {
+    if (!hard.some(h => h && e && h.id != null && h.id === e.id)) hard.push({ id: e && e.id, amount: e && e.amount });
+  }
+  return labour + hard.reduce((t, h) => t + (Number(h && h.amount) || 0), 0);
+}
+async function _sendOnce(userId, kind, windowMs, title, body, data) {
+  if (await _sentRecently(userId, kind, windowMs)) return false;
+  await _recordSent(userId, kind, title, body, data);
+  await sendPushToUser(userId, title, body, Object.assign({ kind: 'project_alert' }, data || {})).catch(function(){});
+  return true;
+}
+
+const DAY_MS = 24 * 3600 * 1000;
+async function runProjectAlertsTick() {
+  if (!supabaseAdmin) return;
+  const { data: states } = await supabaseAdmin.from('app_state').select('agency_id,projects,brand');
+  for (const state of (states || [])) {
+    const members = (await _agencyActiveMembers(state.agency_id)).filter(m => {
+      const p = m.preferences || {};
+      return m.user_id && (p.projectAlerts || (Array.isArray(p.projectReminders) && p.projectReminders.length));
+    });
+    if (!members.length) continue;
+    const tz = (state.brand && state.brand.timezone) || 'Pacific/Auckland';
+    const now = _localParts(tz);
+    const projects = Array.isArray(state.projects) ? state.projects : [];
+    const byId = {}; projects.forEach(p => { if (p && p.id != null) byId[String(p.id)] = p; });
+    let costRates = null;   // loaded only if someone has budget alerts
+    for (const m of members) {
+      if (!_pushPrefOn(m, 'pushProjectAlerts')) continue;
+      const uid = String(m.user_id);
+      const prefs = m.preferences || {};
+      const alerts = prefs.projectAlerts || {};
+      for (const pid of Object.keys(alerts)) {
+        const a = alerts[pid] || {}, p = byId[pid];
+        if (!p) continue;
+        const name = p.name || 'Project';
+        // Shoot day: the evening before (from 6pm) and on the day, an hour before call.
+        if (a.shoot && p.shootStart) {
+          const shootDay = String(p.shootStart).slice(0, 10);
+          const call = _callMinutes(p);
+          const loc = (p.runsheet && p.runsheet.location) || '';
+          const detail = [call != null ? 'Call ' + _fmtMinutes(call) : null, loc || null].filter(Boolean).join(' · ');
+          if (now.date === _addDays(shootDay, -1) && now.minutes >= 18 * 60) {
+            await _sendOnce(uid, 'shoot_eve:' + pid + ':' + shootDay, 3 * DAY_MS, 'Shoot tomorrow · ' + name, detail || 'Check the run sheet before tomorrow.', { projectId: pid });
+          }
+          const at = Math.max(0, (call != null ? call : 8 * 60) - 60);
+          if (now.date === shootDay && now.minutes >= at && now.minutes < at + 3 * 60) {
+            await _sendOnce(uid, 'shoot_day:' + pid + ':' + shootDay, 3 * DAY_MS, 'Shoot today · ' + name, detail || 'Have a great shoot.', { projectId: pid });
+          }
+        }
+        // Deadlines: N days before, at 9am.
+        if (Array.isArray(a.deadline) && p.endDate) {
+          const due = String(p.endDate).slice(0, 10);
+          for (const n of a.deadline) {
+            const days = Number(n); if (!(days >= 0)) continue;
+            if (now.date === _addDays(due, -days) && now.minutes >= 9 * 60) {
+              const when = days === 0 ? 'due today' : days === 1 ? 'due tomorrow' : 'due in ' + days + ' days';
+              await _sendOnce(uid, 'deadline:' + pid + ':' + due + ':' + days, 5 * DAY_MS, name + ' is ' + when, 'Delivery ' + due + '.', { projectId: pid });
+            }
+          }
+        }
+        // Budget: once per threshold, only for people allowed to see money.
+        const seesMoney = m.role === 'admin' || m.can_edit_budgets === true;
+        if (Array.isArray(a.budget) && a.budget.length && seesMoney && Number(p.budget) > 0) {
+          if (!costRates) {
+            const { data: all } = await supabaseAdmin.from('agency_members').select('id,cost_rate').eq('agency_id', state.agency_id);
+            costRates = {}; (all || []).forEach(r => { costRates[String(r.id)] = Number(r.cost_rate) || 0; });
+          }
+          const pct = _projectSpend(p, costRates) / Number(p.budget) * 100;
+          for (const t of a.budget.map(Number).filter(v => v > 0).sort((x, y) => x - y)) {
+            if (pct >= t) {
+              await _sendOnce(uid, 'budget:' + pid + ':' + t, 365 * DAY_MS, name + ' has used ' + Math.floor(pct) + '% of its budget',
+                'Passed your ' + t + '% alert.', { projectId: pid });
+            }
+          }
+        }
+      }
+      // Personal reminders: due now (sent within a day of their time, once).
+      for (const r of (Array.isArray(prefs.projectReminders) ? prefs.projectReminders : [])) {
+        const at = Date.parse(r && r.at);
+        if (!r || !r.id || isNaN(at) || at > Date.now() || at < Date.now() - DAY_MS) continue;
+        const p = byId[String(r.projectId)];
+        await _sendOnce(uid, 'reminder:' + r.id, 30 * DAY_MS, 'Reminder' + (p ? ' · ' + (p.name || 'Project') : ''), r.note || 'You asked to be reminded.', { projectId: r.projectId ? String(r.projectId) : undefined });
+      }
+    }
+  }
+}
+setInterval(function() { runProjectAlertsTick().catch(e => log('⚠', 'project alerts: ' + e.message)); }, 5 * 60 * 1000);
+
+// ── Project activity (task done/assigned, stage, deliverable ready, comment) ──
+// Polls versions every minute; for studios that changed, diffs the projects against the last
+// snapshot and pushes followers. Works for edits from the web, the apps and share links alike.
+const _projSnaps = {};   // agencyId -> { v, projects: { pid: snap } }
+function _snapProject(p) {
+  const tasks = {}, dels = {}, comments = {};
+  (Array.isArray(p.stages) ? p.stages : []).forEach(st => (Array.isArray(st && st.tasks) ? st.tasks : []).forEach(t => {
+    if (t && t.id != null) tasks[String(t.id)] = { name: t.name || 'Task', done: !!t.done, assignee: t.assignee || t.assignedTo || null };
+  }));
+  (Array.isArray(p.deliverables) ? p.deliverables : []).forEach(d => {
+    if (!d || d.id == null) return;
+    const st = String(d.status || '').toLowerCase();
+    dels[String(d.id)] = { name: d.name || d.title || 'Deliverable', ready: !!d.done || ['ready','approved','done','complete','delivered'].includes(st) };
+  });
+  (function walk(v, depth) {   // comments live on shots, run-sheet rows, deliverables… (item.comments[])
+    if (!v || typeof v !== 'object' || depth > 5) return;
+    if (Array.isArray(v)) { v.forEach(x => walk(x, depth + 1)); return; }
+    for (const k of Object.keys(v)) {
+      if (k === 'comments' && Array.isArray(v[k])) {
+        v[k].forEach(c => { if (c && (c.id != null || c.time)) comments[String(c.id != null ? c.id : c.time)] = { by: c.userId || null, name: c.userName || (c.isGuest ? 'Client' : 'Someone'), text: String(c.text || '').slice(0, 120) }; });
+      } else if (k !== 'timeLog' && typeof v[k] === 'object') walk(v[k], depth + 1);
+    }
+  })(p, 0);
+  return { name: p.name || 'Project', status: p.status || '', tasks, dels, comments };
+}
+function _projectEvents(prev, cur, memberNames) {
+  const ev = [];
+  const STAGES = { upcoming: 'Upcoming', preproduction: 'Pre-Production', production: 'Production',
+                   postproduction: 'Post Production', done: 'Completed', archived: 'Archived' };
+  if (prev.status !== cur.status && cur.status) ev.push({ type: 'stage', text: 'Moved to ' + (STAGES[cur.status] || cur.status) });
+  for (const id of Object.keys(cur.tasks)) {
+    const a = prev.tasks[id], b = cur.tasks[id];
+    if (a && !a.done && b.done) ev.push({ type: 'task_done', text: '✓ ' + b.name });
+    if (b.assignee && (!a || a.assignee !== b.assignee)) ev.push({ type: 'task_assigned', text: b.name + ' → ' + (memberNames[String(b.assignee)] || 'someone') });
+  }
+  for (const id of Object.keys(cur.dels)) {
+    const a = prev.dels[id], b = cur.dels[id];
+    if (b.ready && (!a || !a.ready)) ev.push({ type: 'deliverable', text: b.name + ' is ready' });
+  }
+  for (const id of Object.keys(cur.comments)) {
+    if (!prev.comments[id]) { const c = cur.comments[id]; ev.push({ type: 'comment', by: c.by, text: c.name + ': ' + c.text }); }
+  }
+  return ev;
+}
+async function runProjectActivityTick() {
+  if (!supabaseAdmin) return;
+  const { data: versions } = await supabaseAdmin.from('app_state').select('agency_id,local_version,updated_by');
+  for (const row of (versions || [])) {
+    const aid = String(row.agency_id), snap = _projSnaps[aid];
+    if (snap && snap.v === row.local_version) continue;
+    const { data: st } = await supabaseAdmin.from('app_state').select('projects').eq('agency_id', aid).maybeSingle();
+    const projects = (st && Array.isArray(st.projects)) ? st.projects : [];
+    const next = {}; projects.forEach(p => { if (p && p.id != null) next[String(p.id)] = _snapProject(p); });
+    _projSnaps[aid] = { v: row.local_version, projects: next };
+    if (!snap) continue;   // first sight (boot): baseline only, nothing to announce
+    const members = (await _agencyActiveMembers(aid));
+    const followers = members.filter(m => m.user_id && m.preferences && m.preferences.projectAlerts && _pushPrefOn(m, 'pushProjectAlerts'));
+    if (!followers.length) continue;
+    const names = {}; members.forEach(m => { names[String(m.id)] = m.name || 'Someone'; });
+    const actor = row.updated_by ? String(row.updated_by) : '';
+    const actorName = actor.startsWith('share:') ? 'Client' : (names[actor] || null);
+    for (const pid of Object.keys(next)) {
+      const prev = snap.projects[pid];
+      if (!prev) continue;
+      const events = _projectEvents(prev, next[pid], names);
+      if (!events.length) continue;
+      for (const m of followers) {
+        if (String(m.id) === actor) continue;   // never notify people about their own edits
+        const want = ((m.preferences.projectAlerts[pid] || {}).activity) || [];
+        const mine = events.filter(e => want.includes(e.type) && String(e.by || '') !== String(m.id));
+        if (!mine.length) continue;
+        const title = next[pid].name + (actorName ? ' · ' + actorName : '');
+        const body = mine.length <= 3 ? mine.map(e => e.text).join('\n') : mine.slice(0, 2).map(e => e.text).join('\n') + '\n+' + (mine.length - 2) + ' more updates';
+        // Keyed by the row version: a second server instance seeing the same change won't resend it.
+        await _sendOnce(String(m.user_id), 'activity:' + pid + ':' + row.local_version, DAY_MS, title, body,
+          { projectId: pid, kind: 'project_activity' });
+      }
+    }
+  }
+}
+setInterval(function() { runProjectActivityTick().catch(e => log('⚠', 'project activity: ' + e.message)); }, 60 * 1000);
+
 async function handleGiftTokensEmail(req, res) {
   const { agencyId, tokens, message } = req.body || {};
   if (!agencyId || !tokens) return res.status(400).json({ error: 'agencyId and tokens required' });
@@ -2795,7 +3012,7 @@ async function sendPushToUser(userId, title, body, payload) {
 async function _agencyActiveMembers(agencyId) {
   if (!supabaseAdmin || !agencyId) return [];
   const { data, error } = await supabaseAdmin.from('agency_members')
-    .select('id,user_id,role,active,name,preferences')
+    .select('id,user_id,role,active,name,preferences,can_edit_budgets')
     .eq('agency_id', String(agencyId)).eq('active', true);
   if (error) { log('⚠', 'members lookup: ' + error.message); return []; }
   return data || [];
