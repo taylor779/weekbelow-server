@@ -470,6 +470,16 @@ app.post('/boards/unshare-studio', requireAuth, needMember(), handleBoardUnshare
 app.post('/boards/shared-with-me', requireAuth, needMember(), handleBoardsSharedWithMe);
 app.post('/boards/shared/load',    requireAuth, needMember(), handleSharedBoardLoad);
 app.post('/boards/shared/save',    requireAuth, limitUserWrites, needMember(), handleSharedBoardSave);
+// Share-link guests (no login): open / save by token, so shared_boards can be closed to anon.
+const limitGuestBoard = rateLimit({ name: 'bsh-guest', windowMs: MIN, max: 90, by: 'ip' });
+app.post('/share/board/open',      limitPublicRead, handleShareBoardOpen);
+app.post('/share/board/save',      limitGuestBoard, handleShareBoardSave);
+// Board version history (table board_versions, server-only).
+app.post('/boards/versions/save',  requireAuth, limitUserWrites, needMember(), handleBoardVersionSave);
+app.post('/boards/versions/list',  requireAuth, needMember(), handleBoardVersionList);
+app.post('/boards/versions/get',   requireAuth, needMember(), handleBoardVersionGet);
+// @mentions in board comments → push to the mentioned members.
+app.post('/boards/mention',        requireAuth, limitPush, needMember(), handleBoardMention);
 app.post('/set-member-active',    requireAuth, limitUserWrites, handleSetMemberActive); // admin, or invitee re-activating their own row
 app.post('/append-time-log',      requireAuth, limitUserWrites, needMember(), handleAppendTimeLog);
 app.post('/notify-deliverable-comment', requireAuth, limitPush, needMember(), handleNotifyDeliverableComment);
@@ -3564,6 +3574,106 @@ async function handleSharedBoardSave(req, res) {
     if (error) throw error;
     res.json({ ok: true, updatedAt: now });
   } catch (e) { return _boardSharesErr(res, e, 'shared/save'); }
+}
+
+// ── Share-link guests (by token) ───────────────────────────────────────────────
+function _tok(t) { return typeof t === 'string' && /^[a-f0-9]{24,64}$/i.test(t) ? t : null; }
+async function handleShareBoardOpen(req, res) {
+  const token = _tok(req.body && req.body.token);
+  if (!token) return res.status(400).json({ error: 'Invalid link' });
+  try {
+    const { data, error } = await supabaseAdmin.from('shared_boards')
+      .select('board_key,board_name,board_json,updated_at,view_token,edit_token')
+      .or(`view_token.eq.${token},edit_token.eq.${token}`).limit(1).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'This link has been turned off' });
+    res.json({ boardKey: data.board_key, name: data.board_name || 'Board', role: data.edit_token === token ? 'edit' : 'view',
+      board: data.board_json || {}, updatedAt: data.updated_at });
+  } catch (e) { console.error('share/board/open:', e.message); res.status(500).json({ error: 'Something went wrong' }); }
+}
+async function handleShareBoardSave(req, res) {
+  const token = _tok(req.body && req.body.token);
+  const { board, baseUpdatedAt } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'Invalid link' });
+  if (!board || typeof board !== 'object' || !Array.isArray(board.cards)) return res.status(400).json({ error: 'board required' });
+  if (JSON.stringify(board).length > 4 * 1024 * 1024) return res.status(413).json({ error: 'Board too large' });
+  try {
+    const { data: row, error } = await supabaseAdmin.from('shared_boards').select('board_key,board_json,updated_at')
+      .eq('edit_token', token).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(403).json({ error: 'This link is view only or has been turned off' });
+    if (baseUpdatedAt && row.updated_at && new Date(row.updated_at).getTime() > new Date(baseUpdatedAt).getTime() + 1)
+      return res.status(409).json({ error: 'changed', board: row.board_json || {}, updatedAt: row.updated_at });
+    const now = new Date().toISOString();
+    const { error: ue } = await supabaseAdmin.from('shared_boards')
+      .update({ board_json: board, updated_by: 'guest', updated_at: now }).eq('board_key', row.board_key);
+    if (ue) throw ue;
+    res.json({ ok: true, updatedAt: now, boardKey: row.board_key });
+  } catch (e) { console.error('share/board/save:', e.message); res.status(500).json({ error: 'Something went wrong' }); }
+}
+
+// ── Board version history ──────────────────────────────────────────────────────
+function _historyMissing(res, e, what) {
+  if (_boardSharesMissing(e)) return res.status(503).json({ error: 'Board history is not set up yet (run supabase/sql/2026-10-02b_board_history_and_lockdown.sql step 1).' });
+  console.error(what + ':', e.message || e); return res.status(500).json({ error: 'Something went wrong' });
+}
+async function handleBoardVersionSave(req, res) {
+  const { agencyId, boardKey, name, board, label, force } = req.body || {};
+  if (!boardKey || !String(boardKey).startsWith(String(agencyId) + ':')) return res.status(403).json({ error: 'Not your board' });
+  if (!board || typeof board !== 'object' || !Array.isArray(board.cards)) return res.status(400).json({ error: 'board required' });
+  const json = JSON.stringify(board);
+  if (json.length > 4 * 1024 * 1024) return res.status(413).json({ error: 'Board too large' });
+  try {
+    const { data: last } = await supabaseAdmin.from('board_versions').select('id,created_at,board_json')
+      .eq('board_key', boardKey).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (last && JSON.stringify(last.board_json) === json) return res.json({ ok: true, skipped: 'unchanged' });
+    if (!force && last && Date.now() - new Date(last.created_at).getTime() < 10 * 60 * 1000) return res.json({ ok: true, skipped: 'recent' });
+    const { error } = await supabaseAdmin.from('board_versions').insert({
+      board_key: boardKey, agency_id: String(agencyId), board_name: String(name || '').slice(0, 200), board_json: board,
+      card_count: board.cards.length, label: label ? String(label).slice(0, 80) : null,
+      created_by: req.member && String(req.member.id), created_by_name: req.member && req.member.name,
+    });
+    if (error) throw error;
+    // Keep the newest 100 per board.
+    const { data: old } = await supabaseAdmin.from('board_versions').select('id').eq('board_key', boardKey)
+      .order('created_at', { ascending: false }).range(100, 400);
+    if (old && old.length) await supabaseAdmin.from('board_versions').delete().in('id', old.map(r => r.id));
+    res.json({ ok: true });
+  } catch (e) { return _historyMissing(res, e, 'versions/save'); }
+}
+async function handleBoardVersionList(req, res) {
+  const { agencyId, boardKey } = req.body || {};
+  if (!boardKey || !String(boardKey).startsWith(String(agencyId) + ':')) return res.status(403).json({ error: 'Not your board' });
+  try {
+    const { data, error } = await supabaseAdmin.from('board_versions').select('id,created_at,created_by_name,card_count,label')
+      .eq('board_key', boardKey).order('created_at', { ascending: false }).limit(100);
+    if (error) throw error;
+    res.json({ versions: (data || []).map(v => ({ id: v.id, createdAt: v.created_at, by: v.created_by_name || '', cardCount: v.card_count || 0, label: v.label || '' })) });
+  } catch (e) { return _historyMissing(res, e, 'versions/list'); }
+}
+async function handleBoardVersionGet(req, res) {
+  const { agencyId, id } = req.body || {};
+  try {
+    const { data, error } = await supabaseAdmin.from('board_versions').select('board_json,agency_id,created_at').eq('id', id || '').maybeSingle();
+    if (error) throw error;
+    if (!data || String(data.agency_id) !== String(agencyId)) return res.status(404).json({ error: 'Version not found' });
+    res.json({ board: data.board_json || {}, createdAt: data.created_at });
+  } catch (e) { return _historyMissing(res, e, 'versions/get'); }
+}
+
+// ── @mentions in board comments ────────────────────────────────────────────────
+async function handleBoardMention(req, res) {
+  const { agencyId, memberIds, boardName, text, projectId } = req.body || {};
+  const ids = Array.isArray(memberIds) ? memberIds.map(String).slice(0, 20) : [];
+  if (!ids.length) return res.json({ ok: true, sent: 0 });
+  try {
+    const who = (req.member && req.member.name) || 'Someone';
+    const snippet = String(text || '').replace(/\s+/g, ' ').slice(0, 120);
+    const sent = await pushToMemberIds(String(agencyId), ids, 'pushMention', `${who} mentioned you`,
+      `${boardName ? '“' + String(boardName).slice(0, 60) + '”: ' : ''}${snippet}`,
+      { kind: 'board_mention', ...(projectId ? { projectId: String(projectId) } : {}) }, req.member && req.member.id);
+    res.json({ ok: true, sent });
+  } catch (e) { console.error('boards/mention:', e.message); res.status(500).json({ error: 'Something went wrong' }); }
 }
 
 async function handleLinkPreview(req, res) {
