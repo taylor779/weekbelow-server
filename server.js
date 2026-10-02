@@ -477,6 +477,8 @@ app.post('/share/board/save',      limitGuestBoard, handleShareBoardSave);
 // Board version history (table board_versions, server-only).
 app.post('/boards/versions/save',  requireAuth, limitUserWrites, needMember(), handleBoardVersionSave);
 app.post('/boards/versions/list',  requireAuth, needMember(), handleBoardVersionList);
+app.post('/app/checkin',            requireAuth, limitUserWrites, needMember(), handleAppCheckin);   // native app reports its version
+app.post('/app/installs',           requireAuth, needMember({ admin: true }), handleAppInstalls);    // admins: who runs which version
 app.post('/boards/versions/get',   requireAuth, needMember(), handleBoardVersionGet);
 // @mentions in board comments → push to the mentioned members.
 app.post('/boards/mention',        requireAuth, limitPush, needMember(), handleBoardMention);
@@ -3674,6 +3676,57 @@ async function handleBoardMention(req, res) {
       { kind: 'board_mention', ...(projectId ? { projectId: String(projectId) } : {}) }, req.member && req.member.id);
     res.json({ ok: true, sent });
   } catch (e) { console.error('boards/mention:', e.message); res.status(500).json({ error: 'Something went wrong' }); }
+}
+
+// ── App versions (native check-in; admins see them on Team) ────────────────────
+function _installsMissing(res, e, what) {
+  if (_boardSharesMissing(e) || /schema cache|PGRST205/.test((e && e.message) || '')) return res.status(503).json({ error: 'App versions are not set up yet (run supabase/sql/2026-10-02c_app_installs.sql).' });
+  console.error(what + ':', e.message || e); return res.status(500).json({ error: 'Something went wrong' });
+}
+const _clip = (v, n) => String(v == null ? '' : v).slice(0, n);
+async function handleAppCheckin(req, res) {
+  const { agencyId, installId, platform, deviceName, version, build } = req.body || {};
+  if (!installId || !/^[A-Za-z0-9-]{8,64}$/.test(String(installId))) return res.status(400).json({ error: 'installId required' });
+  try {
+    const { error } = await supabaseAdmin.from('app_installs').upsert({
+      install_id: String(installId), user_id: String(req.authUser.id), agency_id: String(agencyId),
+      member_id: req.member && req.member.id != null ? String(req.member.id) : null,
+      platform: _clip(platform, 12), device_name: _clip(deviceName, 80), version: _clip(version, 20), build: _clip(build, 20),
+      last_seen: new Date().toISOString(),
+    }, { onConflict: 'install_id' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { return _installsMissing(res, e, 'app/checkin'); }
+}
+// Newest Mac build on the Sparkle feed (cached 10 min).
+let _feedCache = { at: 0, build: '' };
+async function _latestMacBuild() {
+  if (Date.now() - _feedCache.at < 600000) return _feedCache.build;
+  try {
+    const r = await fetch('https://bsmnt.co.nz/updates/appcast.xml', { signal: AbortSignal.timeout(5000) });
+    const xml = r.ok ? await r.text() : '';
+    const builds = [...xml.matchAll(/<sparkle:version>(\d+)<\/sparkle:version>/g)].map(m => m[1]);
+    _feedCache = { at: Date.now(), build: builds.sort((a, b) => Number(b) - Number(a))[0] || '' };
+  } catch (e) { _feedCache.at = Date.now() - 540000; }   // retry in a minute
+  return _feedCache.build;
+}
+async function handleAppInstalls(req, res) {
+  const { agencyId } = req.body || {};
+  try {
+    const since = new Date(Date.now() - 120 * 86400000).toISOString();
+    const { data, error } = await supabaseAdmin.from('app_installs')
+      .select('install_id,member_id,platform,device_name,version,build,last_seen')
+      .eq('agency_id', String(agencyId)).gte('last_seen', since).order('last_seen', { ascending: false }).limit(300);
+    if (error) throw error;
+    const rows = data || [];
+    const max = (list) => list.filter(Boolean).sort((a, b) => Number(b) - Number(a))[0] || '';
+    const latest = {
+      mac: max([await _latestMacBuild(), ...rows.filter(r => r.platform === 'mac').map(r => r.build)]),
+      ios: max(rows.filter(r => r.platform !== 'mac').map(r => r.build)),
+    };
+    res.json({ latest, installs: rows.map(r => ({ installId: r.install_id, memberId: r.member_id, platform: r.platform,
+      deviceName: r.device_name, version: r.version, build: r.build, lastSeen: r.last_seen })) });
+  } catch (e) { return _installsMissing(res, e, 'app/installs'); }
 }
 
 async function handleLinkPreview(req, res) {
