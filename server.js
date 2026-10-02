@@ -3542,13 +3542,21 @@ async function handleSharedBoardLoad(req, res) {
 }
 
 async function handleSharedBoardSave(req, res) {
-  const { agencyId, boardKey, board } = req.body || {};
+  const { agencyId, boardKey, board, baseUpdatedAt } = req.body || {};
   if (!board || typeof board !== 'object' || !Array.isArray(board.cards)) return res.status(400).json({ error: 'board required' });
   try {
     const share = await _guestShare(agencyId, boardKey);
     if (!share) return res.status(404).json({ error: 'This board is no longer shared with your studio' });
     if (share.role !== 'edit') return res.status(403).json({ error: 'View only' });
     if (JSON.stringify(board).length > 4 * 1024 * 1024) return res.status(413).json({ error: 'Board too large' });
+    // Optimistic concurrency: the client says which version it edited. If someone saved since, send
+    // the current copy back (409) so the client merges instead of overwriting their work.
+    if (baseUpdatedAt) {
+      const { data: cur } = await supabaseAdmin.from('shared_boards').select('board_json,updated_at').eq('board_key', boardKey).maybeSingle();
+      if (cur && cur.updated_at && new Date(cur.updated_at).getTime() > new Date(baseUpdatedAt).getTime() + 1) {
+        return res.status(409).json({ error: 'changed', board: cur.board_json || {}, updatedAt: cur.updated_at });
+      }
+    }
     const now = new Date().toISOString();
     // updated_by 'guest' = the owner's app adopts it like a link guest's edit.
     const { error } = await supabaseAdmin.from('shared_boards')
