@@ -3021,7 +3021,7 @@ async function sendPushToUser(userId, title, body, payload) {
     .select('token,platform').eq('user_id', String(userId));
   if (error) return { sent: 0, failed: 0, error: error.message || String(error) };
   if (!rows || !rows.length) return { sent: 0, failed: 0, reason: 'no tokens for user' };
-  const iosTokens = rows.filter(r => (r.platform || 'ios') === 'ios').map(r => r.token);
+  const iosTokens = [...new Set(rows.filter(r => (r.platform || 'ios') === 'ios').map(r => r.token))];
   return sendApnsPush(iosTokens, title, body, payload);
 }
 
@@ -3049,10 +3049,26 @@ function _pushPrefOn(member, prefKey) {
   if (!prefKey) return true;
   return p[prefKey] !== false;                 // default-on
 }
+// One push per person per project per minute: creating a project with you on it used to send both
+// "New project: X" (admins) and "You're on X". Assignment wins (it's sent second, but says more), so
+// the admin one is skipped when the person is also an assignee — see handleNotifyProjectCreated.
+const _projectPushAt = new Map();
+function _projectPushSeen(userId, payload) {
+  const pid = payload && payload.projectId;
+  if (!pid || !/^(project_assigned|admin_new_project)$/.test(payload.kind || '')) return false;
+  const key = userId + '|' + pid + '|' + payload.kind, now = Date.now();
+  for (const [k, t] of _projectPushAt) if (now - t > 60000) _projectPushAt.delete(k);
+  if (_projectPushAt.has(key)) return true;
+  // Already told "You're on X"? Then "New project: X" adds nothing.
+  if (payload.kind === 'admin_new_project' && _projectPushAt.has(userId + '|' + pid + '|project_assigned')) return true;
+  _projectPushAt.set(key, now);
+  return false;
+}
 async function _pushMember(member, prefKey, title, body, payload) {
   try {
     if (!member || !member.user_id) return;
     if (!_pushPrefOn(member, prefKey)) return;
+    if (_projectPushSeen(String(member.user_id), payload)) return;
     await sendPushToUser(String(member.user_id), title, body, payload || {});
   } catch(e) { log('⚠', 'push member: ' + (e && e.message)); }
 }
@@ -3092,11 +3108,15 @@ async function handleNotifyProjectCreated(req, res) {
     const b = req.body || {};
     if (!b.agencyId || !b.projectName) return res.status(400).json({ error: 'agencyId and projectName required' });
     const by = b.byName || 'Someone';
-    const n = await pushToAdmins(b.agencyId, 'pushAdminNewProject',
-      'New project: ' + b.projectName, by + ' added it to the studio',
-      { kind: 'admin_new_project', projectId: b.projectId ? String(b.projectId) : null },
-      b.byId);
-    res.json({ ok: true, notified: n });
+    // Clients send "assigned" right after "created": wait a moment so admins who are also on the
+    // project get just the "You're on X" push (see _projectPushSeen).
+    res.json({ ok: true });
+    setTimeout(function () {
+      pushToAdmins(b.agencyId, 'pushAdminNewProject',
+        'New project: ' + b.projectName, by + ' added it to the studio',
+        { kind: 'admin_new_project', projectId: b.projectId ? String(b.projectId) : null },
+        b.byId).catch(function (e) { console.error('notify-project-created:', e.message); });
+    }, 4000);
   } catch(e) { console.error('notify-project-created:', e.message); res.status(500).json({ error: e.message }); }
 }
 // POST /notify/project-assigned -> tell each assignee they are on a project.
@@ -3149,17 +3169,31 @@ async function handleRegisterPushToken(req, res) {
     if (b.agencyId && !(await requireMember(uid, String(b.agencyId)))) {
       return res.status(403).json({ error: 'Not a member of this agency' });
     }
+    // Native builds send an install id: the device is stored as "<name> · <install>" and every other
+    // token for that install (or legacy rows with the bare name, from before install ids) is dropped,
+    // so a phone that re-registered after a reinstall / TestFlight / the old app gets ONE push, not one
+    // per token it ever had.
+    const plainName = b.deviceName ? String(b.deviceName).slice(0, 80) : null;
+    const installId = typeof b.installId === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(b.installId) ? b.installId : null;
+    const deviceName = installId && plainName ? plainName + ' · ' + installId.slice(0, 8) : plainName;
     const { error } = await supabaseAdmin.from('device_tokens').upsert({
       user_id:      uid,
       agency_id:    b.agencyId ? String(b.agencyId) : null,
       token:        String(b.token),
       platform:     b.platform || 'ios',
-      device_name:  b.deviceName || null,
+      device_name:  deviceName,
       last_seen_at: new Date().toISOString(),
     }, { onConflict: 'token' }); // device_tokens.token is UNIQUE (01_supabase_schema.sql); a device that changes user is re-pointed
     if (error) {
       log('❌', 'register-token error: ' + (error.message || error));
       return res.status(500).json({ error: error.message || String(error) });
+    }
+    if (installId && plainName) {
+      try {
+        await supabaseAdmin.from('device_tokens').delete()
+          .eq('user_id', uid).eq('platform', b.platform || 'ios').neq('token', String(b.token))
+          .in('device_name', [deviceName, plainName]);
+      } catch (e) { log('⚠', 'token dedupe: ' + e.message); }
     }
     log('🔔', 'Push token registered for user ' + uid.slice(0, 8) + '…');
     res.json({ ok: true });
