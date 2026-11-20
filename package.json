@@ -12,7 +12,8 @@
     "stripe": "^14.0.0",
     "node-fetch": "^2.7.0",
     "@parse/node-apn": "^6.0.1",
-   "node-cron": "^3.0.3"
+   "node-cron": "^3.0.3",
+    "pdf-lib": "^1.17.1"
   },
   "engines": {
     "node": ">=16"

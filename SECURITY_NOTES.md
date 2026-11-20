@@ -108,3 +108,36 @@ Railway.
   set it's used instead of the email.
 - `XERO_STATE_SECRET` is optional. It's the key used to sign Xero OAuth state
   and defaults to a hash of `XERO_CLIENT_SECRET`.
+
+## Claude connector (`mcp-connector.js`, added 2026-10-13)
+
+Remote MCP server so Claude can create projects and fill in shot lists, run sheets and
+storyboards. Off unless `MCP_OAUTH_SECRET`, `SUPABASE_ANON_KEY` and `PUBLIC_URL` are set.
+
+- **Auth.** OAuth 2.1 with PKCE (S256). The sign-in page uses Supabase Auth (email/password
+  or Google). The tokens Claude holds are the user's own Supabase access/refresh tokens, so the
+  connector can do no more than that user can. Every MCP call is verified with
+  `userFromToken`, and every tool checks studio membership; writes also need
+  `can_manage_projects` (or admin/manager), budgets need `can_edit_budgets` (or admin).
+- **Clients.** Dynamic registration is stateless: `client_id` is HMAC-signed with
+  `MCP_OAUTH_SECRET` and carries its redirect URIs. Only Claude's callbacks
+  (`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`),
+  loopback URIs and `MCP_REDIRECT_URIS` are accepted. Rotating the secret makes everyone
+  reconnect.
+- **PUBLIC routes.** `/.well-known/oauth-*`, `/oauth/*` (rate-limited), and
+  `/mcp/upload/:token`: a one-time 144-bit link, 2 h TTL, PDF only, 60 MB cap, max 4 uploads
+  in flight, checked before the body is read. Uploads stay in memory and are bound to the
+  user and studio that made the link.
+- **PDF parsing** runs in a worker thread (768 MB heap cap, 45 s timeout) with bounded
+  inflation, a pixel cap and a draw cap (`mcp-pdf-frames.js`).
+- **Data.** Writes use `casUpdateAppState` + `state_update`. Free text is stripped of `<` and `>`.
+  Project-doc imports only read paths under the caller's own studio folder.
+- **Single instance.** OAuth codes and uploads are in memory; a restart just means reconnect /
+  new upload link.
+
+### AI connector: Grok (2026-11-20)
+- Grok (grok.com custom connector) uses the same OAuth + MCP endpoint as Claude. Allowed redirect URIs: Claude's two callbacks, loopback, `MCP_REDIRECT_URIS`, and any `https://` URL on `grok.com` / `x.ai` or their subdomains (no userinfo). PKCE S256 is still required and the user signs in on our page.
+- New read tool `bsmnt_read_studio_data` reads with the service key, always filtered by the caller's own `agency_id` (membership checked first). Team rates and `business_costs` only for role `admin`; time logs for others only with reports permission.
+- New writes (tasks, time, clients, client requests) go through `casUpdateAppState` + `state_update` like the other connector writes. There are no delete tools.
+- Everything an assistant reads is sent to that AI provider (Anthropic or xAI).
+

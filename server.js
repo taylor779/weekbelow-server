@@ -18,8 +18,11 @@
  *   PLATFORM_ADMIN_UID    — optional Supabase auth id of the platform owner (overrides ADMIN_EMAIL match)
  *   APNS_KEY_P8 / APNS_KEY_ID / APNS_TEAM_ID — push; see SECURITY_NOTES.md
  *   RATE_LIMITS           — 'off' disables the in-memory rate limiters
+ *   MCP_OAUTH_SECRET      — Claude connector: long random string (signs OAuth client ids). Unset = connector off
+ *   SUPABASE_ANON_KEY     — Claude connector: public anon key for the sign-in page (same one the web app uses)
+ *   PUBLIC_URL            — Claude connector: https://weekbelow-server-production.up.railway.app (required for the connector)
  *
- * Auth model and public routes: SECURITY_NOTES.md.
+ * Auth model and public routes: SECURITY_NOTES.md. Claude connector: mcp-connector.js.
  */
 
 const { WebSocketServer, WebSocket } = require('ws');
@@ -823,6 +826,14 @@ async function handleSendQuote(req, res) {
     res.status(500).json({ error: 'Could not send the email.' });
   }
 }
+
+// ── Claude connector (remote MCP server + OAuth) ─────────────────────────────
+// POST /mcp, /oauth/*, /.well-known/oauth-*, /mcp/upload/:token. Off until
+// MCP_OAUTH_SECRET, SUPABASE_ANON_KEY and PUBLIC_URL are set. See mcp-connector.js.
+require('./mcp-connector')({
+  app, express, supaRest, casUpdateAppState, broadcastStateUpdate, userFromToken, memberships,
+  log, pushToAdmins, rateLimit, SUPA_URL, SUPA_KEY,
+});
 
 // ── BSMNT Xero integration (one-click "Send to Xero") ──
 // Adds /xero/connect, /xero/callback, /xero/status, /xero/invoice.
