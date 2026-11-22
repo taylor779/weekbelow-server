@@ -53,6 +53,9 @@ Security model: `SECURITY_NOTES.md` → "Claude connector".
 | `bsmnt_log_time` | Time entry on a project (for someone else: admins only) |
 | `bsmnt_save_client` | Create or update a client |
 | `bsmnt_add_client_request` / `bsmnt_set_client_request_done` | Client requests on a project |
+| `bsmnt_get_priorities` | The Priority Board (shoot and edit running order, as on the wall screen): projects and standalone tasks, ranked |
+| `bsmnt_set_priorities` | Reorder one board (full order, most important first), with optional notes. `bsmnt_add_task` with `priority_board` puts a new standalone task on it |
+| `bsmnt_set_priority_note` | The short note shown on a project or task on the board |
 
 ## Typical use
 

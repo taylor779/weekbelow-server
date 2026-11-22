@@ -495,6 +495,54 @@ module.exports = function mountMcpConnector(deps) {
   }
   const pushActivity = (p, entry) => { p.activity = [entry].concat(Array.isArray(p.activity) ? p.activity : []).slice(0, 200); };
 
+
+  // ── Priorities (same rules as the native Priority Board, Features/Dashboard/Priorities.swift) ──
+  // Projects and loose studio tasks (app_state.tasks) both carry
+  // priority = { shoot, edit, board, note, updatedAt, updatedBy, via }; shoot/edit are 1-based ranks shared on that board.
+  const BOARDS = ['shoot', 'edit'];
+  const studioToday = () => new Date().toLocaleDateString('en-CA', { timeZone: process.env.STUDIO_TZ || 'Pacific/Auckland' });
+  const rankOf = (x, b) => { const r = Number(((x && x.priority) || {})[b]); return r > 0 ? r : null; };
+  function onBoard(p, b, today) {
+    if (!p || p.status === 'done' || p.status === 'archived') return false;
+    if (rankOf(p, b) != null) return true;
+    const last = p.shootEnd || p.shootStart || '';
+    const edit = p.status === 'postproduction' || (p.status === 'production' && !!last && last < today);
+    return b === 'edit' ? edit : !edit;
+  }
+  const taskOnBoard = (t, b) => !!t && !t.done && (((t.priority || {}).board) === b || rankOf(t, b) != null);
+  function boardItems(row, b) {
+    const today = studioToday();
+    const all = liveProjects(row, false).map(x => x.p).filter(p => onBoard(p, b, today)).map(p => ({ kind: 'project', x: p, date: (b === 'shoot' ? p.shootStart : p.endDate) || '9999' }))
+      .concat((row.tasks || []).filter(t => taskOnBoard(t, b)).map(t => ({ kind: 'task', x: t, date: t.dueDate || '9999' })));
+    const byName = (i, j) => String(i.x.name).localeCompare(String(j.x.name));
+    const ranked = all.filter(i => rankOf(i.x, b) != null).sort((i, j) => rankOf(i.x, b) - rankOf(j.x, b) || byName(i, j));
+    const rest = all.filter(i => rankOf(i.x, b) == null).sort((i, j) => i.date.localeCompare(j.date) || byName(i, j));
+    return ranked.map((i, n) => Object.assign(i, { rank: n + 1 })).concat(rest.map(i => Object.assign(i, { rank: null })));
+  }
+  function boardView(row, b) {
+    return boardItems(row, b).map(({ kind, x, rank }) => {
+      const note = ((x.priority || {}).note) || '';
+      if (kind === 'task') return { kind, rank, id: x.id, name: x.name, due_date: x.dueDate || '', assignee_member_id: x.userId || '', note };
+      const tasks = (x.stages || []).flatMap(sg => sg.tasks || []);
+      return Object.assign({ kind, rank }, summary(row, x), {
+        note, tasks_done: tasks.filter(t => t && t.done).length, tasks_total: tasks.length,
+        open_client_requests: (x.clientRequests || []).filter(r => r && !r.done).length,
+        assigned_member_ids: x.assigned || [],
+      });
+    });
+  }
+  function stampPriority(x, st) {
+    x.priority = Object.assign({}, x.priority || {}, { updatedAt: nowIso(), updatedBy: st.memberName, via: 'ai' });
+  }
+  // An item ref is a loose task id (task-…) or a project id / exact name.
+  function findItem(row, ref) {
+    const t = (row.tasks || []).find(t => t && same(t.id, ref));
+    if (t) { if (t.done) throw fail('Task “' + t.name + '” is already done.'); return { kind: 'task', key: 't:' + t.id }; }
+    const p = findProject(row, ref, false, true).p;
+    if (p.status === 'done' || p.status === 'archived') throw fail('Project “' + p.name + '” isn’t active.');
+    return { kind: 'project', key: 'p:' + p.id };
+  }
+
   function summary(row, p) {
     const shots = (p.shotList || []);
     return {
@@ -1085,7 +1133,8 @@ module.exports = function mountMcpConnector(deps) {
       inputSchema: {
         type: 'object', required: ['name'],
         properties: { ...agencyProp, project_id: { type: 'string', description: 'Optional project id or exact name' }, stage: { type: 'string', description: 'e.g. Pre-Production, Production, Post Production' },
-          name: { type: 'string' }, assignee_member_id: { type: 'string' }, due_date: { type: 'string' }, notes: { type: 'string' } },
+          name: { type: 'string' }, assignee_member_id: { type: 'string' }, due_date: { type: 'string' }, notes: { type: 'string' },
+          priority_board: { type: 'string', enum: BOARDS, description: 'Loose tasks only: put it on the Priority Board ("shoot" or "edit"), ranked after what is already ranked there' } },
       },
       async run(a, ctx) {
         const st = await studio(ctx, a.agency_id);
@@ -1112,8 +1161,19 @@ module.exports = function mountMcpConnector(deps) {
           return { ok: true, task_id: id, project_id: p.id, project: p.name, stage: stageName };
         }
         const id = 'task-' + Date.now();
-        await writeProjects(st, 'tasks', (row) => ({ tasks: (row.tasks || []).concat([{ id, name, desc: clean(a.notes, 4000), dueDate: a.due_date || '', userId: assignee, done: false, timeLog: [], notes: [], social: false, hold: false, createdAt: nowIso(), dependsOn: [] }]) }));
-        return { ok: true, task_id: id, loose_task: true };
+        const pb = a.priority_board ? String(a.priority_board) : '';
+        if (pb && !BOARDS.includes(pb)) throw fail('priority_board must be "shoot" or "edit".');
+        let rank = null;
+        await writeProjects(st, pb ? 'tasks,projects,deleted_projects' : 'tasks', (row) => {
+          const t = { id, name, desc: clean(a.notes, 4000), dueDate: a.due_date || '', userId: assignee, done: false, timeLog: [], notes: [], social: false, hold: false, createdAt: nowIso(), dependsOn: [] };
+          if (pb) {
+            rank = boardItems(row, pb).filter(i => i.rank != null).length + 1;
+            t.priority = { board: pb, [pb]: rank };
+            stampPriority(t, st);
+          }
+          return { tasks: (row.tasks || []).concat([t]) };
+        });
+        return pb ? { ok: true, task_id: id, loose_task: true, priority_board: pb, rank } : { ok: true, task_id: id, loose_task: true };
       },
     },
     {
@@ -1242,6 +1302,88 @@ module.exports = function mountMcpConnector(deps) {
         return { ok: true, request_id: hit.id, done: hit.done, project: p.name };
       },
     },
+    {
+      name: 'bsmnt_get_priorities', title: 'Get shoot and edit priorities', annotations: RO,
+      description: 'The studio\'s Priority Board, exactly as the BSMNT app shows it on the wall: "shoot" (projects still to shoot) and "edit" (projects in post), each in priority order. Items are projects (kind "project") or standalone studio tasks (kind "task", ids like task-…). rank 1 is most important; rank null means not ranked yet (listed after the ranked items, by shoot / due date). Each item has dates, a priority note, and for projects task progress and open client requests.',
+      inputSchema: { type: 'object', properties: { ...agencyProp } },
+      async run(a, ctx) {
+        const st = await studio(ctx, a.agency_id);
+        const row = await readState(st.agencyId, 'projects,tasks,clients,deleted_projects,brand');
+        return { studio: st.studioName, today: studioToday(), shoot: boardView(row, 'shoot'), edit: boardView(row, 'edit') };
+      },
+    },
+    {
+      name: 'bsmnt_set_priorities', title: 'Set shoot or edit priorities', annotations: RW,
+      description: 'Set the running order of one board ("shoot" or "edit"). item_ids is the full new order, most important first: project ids (or exact names) and/or standalone task ids (task-…). They get ranks 1…n; every other item on that board goes back to unranked (projects sort by date; tasks stay on the board). A task listed here joins this board. Empty list clears the order. Optional notes: { item_id: "short note shown on the board" } (empty string removes). To put a brand-new standalone task on the board use bsmnt_add_task with priority_board. Call bsmnt_get_priorities first and confirm big reshuffles with the user.',
+      inputSchema: {
+        type: 'object', required: ['board', 'item_ids'],
+        properties: {
+          ...agencyProp,
+          board: { type: 'string', enum: BOARDS },
+          item_ids: { type: 'array', items: { type: 'string' }, description: 'Project ids / exact names and task ids, most important first' },
+          notes: { type: 'object', additionalProperties: { type: 'string' }, description: 'Optional { item_id: note }' },
+        },
+      },
+      async run(a, ctx) {
+        const st = await studio(ctx, a.agency_id);
+        needManage(st);
+        const b = String(a.board || '');
+        if (!BOARDS.includes(b)) throw fail('board must be "shoot" or "edit".');
+        const refs = Array.isArray(a.item_ids) ? a.item_ids : Array.isArray(a.project_ids) ? a.project_ids : null;
+        if (!refs) throw fail('item_ids must be a list.');
+        if (refs.length > 100) throw fail('At most 100 items.');
+        let noted = 0;
+        await writeProjects(st, 'projects,tasks,activity,deleted_projects', (row) => {
+          const keys = refs.map(ref => findItem(row, ref).key);
+          const order = keys.filter((k, i) => keys.indexOf(k) === i);
+          const notes = new Map(Object.entries(a.notes || {}).map(([ref, v]) => [findItem(row, ref).key, clean(v, 300).trim()]));
+          noted = notes.size;
+          const apply = (x, key, isTask) => {
+            const want = order.indexOf(key) + 1 || null;
+            const hasNote = notes.has(key);
+            const joins = isTask && want && ((x.priority || {}).board) == null;
+            if (rankOf(x, b) === want && !hasNote && !joins) return x;
+            const q = JSON.parse(JSON.stringify(x));
+            q.priority = Object.assign({}, q.priority || {}, { [b]: want });
+            if (joins) q.priority.board = b;
+            if (hasNote) q.priority.note = notes.get(key);
+            stampPriority(q, st);
+            return q;
+          };
+          const projects = (row.projects || []).map(p => (!p || p.status === 'done' || p.status === 'archived') ? p : apply(p, 'p:' + p.id, false));
+          const tasks = (row.tasks || []).map(t => (!t || t.done) ? t : apply(t, 't:' + t.id, true));
+          const activity = [{ icon: '🎯', text: 'set the ' + b + ' priorities' + VIA, user: st.memberName, time: nowIso(), read: false }].concat(row.activity || []).slice(0, 50);
+          return { projects, tasks, activity };
+        });
+        const row = await readState(st.agencyId, 'projects,tasks,clients,deleted_projects,brand');
+        return { ok: true, board: b, notes_changed: noted, [b]: boardView(row, b) };
+      },
+    },
+    {
+      name: 'bsmnt_set_priority_note', title: 'Set priority note', annotations: RW,
+      description: 'Set the short note shown on the Priority Board for a project or standalone task (e.g. "Grade + mix first · client review Fri"). Empty string removes it.',
+      inputSchema: { type: 'object', required: ['item_id', 'note'], properties: { ...agencyProp, item_id: { type: 'string', description: 'Project id / exact name, or task id (task-…)' }, note: { type: 'string' } } },
+      async run(a, ctx) {
+        const st = await studio(ctx, a.agency_id);
+        needManage(st);
+        const note = clean(a.note, 300).trim();
+        let name = '';
+        await writeProjects(st, 'projects,tasks,deleted_projects', (row) => {
+          const { kind, key } = findItem(row, a.item_id || a.project_id);
+          const col = kind === 'task' ? 'tasks' : 'projects';
+          const list = (row[col] || []).map(x => {
+            if (!x || (kind === 'task' ? 't:' : 'p:') + x.id !== key) return x;
+            const q = JSON.parse(JSON.stringify(x));
+            q.priority = Object.assign({}, q.priority || {}, { note });
+            stampPriority(q, st);
+            name = q.name;
+            return q;
+          });
+          return { [col]: list };
+        });
+        return { ok: true, item: name, note };
+      },
+    },
   ];
 
   async function sendToRunsheet(st, projectId, panels, title) {
@@ -1310,6 +1452,7 @@ const INSTRUCTIONS = [
   'Ask before replacing a shot list, run sheet or storyboard that already has content the user did not give you.',
   'Everything else (tasks, time, team, quotes, equipment, crew, briefs, client messages, flight ops, etc.): bsmnt_read_studio_data with a section; time sheets: bsmnt_get_time_logs.',
   'You can add and edit tasks, time entries, clients and client requests. Nothing can be deleted through these tools: tell the user to delete in the app.',
+  'Priorities: the studio keeps a shoot and an edit running order on a wall screen. Read it with bsmnt_get_priorities; reorder with bsmnt_set_priorities (full order, most important first) and add context with notes. The board can hold standalone tasks too: bsmnt_add_task with priority_board. When asked what to work on, start from this board.',
 ].join('\n');
 
 const CSS = [
