@@ -54,6 +54,8 @@ const UPLOAD_MAX_BYTES = 60 * 1024 * 1024;
 const UPLOAD_TOTAL_MAX = 400 * 1024 * 1024;
 const SUPABASE_JS = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js';
 
+const DELIVERY_STATES = ['editing', 'sent', 'revisions', 'approved', 'delivered'];
+const WAITING_ON = { editing: 'us', sent: 'client', revisions: 'us', approved: 'us', delivered: 'nobody' };
 const STATUS_PHASE = { upcoming: 'Upcoming', preproduction: 'Pre-Production', production: 'Production', postproduction: 'Post Production', done: 'Completed' };
 const SB_SHOT_TYPES = ['', 'ECU', 'CU', 'MCU', 'MS', 'MWS', 'WS', 'EWS', 'OTS', 'POV', 'Aerial'];
 const SB_MOVES = ['static', 'pan-left', 'pan-right', 'tilt-up', 'tilt-down', 'dolly-in', 'dolly-out', 'handheld', 'crane', 'drone'];
@@ -543,12 +545,26 @@ module.exports = function mountMcpConnector(deps) {
     return { kind: 'project', key: 'p:' + p.id };
   }
 
+  // Delivery state (native Features/Projects/DeliveryState.swift): project.delivery = { state, updatedAt, updatedBy, via }.
+  function deliveryInfo(p) {
+    const d = p.delivery || {};
+    const state = DELIVERY_STATES.includes(d.state) ? d.state : null;
+    const inPost = p.status === 'postproduction' || !!state;
+    if (!inPost) return {};
+    return { delivery_state: state || 'editing', delivery_state_set: !!state, waiting_on: WAITING_ON[state || 'editing'], delivery_state_since: state ? (d.updatedAt || '') : '',
+      missing_delivery_date: !p.endDate && p.status !== 'done' && p.status !== 'archived' };
+  }
+  function setDelivery(p, state, st) {
+    p.delivery = Object.assign({}, p.delivery || {}, { state, updatedAt: nowIso(), updatedBy: st.memberName, via: 'ai' });
+  }
+
   function summary(row, p) {
     const shots = (p.shotList || []);
     return {
       id: p.id, name: p.name, client: clientName(row, p.clientId), status: p.status, phase: p.phase,
       start_date: p.startDate || '', delivery_date: p.endDate || '', shoot_start: p.shootStart || '', shoot_end: p.shootEnd || '',
       shots: shots.filter(s => !s.isScene).length, runsheet_slots: ((p.runsheet || {}).timeline || []).length,
+      ...deliveryInfo(p),
     };
   }
 
@@ -726,6 +742,7 @@ module.exports = function mountMcpConnector(deps) {
         if (!name) throw fail('name is required.');
         for (const k of ['start_date', 'delivery_date', 'shoot_start', 'shoot_end']) if (a[k] && !isDate(a[k])) throw fail(k + ' must be YYYY-MM-DD.');
         const status = STATUS_PHASE[a.status] ? a.status : 'upcoming';
+        if (status === 'postproduction' && !a.delivery_date) throw fail('A project in post needs a delivery date. Ask the user when it is due and pass delivery_date (YYYY-MM-DD).');
         const ms = Date.now();
         let newClient = null, created = null, clientLabel = '';
         await writeProjects(st, 'projects,clients,activity,deleted_projects,deleted_clients', (row) => {
@@ -791,18 +808,24 @@ module.exports = function mountMcpConnector(deps) {
           budget: { type: 'number' }, shoot_budget: { type: 'number' }, edit_budget: { type: 'number' },
           description: { type: 'string' }, team_notes: { type: 'string' },
           brief: { type: 'object', properties: { mood: { type: 'string' }, tone: { type: 'string' }, refs: { type: 'string' }, formats: { type: 'string' } } },
+          delivery_state: { type: 'string', enum: DELIVERY_STATES, description: 'Where a project in post is: editing / revisions / approved = waiting on us; sent = sent to client, waiting on them; delivered = finished' },
         },
       },
       async run(a, ctx) {
         const st = await studio(ctx, a.agency_id);
         needManage(st);
+        if (a.delivery_state != null && !DELIVERY_STATES.includes(a.delivery_state)) throw fail('delivery_state must be one of ' + DELIVERY_STATES.join(', ') + '.');
         for (const k of ['start_date', 'delivery_date', 'shoot_start', 'shoot_end']) if (a[k] && !isDate(a[k])) throw fail(k + ' must be YYYY-MM-DD.');
         if ((a.budget != null || a.shoot_budget != null || a.edit_budget != null) && !st.canBudget) throw fail('You don’t have budget permission in ' + st.studioName + '.');
         const changed = [];
         const p = await editProject(st, a.project_id, (p, row) => {
           changed.length = 0;
           if (a.name) { p.name = clean(a.name, 200); changed.push('name'); }
-          if (a.status && STATUS_PHASE[a.status]) { p.status = a.status; p.phase = STATUS_PHASE[a.status]; changed.push('status'); }
+          if (a.status && STATUS_PHASE[a.status]) {
+            if (a.status === 'postproduction' && p.status !== 'postproduction' && !(a.delivery_date || p.endDate)) throw fail('A project moving into post needs a delivery date. Ask the user when it is due and pass delivery_date (YYYY-MM-DD).');
+            p.status = a.status; p.phase = STATUS_PHASE[a.status]; changed.push('status');
+          }
+          if (a.delivery_state) { setDelivery(p, a.delivery_state, st); changed.push('delivery_state'); }
           if (a.client_id) { if (!(row.clients || []).some(c => same(c.id, a.client_id))) throw fail('client_id not found.'); p.clientId = (row.clients.find(c => same(c.id, a.client_id))).id; changed.push('client'); }
           if (a.start_date != null) { p.startDate = a.start_date; changed.push('start_date'); }
           if (a.delivery_date != null) { p.endDate = a.delivery_date; changed.push('delivery_date'); }
@@ -1304,12 +1327,17 @@ module.exports = function mountMcpConnector(deps) {
     },
     {
       name: 'bsmnt_get_priorities', title: 'Get shoot and edit priorities', annotations: RO,
-      description: 'The studio\'s Priority Board, exactly as the BSMNT app shows it on the wall: "shoot" (projects still to shoot) and "edit" (projects in post), each in priority order. Items are projects (kind "project") or standalone studio tasks (kind "task", ids like task-…). rank 1 is most important; rank null means not ranked yet (listed after the ranked items, by shoot / due date). Each item has dates, a priority note, and for projects task progress and open client requests.',
+      description: 'The studio\'s Priority Board, exactly as the BSMNT app shows it on the wall: "shoot" (projects still to shoot) and "edit" (projects in post), each in priority order. Items are projects (kind "project") or standalone studio tasks (kind "task", ids like task-…). rank 1 is most important; rank null means not ranked yet (listed after the ranked items, by shoot / due date). Each item has dates, a priority note, and for projects task progress and open client requests. Edit projects also carry delivery_state (editing, sent, revisions, approved, delivered), waiting_on (us / client / nobody), delivery_state_since and missing_delivery_date.',
       inputSchema: { type: 'object', properties: { ...agencyProp } },
       async run(a, ctx) {
         const st = await studio(ctx, a.agency_id);
         const row = await readState(st.agencyId, 'projects,tasks,clients,deleted_projects,brand');
-        return { studio: st.studioName, today: studioToday(), shoot: boardView(row, 'shoot'), edit: boardView(row, 'edit') };
+        const shoot = boardView(row, 'shoot'), edit = boardView(row, 'edit');
+        const eps = edit.filter(x => x.kind === 'project');
+        return { studio: st.studioName, today: studioToday(),
+          edit_summary: { waiting_on_us: eps.filter(x => x.waiting_on === 'us').length, waiting_on_client: eps.filter(x => x.waiting_on === 'client').length,
+            delivered: eps.filter(x => x.waiting_on === 'nobody').length, missing_delivery_date: eps.filter(x => x.missing_delivery_date).map(x => x.name) },
+          shoot, edit };
       },
     },
     {
@@ -1452,7 +1480,8 @@ const INSTRUCTIONS = [
   'Ask before replacing a shot list, run sheet or storyboard that already has content the user did not give you.',
   'Everything else (tasks, time, team, quotes, equipment, crew, briefs, client messages, flight ops, etc.): bsmnt_read_studio_data with a section; time sheets: bsmnt_get_time_logs.',
   'You can add and edit tasks, time entries, clients and client requests. Nothing can be deleted through these tools: tell the user to delete in the app.',
-  'Priorities: the studio keeps a shoot and an edit running order on a wall screen. Read it with bsmnt_get_priorities; reorder with bsmnt_set_priorities (full order, most important first) and add context with notes. The board can hold standalone tasks too: bsmnt_add_task with priority_board. When asked what to work on, start from this board.',
+  'Priorities: the studio keeps a shoot and an edit running order on a wall screen. Read it with bsmnt_get_priorities; reorder with bsmnt_set_priorities (full order, most important first) and add context with notes. The board can hold standalone tasks too: bsmnt_add_task with priority_board.',
+  'Delivery: projects in post have a delivery_state (editing / revisions / approved = waiting on us, sent = waiting on the client, delivered). Keep it current with bsmnt_update_project delivery_state when the user tells you something was sent, came back with changes, was approved or delivered. Moving a project into post requires a delivery date: ask for it. When asked what to work on, start from this board.',
 ].join('\n');
 
 const CSS = [

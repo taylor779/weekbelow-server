@@ -41,7 +41,7 @@ Security model: `SECURITY_NOTES.md` → "Claude connector".
 | `bsmnt_list_projects` | Projects with status and dates |
 | `bsmnt_get_project` | One project in full: shot list, run sheet, storyboard text |
 | `bsmnt_create_project` | New project (matches or creates the client) |
-| `bsmnt_update_project` | Change fields (dates, status, budgets, brief…) |
+| `bsmnt_update_project` | Change fields (dates, status, budgets, brief, delivery state…). Moving into post needs a delivery date |
 | `bsmnt_set_shot_list` | Shot list with real scene dividers |
 | `bsmnt_set_runsheet` | Location, notes, crew, timeline |
 | `bsmnt_set_storyboard` | Storyboard panels (upload mode), optional send to run sheet |
